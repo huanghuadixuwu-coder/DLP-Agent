@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+
+
+REQUESTS_TOTAL = Counter("agent_requests_total", "Total requests handled by the agent.")
+FAILURES_TOTAL = Counter("agent_failures_total", "Total failed requests.")
+MODE_RUNS_TOTAL = Counter("agent_mode_runs_total", "Total mode executions.", ["mode"])
+TOKENS_INPUT_TOTAL = Counter("agent_tokens_input_total", "Total input tokens.")
+TOKENS_OUTPUT_TOTAL = Counter("agent_tokens_output_total", "Total output tokens.")
+ESTIMATED_COST_TOTAL = Counter("agent_estimated_cost_total", "Estimated model cost in CNY.")
+RETRIEVAL_HITS_TOTAL = Counter("agent_retrieval_hits_total", "Total retrieved document hits.")
+REFLECTION_RUNS_TOTAL = Counter("agent_reflection_runs_total", "Total reflection executions.")
+MEMORY_HITS_TOTAL = Counter("agent_memory_hits_total", "Total conversation memory hits.")
+CONVERSATION_MEMORY_USED_TOTAL = Counter("agent_conversation_memory_used_total", "Total requests that used conversation memory.")
+CONVERSATION_SUMMARY_WRITES_TOTAL = Counter("agent_conversation_summary_writes_total", "Total conversation summaries written to Chroma.")
+LAB_REQUESTS_TOTAL = Counter("agent_lab_requests_total", "Total lab workflow requests.", ["lab"])
+PRIVACY_REDACTIONS_TOTAL = Counter("agent_privacy_redactions_total", "Total redacted privacy fields.", ["pii_type"])
+PRIVACY_ALERTS_TOTAL = Counter("agent_privacy_alerts_total", "Total privacy alerts by risk level.", ["risk_level"])
+CONTEXT_TRUNCATED_SEGMENTS_TOTAL = Counter("agent_context_truncated_segments_total", "Total context segments dropped by budget packers.", ["lab"])
+CONTEXT_BUDGET_USED_TOKENS = Gauge("agent_context_budget_used_tokens", "Last context budget used tokens.", ["lab"])
+CONTEXT_BUDGET_LIMIT_TOKENS = Gauge("agent_context_budget_limit_tokens", "Last context budget limit tokens.", ["lab"])
+UNIFIED_REQUESTS_TOTAL = Counter("agent_unified_requests_total", "Total unified Agent requests.")
+INTENT_RUNS_TOTAL = Counter("agent_intent_runs_total", "Total unified Agent intent runs.", ["intent"])
+TOOL_CALLS_TOTAL = Counter("agent_tool_calls_total", "Total unified Agent tool calls.", ["tool"])
+TOOL_FAILURES_TOTAL = Counter("agent_tool_failures_total", "Total unified Agent tool failures.", ["tool"])
+CLARIFICATION_REQUESTS_TOTAL = Counter("agent_clarification_requests_total", "Total clarification requests.")
+PRIVACY_GUARDRAILS_TOTAL = Counter("agent_privacy_guardrails_total", "Total privacy guardrail activations.")
+AGENT_CONTEXT_BUDGET_USED_TOKENS = Gauge("agent_context_budget_used_tokens_by_intent", "Last unified Agent context budget used tokens.", ["intent"])
+ROUTER_RUNS_TOTAL = Counter("agent_router_runs_total", "Total hybrid router runs.", ["source"])
+ROUTER_FALLBACKS_TOTAL = Counter("agent_router_fallbacks_total", "Total hybrid router fallbacks.")
+ROUTER_LLM_CONFIDENCE = Gauge("agent_router_llm_confidence", "Last LLM router confidence.")
+UNIFIED_EVIDENCE_HITS_TOTAL = Counter("agent_unified_evidence_hits_total", "Total unified RAG evidence hits.", ["domain"])
+CONVERSATIONS_TOTAL = Counter("agent_conversations_total", "Total conversations created.")
+CONVERSATION_TURNS_TOTAL = Counter("agent_conversation_turns_total", "Total conversation turns written.", ["role"])
+CONVERSATION_MERGES_TOTAL = Counter("agent_conversation_merges_total", "Total conversation merges.")
+TURN_SUMMARY_WRITES_TOTAL = Counter("agent_turn_summary_writes_total", "Total turn summaries written to Chroma.")
+MERGED_SUMMARY_WRITES_TOTAL = Counter("agent_merged_summary_writes_total", "Total merged summaries written to Chroma.")
+MEMORY_RETRIEVAL_HITS_TOTAL = Counter("agent_memory_retrieval_hits_total", "Total memory retrieval hits.", ["source_type"])
+ANSWER_COLLAPSES_TOTAL = Counter("agent_answer_collapses_total", "Total long answers collapsed in the UI.")
+WORKFLOW_CREATED_TOTAL = Counter("agent_workflow_created_total", "Total HITL workflows created.")
+WORKFLOW_PENDING_APPROVALS_TOTAL = Counter(
+    "agent_workflow_pending_approvals_total",
+    "Total workflows that entered pending approval.",
+)
+WORKFLOW_APPROVED_TOTAL = Counter("agent_workflow_approved_total", "Total workflows approved by humans.")
+WORKFLOW_REJECTED_TOTAL = Counter("agent_workflow_rejected_total", "Total workflows rejected by humans.")
+WORKFLOW_RISK_TOTAL = Counter("agent_workflow_risk_total", "Total workflow risk decisions.", ["risk_level"])
+WORKFLOW_EMAIL_SENT_TOTAL = Counter("agent_workflow_email_sent_total", "Total workflow emails sent.")
+WORKFLOW_EMAIL_FAILED_TOTAL = Counter("agent_workflow_email_failed_total", "Total workflow email send failures.")
+REQUEST_LATENCY_MS = Histogram(
+    "agent_request_latency_ms",
+    "Total request latency in milliseconds.",
+    buckets=(100, 300, 500, 800, 1200, 2000, 5000, 8000, 12000, 15000, 20000, 30000),
+)
+NODE_LATENCY_MS = Histogram(
+    "agent_node_latency_ms",
+    "Per-node latency in milliseconds.",
+    ["node"],
+    buckets=(10, 25, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000),
+)
+
+LAST_REQUEST_LATENCY_MS = Gauge("agent_last_request_latency_ms", "Latency of the last completed request in milliseconds.")
+LAST_REQUEST_TOKENS_INPUT = Gauge("agent_last_request_tokens_input", "Input tokens used by the last completed request.")
+LAST_REQUEST_TOKENS_OUTPUT = Gauge("agent_last_request_tokens_output", "Output tokens used by the last completed request.")
+LAST_REQUEST_ESTIMATED_COST = Gauge("agent_last_request_estimated_cost", "Estimated cost of the last completed request in CNY.")
+LAST_RETRIEVAL_HITS = Gauge("agent_last_retrieval_hits", "Retrieval hits for the last completed request.")
+LAST_REQUEST_SUCCESS = Gauge("agent_last_request_success", "1 if the last request succeeded, otherwise 0.")
+LAST_MEMORY_HITS = Gauge("agent_last_memory_hits", "Number of conversation memory hits for the last completed request.")
+LAST_CONVERSATION_MEMORY_USED = Gauge("agent_last_conversation_memory_used", "1 if the last request used conversation memory.")
+LAST_CONVERSATION_SUMMARY_WRITTEN = Gauge("agent_last_conversation_summary_written", "1 if the last request wrote a conversation summary.")
+
+
+@dataclass
+class UsageTracker:
+    token_in: int = 0
+    token_out: int = 0
+    estimated_cost: float = 0.0
+    node_latencies_ms: dict[str, float] = field(default_factory=dict)
+
+
+def record_request(
+    mode: str,
+    latency_ms: float,
+    token_in: int,
+    token_out: int,
+    estimated_cost: float,
+    retrieval_hits: int,
+    node_latencies_ms: dict[str, float] | None = None,
+    memory_hits: int = 0,
+    used_conversation_memory: bool = False,
+    conversation_summary_written: bool = False,
+) -> None:
+    REQUESTS_TOTAL.inc()
+    MODE_RUNS_TOTAL.labels(mode=mode).inc()
+    TOKENS_INPUT_TOTAL.inc(token_in)
+    TOKENS_OUTPUT_TOTAL.inc(token_out)
+    ESTIMATED_COST_TOTAL.inc(estimated_cost)
+    RETRIEVAL_HITS_TOTAL.inc(retrieval_hits)
+    REQUEST_LATENCY_MS.observe(latency_ms)
+    MEMORY_HITS_TOTAL.inc(memory_hits)
+
+    LAST_REQUEST_LATENCY_MS.set(latency_ms)
+    LAST_REQUEST_TOKENS_INPUT.set(token_in)
+    LAST_REQUEST_TOKENS_OUTPUT.set(token_out)
+    LAST_REQUEST_ESTIMATED_COST.set(estimated_cost)
+    LAST_RETRIEVAL_HITS.set(retrieval_hits)
+    LAST_REQUEST_SUCCESS.set(1)
+    LAST_MEMORY_HITS.set(memory_hits)
+    LAST_CONVERSATION_MEMORY_USED.set(1 if used_conversation_memory else 0)
+    LAST_CONVERSATION_SUMMARY_WRITTEN.set(1 if conversation_summary_written else 0)
+
+    if used_conversation_memory:
+        CONVERSATION_MEMORY_USED_TOTAL.inc()
+    if conversation_summary_written:
+        CONVERSATION_SUMMARY_WRITES_TOTAL.inc()
+
+    for node, value in (node_latencies_ms or {}).items():
+        if node == "total":
+            continue
+        NODE_LATENCY_MS.labels(node=node).observe(value)
+
+
+def record_failure() -> None:
+    FAILURES_TOTAL.inc()
+    LAST_REQUEST_SUCCESS.set(0)
+
+
+def record_reflection() -> None:
+    REFLECTION_RUNS_TOTAL.inc()
+
+
+def record_lab_request(lab: str) -> None:
+    LAB_REQUESTS_TOTAL.labels(lab=lab).inc()
+
+
+def record_context_budget(lab: str, used_tokens: int, limit_tokens: int, truncated_segments: int = 0) -> None:
+    CONTEXT_BUDGET_USED_TOKENS.labels(lab=lab).set(used_tokens)
+    CONTEXT_BUDGET_LIMIT_TOKENS.labels(lab=lab).set(limit_tokens)
+    if truncated_segments:
+        CONTEXT_TRUNCATED_SEGMENTS_TOTAL.labels(lab=lab).inc(truncated_segments)
+
+
+def record_privacy_scan(risk_level: str, redactions: list[dict[str, int | str]]) -> None:
+    PRIVACY_ALERTS_TOTAL.labels(risk_level=risk_level).inc()
+    for item in redactions:
+        PRIVACY_REDACTIONS_TOTAL.labels(pii_type=str(item["pii_type"])).inc(int(item["count"]))
+
+
+def record_unified_agent(
+    intent: str,
+    tool_calls: list[dict],
+    needs_clarification: bool,
+    privacy_guardrail: bool,
+    context_budget_used: int | None = None,
+) -> None:
+    UNIFIED_REQUESTS_TOTAL.inc()
+    INTENT_RUNS_TOTAL.labels(intent=intent).inc()
+    if needs_clarification:
+        CLARIFICATION_REQUESTS_TOTAL.inc()
+    if privacy_guardrail:
+        PRIVACY_GUARDRAILS_TOTAL.inc()
+    if context_budget_used is not None:
+        AGENT_CONTEXT_BUDGET_USED_TOKENS.labels(intent=intent).set(context_budget_used)
+
+    for call in tool_calls:
+        tool_name = str(call.get("tool_name", "unknown"))
+        TOOL_CALLS_TOTAL.labels(tool=tool_name).inc()
+        if not call.get("success", False):
+            TOOL_FAILURES_TOTAL.labels(tool=tool_name).inc()
+
+
+def record_router(source: str, confidence: float) -> None:
+    ROUTER_RUNS_TOTAL.labels(source=source).inc()
+    if source == "fallback":
+        ROUTER_FALLBACKS_TOTAL.inc()
+    if source == "llm":
+        ROUTER_LLM_CONFIDENCE.set(confidence)
+
+
+def record_unified_evidence_hits(evidence: list[dict]) -> None:
+    for item in evidence:
+        domain = str(item.get("domain", "unknown"))
+        if domain:
+            UNIFIED_EVIDENCE_HITS_TOTAL.labels(domain=domain).inc()
+
+
+def record_conversation_created() -> None:
+    CONVERSATIONS_TOTAL.inc()
+
+
+def record_conversation_turns(user_written: bool = True, assistant_written: bool = True) -> None:
+    if user_written:
+        CONVERSATION_TURNS_TOTAL.labels(role="user").inc()
+    if assistant_written:
+        CONVERSATION_TURNS_TOTAL.labels(role="assistant").inc()
+
+
+def record_conversation_merge() -> None:
+    CONVERSATION_MERGES_TOTAL.inc()
+
+
+def record_turn_summary_write() -> None:
+    TURN_SUMMARY_WRITES_TOTAL.inc()
+
+
+def record_merged_summary_write() -> None:
+    MERGED_SUMMARY_WRITES_TOTAL.inc()
+
+
+def record_memory_retrieval_hits(turn_hits: int, merged_hits: int) -> None:
+    if turn_hits:
+        MEMORY_RETRIEVAL_HITS_TOTAL.labels(source_type="turn_summary").inc(turn_hits)
+    if merged_hits:
+        MEMORY_RETRIEVAL_HITS_TOTAL.labels(source_type="merged_summary").inc(merged_hits)
+
+
+def record_answer_collapse() -> None:
+    ANSWER_COLLAPSES_TOTAL.inc()
+
+
+def record_workflow_created(risk_level: str, approval_required: bool) -> None:
+    WORKFLOW_CREATED_TOTAL.inc()
+    WORKFLOW_RISK_TOTAL.labels(risk_level=risk_level).inc()
+    if approval_required:
+        WORKFLOW_PENDING_APPROVALS_TOTAL.inc()
+
+
+def record_workflow_approved() -> None:
+    WORKFLOW_APPROVED_TOTAL.inc()
+
+
+def record_workflow_rejected() -> None:
+    WORKFLOW_REJECTED_TOTAL.inc()
+
+
+def record_workflow_email_sent(success: bool) -> None:
+    if success:
+        WORKFLOW_EMAIL_SENT_TOTAL.inc()
+    else:
+        WORKFLOW_EMAIL_FAILED_TOTAL.inc()
+
+
+def render_metrics() -> bytes:
+    return generate_latest()
+
+
+def content_type() -> str:
+    return CONTENT_TYPE_LATEST

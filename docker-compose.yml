@@ -1,0 +1,60 @@
+name: leetcode-rag-agent-enterprise
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    environment:
+      CHROMA_HOST: chroma
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8010:8000"
+    depends_on:
+      - chroma
+    volumes:
+      - .:/app
+      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: streamlit run web/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8511:8501"
+    depends_on:
+      - api
+    volumes:
+      - .:/app
+      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+
+  chroma:
+    image: chromadb/chroma:1.0.15
+    ports:
+      - "8011:8000"
+    volumes:
+      - chroma_data:/data
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    depends_on:
+      - api
+
+volumes:
+  chroma_data:
+  prometheus_data:

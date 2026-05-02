@@ -1,0 +1,25 @@
+{
+  "problem_id": "maximum-depth-binary-tree",
+  "title": "Maximum Depth of Binary Tree",
+  "difficulty": "Easy",
+  "topic": "tree-traversal",
+  "tags": ["tree", "dfs", "recursion"],
+  "statement": "Given the root of a binary tree, return the number of nodes along the longest path from the root down to a leaf.",
+  "examples": [
+    "root = [3,9,20,null,null,15,7] -> 3"
+  ],
+  "constraints": [
+    "node count can be zero",
+    "tree values do not affect the answer"
+  ],
+  "solution_code": "def max_depth(root):\n    if root is None:\n        return 0\n    left_depth = max_depth(root.left)\n    right_depth = max_depth(root.right)\n    return 1 + max(left_depth, right_depth)\n",
+  "editor_note": {
+    "idea": "The depth of a node is one plus the larger depth of its two children.",
+    "data_structure_reason": "Recursion matches the recursive structure of the tree.",
+    "time_complexity": "O(n)",
+    "space_complexity": "O(h), where h is the tree height",
+    "edge_cases": "The base case returns 0 for an empty subtree.",
+    "pitfalls": "Confusing number of edges with number of nodes leads to off-by-one errors."
+  }
+}
+

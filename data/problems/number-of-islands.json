@@ -1,0 +1,25 @@
+{
+  "problem_id": "number-of-islands",
+  "title": "Number of Islands",
+  "difficulty": "Medium",
+  "topic": "graph-search",
+  "tags": ["matrix", "dfs", "bfs", "graph"],
+  "statement": "Given a grid of land and water cells, count how many disconnected land regions exist. Cells connect vertically and horizontally.",
+  "examples": [
+    "grid = [[1,1,0],[0,1,0],[1,0,1]] -> 3"
+  ],
+  "constraints": [
+    "grid may be empty",
+    "only four-direction adjacency counts"
+  ],
+  "solution_code": "def num_islands(grid):\n    if not grid:\n        return 0\n\n    rows, cols = len(grid), len(grid[0])\n    islands = 0\n\n    def dfs(r, c):\n        if r < 0 or r >= rows or c < 0 or c >= cols or grid[r][c] != '1':\n            return\n        grid[r][c] = '0'\n        dfs(r + 1, c)\n        dfs(r - 1, c)\n        dfs(r, c + 1)\n        dfs(r, c - 1)\n\n    for r in range(rows):\n        for c in range(cols):\n            if grid[r][c] == '1':\n                islands += 1\n                dfs(r, c)\n\n    return islands\n",
+  "editor_note": {
+    "idea": "Whenever an unvisited land cell is found, run DFS to mark the whole island and increment the count once.",
+    "data_structure_reason": "DFS explores one connected component completely before moving on.",
+    "time_complexity": "O(m * n)",
+    "space_complexity": "O(m * n) in the worst recursive case",
+    "edge_cases": "An empty grid returns 0.",
+    "pitfalls": "If visited cells are not marked, the same island gets counted multiple times."
+  }
+}
+

@@ -1,0 +1,26 @@
+{
+  "problem_id": "valid-parentheses",
+  "title": "Valid Parentheses",
+  "difficulty": "Easy",
+  "topic": "stack",
+  "tags": ["string", "stack"],
+  "statement": "Given a string containing only parentheses characters, determine whether every opening bracket is closed by the correct type in the correct order.",
+  "examples": [
+    "s = \"()[]{}\" -> true",
+    "s = \"(]\" -> false"
+  ],
+  "constraints": [
+    "input length may be zero",
+    "characters belong to (), [], {}"
+  ],
+  "solution_code": "def is_valid(s):\n    pairs = {')': '(', ']': '[', '}': '{'}\n    stack = []\n    for char in s:\n        if char in pairs.values():\n            stack.append(char)\n        else:\n            if not stack or stack[-1] != pairs[char]:\n                return False\n            stack.pop()\n    return not stack\n",
+  "editor_note": {
+    "idea": "Push opening brackets and verify that each closing bracket matches the latest unmatched opening bracket.",
+    "data_structure_reason": "A stack naturally models nested and last-opened-first-closed structures.",
+    "time_complexity": "O(n)",
+    "space_complexity": "O(n)",
+    "edge_cases": "An empty string is valid. A closing bracket cannot be processed when the stack is empty.",
+    "pitfalls": "Using a queue would break the matching order."
+  }
+}
+

@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.streamlit/secrets.toml
+prometheus_data/
+grafana_data/
+chroma_data/
+

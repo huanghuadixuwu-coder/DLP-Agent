@@ -1,0 +1,26 @@
+{
+  "problem_id": "two-sum",
+  "title": "Two Sum",
+  "difficulty": "Easy",
+  "topic": "hash-map",
+  "tags": ["array", "hash-map"],
+  "statement": "Given an integer array and a target, return the indexes of two values whose sum equals the target. Assume exactly one valid answer exists and the same element cannot be used twice.",
+  "examples": [
+    "nums = [2,7,11,15], target = 9 -> [0,1]",
+    "nums = [3,2,4], target = 6 -> [1,2]"
+  ],
+  "constraints": [
+    "array length is at least 2",
+    "answer is unique"
+  ],
+  "solution_code": "def two_sum(nums, target):\n    seen = {}\n    for index, value in enumerate(nums):\n        need = target - value\n        if need in seen:\n            return [seen[need], index]\n        seen[value] = index\n    return []\n",
+  "editor_note": {
+    "idea": "Scan once and store each number's index after checking whether its complement has appeared.",
+    "data_structure_reason": "A hash map turns the complement lookup into average O(1) time.",
+    "time_complexity": "O(n)",
+    "space_complexity": "O(n)",
+    "edge_cases": "Store the current value after the lookup so the same element is not matched with itself.",
+    "pitfalls": "If duplicates exist, update order matters."
+  }
+}
+

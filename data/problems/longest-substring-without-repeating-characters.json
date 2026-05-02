@@ -1,0 +1,25 @@
+{
+  "problem_id": "longest-substring-without-repeating-characters",
+  "title": "Longest Substring Without Repeating Characters",
+  "difficulty": "Medium",
+  "topic": "two-pointers",
+  "tags": ["string", "hash-map", "sliding-window"],
+  "statement": "Given a string, return the length of the longest substring that contains no repeated characters.",
+  "examples": [
+    "s = \"abcabcbb\" -> 3",
+    "s = \"bbbbb\" -> 1"
+  ],
+  "constraints": [
+    "input may be empty"
+  ],
+  "solution_code": "def length_of_longest_substring(s):\n    last_seen = {}\n    left = 0\n    best = 0\n    for right, char in enumerate(s):\n        if char in last_seen and last_seen[char] >= left:\n            left = last_seen[char] + 1\n        last_seen[char] = right\n        best = max(best, right - left + 1)\n    return best\n",
+  "editor_note": {
+    "idea": "Maintain a sliding window with unique characters and move the left boundary when a duplicate appears inside the window.",
+    "data_structure_reason": "A hash map remembers the latest index of each character so the left pointer can jump directly.",
+    "time_complexity": "O(n)",
+    "space_complexity": "O(min(n, alphabet size))",
+    "edge_cases": "The left pointer only moves forward.",
+    "pitfalls": "Updating left with an older index can incorrectly shrink the window backwards."
+  }
+}
+

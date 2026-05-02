@@ -1,0 +1,30 @@
+{
+  "name": "interview-agent-tools",
+  "description": "Local tool bundle for Agent/RAG interview practice.",
+  "tools": [
+    {
+      "name": "create_reminder",
+      "description": "Create a local reminder from natural language text."
+    },
+    {
+      "name": "list_reminders",
+      "description": "List active local reminders."
+    },
+    {
+      "name": "privacy_scan",
+      "description": "Redact PII, classify risk, and pack minimal context."
+    },
+    {
+      "name": "budget_context",
+      "description": "Simulate hierarchical long-document retrieval under a context budget."
+    },
+    {
+      "name": "disambiguate_entity",
+      "description": "Resolve ambiguous Apple company/fruit queries."
+    },
+    {
+      "name": "send_email_163",
+      "description": "Send a text email through 163 SMTP using environment-provided credentials."
+    }
+  ]
+}

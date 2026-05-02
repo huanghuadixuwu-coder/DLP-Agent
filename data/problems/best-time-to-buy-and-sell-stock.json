@@ -1,0 +1,24 @@
+{
+  "problem_id": "best-time-to-buy-and-sell-stock",
+  "title": "Best Time to Buy and Sell Stock",
+  "difficulty": "Easy",
+  "topic": "dynamic-programming",
+  "tags": ["array", "greedy", "dynamic-programming"],
+  "statement": "Given a list of daily stock prices, choose one day to buy and a later day to sell to maximize profit. Return 0 if no profit is possible.",
+  "examples": [
+    "prices = [7,1,5,3,6,4] -> 5"
+  ],
+  "constraints": [
+    "sell day must be later than buy day"
+  ],
+  "solution_code": "def max_profit(prices):\n    min_price = float('inf')\n    best_profit = 0\n    for price in prices:\n        min_price = min(min_price, price)\n        best_profit = max(best_profit, price - min_price)\n    return best_profit\n",
+  "editor_note": {
+    "idea": "Track the smallest price seen so far and compare each later price against it.",
+    "data_structure_reason": "Two rolling variables are enough, so there is no need for an array of states.",
+    "time_complexity": "O(n)",
+    "space_complexity": "O(1)",
+    "edge_cases": "If prices always decrease, the result stays 0.",
+    "pitfalls": "The min price must come from an earlier day."
+  }
+}
+
