@@ -285,7 +285,9 @@ def send_sensitive_workflow_email(workflow_id: str, actor: str = "agent") -> dic
         return workflow
 
     draft_summary = workflow.get("draft_summary") or _build_draft_summary(workflow.get("redacted_text", ""))
-    destination_email = workflow.get("destination_email") or "17388861183@163.com"
+    destination_email = workflow.get("destination_email") or ""
+    if not destination_email:
+        return None
     subject = f"DLP Agent outbound summary - {workflow_id}"
     body = "\n".join(
         [
@@ -302,13 +304,13 @@ def send_sensitive_workflow_email(workflow_id: str, actor: str = "agent") -> dic
         ]
     )
     tool_result = call_mcp_tool(
-        "send_email_163",
+        "send_email_smtp",
         {"to_email": destination_email, "subject": subject, "body": body},
     )
     result_payload = tool_result.get("result") if tool_result.get("ok") else {"ok": False, "error": tool_result.get("error", "")}
     success = bool(result_payload.get("ok"))
     sent_at = str(result_payload.get("sent_at") or "")
-    provider = str(result_payload.get("provider") or "163_smtp")
+    provider = str(result_payload.get("provider") or "smtp")
     error = str(result_payload.get("error") or "")
     delivery_result = (
         f"已真实发送到 {destination_email}。发送内容仅使用脱敏摘要，未包含原始敏感字段。"

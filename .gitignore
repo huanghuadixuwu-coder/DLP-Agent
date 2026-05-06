@@ -10,4 +10,7 @@ __pycache__/
 prometheus_data/
 grafana_data/
 chroma_data/
-
+external-models/
+documents.parquet
+questions.parquet
+data/*.db

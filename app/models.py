@@ -180,6 +180,8 @@ class UnifiedAgentRequest(BaseModel):
     uploaded_filename: str = ""
     uploaded_content_type: str = ""
     uploaded_text: str = ""
+    source_parse_status: str = "not_provided"
+    source_parse_error: str = ""
 
 
 class UnifiedAgentResponse(BaseModel):
@@ -204,11 +206,24 @@ class UnifiedAgentResponse(BaseModel):
     memory_hits: int = 0
     merged_memory_hits: int = 0
     memory_context: dict[str, Any] = Field(default_factory=dict)
+    context_sources: list[str] = Field(default_factory=list)
+    workspace_memory_hits: int = 0
+    transcript_hits: int = 0
+    user_model_used: bool = False
     answer_collapsed: bool = False
     reflection_notes: str | None = None
+    upload_context: dict[str, Any] = Field(default_factory=dict)
+    planner_type: str = ""
+    task_plan: dict[str, Any] = Field(default_factory=dict)
+    subtask_results: list[dict[str, Any]] = Field(default_factory=list)
+    aggregation_strategy: str = ""
+    partial_failures: list[dict[str, Any]] = Field(default_factory=list)
     workflow_id: str | None = None
     workflow_status: str | None = None
     workflow_risk_level: str | None = None
+    task_id: str | None = None
+    task_status: str | None = None
+    task_risk_level: str | None = None
     delivery_status: str | None = None
     delivery_result: str | None = None
     delivery_error: str | None = None
@@ -217,6 +232,130 @@ class UnifiedAgentResponse(BaseModel):
     token_in: int = 0
     token_out: int = 0
     estimated_cost: float = 0.0
+
+
+class InboundMailSyncRequest(BaseModel):
+    since: str | None = None
+    until: str | None = None
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class InboundMailMessage(BaseModel):
+    message_id: str
+    mailbox: str = "INBOX"
+    uid: str = ""
+    sender: str = ""
+    recipients: str = ""
+    subject: str = ""
+    received_at: str = ""
+    snippet: str = ""
+    summary: str = ""
+    risk_hint: str = ""
+    raw_size: int = 0
+    is_seen: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class InboundMailSummaryResponse(BaseModel):
+    since: str
+    until: str
+    total: int = 0
+    unread: int = 0
+    important_count: int = 0
+    important_messages: list[InboundMailMessage] = Field(default_factory=list)
+    recent_messages: list[InboundMailMessage] = Field(default_factory=list)
+    sync_state: dict[str, Any] = Field(default_factory=dict)
+
+
+class OutboundMailSummaryResponse(BaseModel):
+    since: str
+    until: str
+    total_sent: int = 0
+    recent_sent: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EnterpriseRagQueryRequest(BaseModel):
+    question: str = Field(min_length=1)
+    source_types: list[str] = Field(default_factory=list)
+    top_k: int = Field(default=8, ge=1, le=30)
+    session_id: str = ""
+    conversation_id: str = ""
+
+
+class EnterpriseRagQueryResponse(BaseModel):
+    answer: str
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    supporting_doc_ids: list[str] = Field(default_factory=list)
+    missing_evidence: bool = False
+    confidence: float = 0.0
+    supporting_facts: list[str] = Field(default_factory=list)
+    supporting_fact_details: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_plan: dict[str, Any] = Field(default_factory=dict)
+    retrieval_stage_debug: dict[str, Any] = Field(default_factory=dict)
+    rerank_debug: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_fact_hits: list[str] = Field(default_factory=list)
+    answer_debug: dict[str, Any] = Field(default_factory=dict)
+    context_sources: list[str] = Field(default_factory=list)
+    workspace_memory_hits: int = 0
+    transcript_hits: int = 0
+    user_model_used: bool = False
+    memory_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class EnterpriseRagIngestRequest(BaseModel):
+    mode: Literal["sample", "full"] = "sample"
+    documents_path: str | None = None
+    questions_path: str | None = None
+    limit: int = Field(default=200, ge=1, le=100_000)
+    reset: bool = False
+
+
+class EnterpriseRagIngestResponse(BaseModel):
+    dataset: str
+    mode: str
+    documents_path: str
+    questions_path: str = ""
+    documents_seen: int = 0
+    questions_seen: int = 0
+    chunks_indexed: int = 0
+    enterprise_collection: str = ""
+    sparse_index: str = ""
+    reset: bool = False
+
+
+class EnterpriseRagBenchmarkResponse(BaseModel):
+    cases: list[dict[str, Any]] = Field(default_factory=list)
+    average_doc_recall: float = 0.0
+    average_answer_fact_coverage: float = 0.0
+    average_evidence_fact_coverage: float = 0.0
+
+
+class InboundMailSyncResponse(BaseModel):
+    enabled: bool
+    ok: bool = False
+    synced: int = 0
+    new: int = 0
+    mailbox: str = "INBOX"
+    error: str = ""
+    state: dict[str, Any] = Field(default_factory=dict)
+
+
+class InboundDraftReplyResponse(BaseModel):
+    message: InboundMailMessage
+    draft_reply: str
+    requires_dlp_before_send: bool = True
+
+
+class NotificationOutboxItem(BaseModel):
+    notification_id: str
+    event_type: str
+    title: str
+    body: str = ""
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    status: str = "pending"
+    created_at: str
+    delivered_at: str = ""
 
 
 class ConversationCreateRequest(BaseModel):
@@ -257,7 +396,7 @@ class SensitiveWorkflowCreateRequest(BaseModel):
     business_context: str = ""
     recipient_type: str = ""
     context_budget: int = Field(default=600, ge=100, le=5_000)
-    destination_email: str = "17388861183@163.com"
+    destination_email: str = ""
     source_filename: str = ""
     source_content_type: str = ""
     requested_action: str = "summarize_and_send"
@@ -278,7 +417,7 @@ class SensitiveWorkflowResponse(BaseModel):
     redacted_text: str
     business_context: str = ""
     recipient_type: str = ""
-    destination_email: str = "17388861183@163.com"
+    destination_email: str = ""
     source_filename: str = ""
     source_content_type: str = ""
     source_text_preview: str = ""
@@ -302,6 +441,132 @@ class SensitiveWorkflowResponse(BaseModel):
     created_at: str
     updated_at: str
     audit_events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DlpTaskCreateRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    message: str = ""
+    destination_email: str = ""
+    uploaded_filename: str = ""
+    uploaded_content_type: str = ""
+    uploaded_text: str = ""
+    source_parse_status: str = "not_provided"
+    source_parse_error: str = ""
+    requested_action: str = "summarize_and_send"
+    lab_run: bool = False
+    scenario_id: str = ""
+    scenario_name: str = ""
+    fault_injection: dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: dict[str, Any] = Field(default_factory=dict)
+
+
+class DlpTaskApprovalRequest(BaseModel):
+    actor: str = Field(default="local_reviewer", min_length=1)
+    reason: str = ""
+
+
+class DlpTaskSupplementRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    message: str = ""
+    destination_email: str = ""
+    uploaded_filename: str = ""
+    uploaded_content_type: str = ""
+    uploaded_text: str = ""
+    source_parse_status: str = "not_provided"
+    source_parse_error: str = ""
+
+
+class DlpTaskEvent(BaseModel):
+    event_id: str | None = None
+    task_id: str
+    event_type: str
+    actor: str = ""
+    details_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class DlpTaskApproval(BaseModel):
+    approval_id: str
+    task_id: str
+    action: str
+    actor: str = ""
+    reason: str = ""
+    created_at: str
+
+
+class DlpTaskResponse(BaseModel):
+    task_id: str
+    task_type: str = "dlp_outbound"
+    tenant_id: str = ""
+    session_id: str
+    conversation_id: str = ""
+    priority: int = 0
+    status: str
+    risk_level: str = ""
+    approval_required: bool = False
+    destination_email: str = ""
+    requested_action: str = "summarize_and_send"
+    message_raw: str
+    message_redacted: str = ""
+    source_filename: str = ""
+    source_content_type: str = ""
+    source_parse_status: str = "not_provided"
+    source_parse_error: str = ""
+    draft_summary: str = ""
+    risk_reasons: list[str] = Field(default_factory=list)
+    redactions: list[dict[str, Any]] = Field(default_factory=list)
+    retrieved_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    delivery_status: str = "not_sent"
+    delivery_result: str = ""
+    delivery_error: str = ""
+    smtp_provider: str = ""
+    sent_at: str = ""
+    final_result: str = ""
+    degradation_mode: str = ""
+    fallback_reason: str = ""
+    manual_handover_required: bool = False
+    next_recommended_action: str = ""
+    last_error_category: str = ""
+    entry_issue_type: str = ""
+    missing_fields: list[str] = Field(default_factory=list)
+    clarification_question: str = ""
+    retrieval_status: str = ""
+    summary_status: str = ""
+    lab_run: bool = False
+    scenario_id: str = ""
+    scenario_name: str = ""
+    fault_injection: dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: dict[str, Any] = Field(default_factory=dict)
+    status_path: list[str] = Field(default_factory=list)
+    scenario_evaluation: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    audit_events: list[DlpTaskEvent] = Field(default_factory=list)
+    approvals: list[DlpTaskApproval] = Field(default_factory=list)
+
+
+class DlpScenarioDefinition(BaseModel):
+    scenario_id: str
+    name: str
+    category: str
+    description: str
+    message: str
+    uploaded_filename: str = ""
+    uploaded_content_type: str = ""
+    uploaded_text: str = ""
+    destination_email: str = ""
+    requested_action: str = "summarize_and_send"
+    fault_injection: dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: dict[str, Any] = Field(default_factory=dict)
+
+
+class DlpScenarioReplayRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    destination_email: str = ""
+    fault_injection: dict[str, Any] | None = None
 
 
 class ConversationMergeRequest(BaseModel):

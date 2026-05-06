@@ -1,0 +1,16 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+data/
+external-models/
+documents.parquet
+questions.parquet
+enterprise_rag_bench_documents_sample.csv
+enterprise_rag_bench_questions_view.csv

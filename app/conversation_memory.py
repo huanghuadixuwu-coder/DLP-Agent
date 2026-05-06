@@ -40,6 +40,7 @@ def build_turn_summary_document(
     answer_summary: str,
     intent: str,
     citations: list[dict[str, Any]],
+    upload_context: dict[str, Any] | None = None,
 ) -> Document:
     source_turn_ids = f"{user_turn_id},{assistant_turn_id}"
     citation_terms = []
@@ -49,6 +50,21 @@ def build_turn_summary_document(
         if chunk_id or source_type:
             citation_terms.append(f"{source_type}:{chunk_id}")
 
+    upload_context = dict(upload_context or {})
+    upload_lines: list[str] = []
+    if upload_context.get("content_available"):
+        upload_lines.append(
+            "upload_context: "
+            f"kind={upload_context.get('kind', 'unknown')} "
+            f"file={upload_context.get('filename', '')} "
+            f"parse_status={upload_context.get('parse_status', 'unknown')}"
+        )
+        if upload_context.get("summary"):
+            upload_lines.append(f"upload_summary: {upload_context.get('summary', '')}")
+        snippets = [str(item).strip() for item in upload_context.get("key_snippets") or [] if str(item).strip()]
+        if snippets:
+            upload_lines.append(f"upload_snippets: {' | '.join(snippets[:3])}")
+
     page_content = "\n".join(
         [
             f"question: {safe_question or question}",
@@ -56,6 +72,7 @@ def build_turn_summary_document(
             f"intent: {intent}",
             f"source_turn_ids: {source_turn_ids}",
             f"citations: {', '.join(citation_terms) if citation_terms else 'none'}",
+            *upload_lines,
         ]
     )
     return Document(

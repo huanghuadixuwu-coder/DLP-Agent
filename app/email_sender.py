@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import smtplib
 from datetime import datetime, timezone
 from email import policy
@@ -20,9 +21,14 @@ def _mask_email(value: str) -> str:
     return f"{masked}@{domain}"
 
 
-def send_email_163(to_email: str, subject: str, body: str) -> dict[str, Any]:
+def _smtp_provider_name(host: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", (host or "").strip().lower()).strip("_")
+    return normalized or "smtp"
+
+
+def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
     settings = get_settings()
-    provider = "163_smtp"
+    provider = _smtp_provider_name(settings.smtp_host)
     from_email = settings.smtp_from or settings.smtp_username
 
     if not settings.email_send_enabled:
@@ -78,3 +84,8 @@ def send_email_163(to_email: str, subject: str, body: str) -> dict[str, Any]:
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "error": "",
     }
+
+
+def send_email_163(to_email: str, subject: str, body: str) -> dict[str, Any]:
+    # Backward-compatible alias kept for older workflow/tool names.
+    return send_email_smtp(to_email=to_email, subject=subject, body=body)

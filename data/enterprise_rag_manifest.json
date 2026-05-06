@@ -1,0 +1,134 @@
+{
+  "runs": [
+    {
+      "created_at": "2026-05-05T07:39:43.204980+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 75,
+      "questions_seen": 25,
+      "chunks_indexed": 592,
+      "expected_doc_ids_seeded": 25,
+      "sample_source_types": [
+        "confluence",
+        "fireflies",
+        "github",
+        "gmail",
+        "google_drive",
+        "hubspot",
+        "jira",
+        "linear"
+      ]
+    },
+    {
+      "created_at": "2026-05-05T07:40:30.661362+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 15,
+      "questions_seen": 5,
+      "chunks_indexed": 231,
+      "expected_doc_ids_seeded": 5,
+      "sample_source_types": [
+        "fireflies",
+        "github",
+        "gmail",
+        "linear"
+      ]
+    },
+    {
+      "created_at": "2026-05-05T13:57:29.832164+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 280,
+      "questions_seen": 200,
+      "chunks_indexed": 1957,
+      "expected_doc_ids_seeded": 200,
+      "sample_source_types": [
+        "confluence",
+        "fireflies",
+        "github",
+        "gmail",
+        "google_drive",
+        "hubspot",
+        "jira",
+        "linear",
+        "slack"
+      ]
+    },
+    {
+      "created_at": "2026-05-05T14:36:01.022291+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 280,
+      "questions_seen": 200,
+      "chunks_indexed": 1957,
+      "expected_doc_ids_seeded": 200,
+      "sample_source_types": [
+        "confluence",
+        "fireflies",
+        "github",
+        "gmail",
+        "google_drive",
+        "hubspot",
+        "jira",
+        "linear",
+        "slack"
+      ],
+      "enterprise_collection": "enterprise_rag_bench_v2",
+      "sparse_index": "/app/data/enterprise_sparse.db",
+      "reset": true
+    },
+    {
+      "created_at": "2026-05-05T16:00:01.482646+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 60,
+      "questions_seen": 20,
+      "chunks_indexed": 479,
+      "expected_doc_ids_seeded": 20,
+      "sample_source_types": [
+        "confluence",
+        "fireflies",
+        "github",
+        "gmail",
+        "google_drive",
+        "hubspot",
+        "jira",
+        "linear"
+      ],
+      "enterprise_collection": "enterprise_rag_bench_v2",
+      "sparse_index": "/app/data/enterprise_sparse.db",
+      "reset": true
+    },
+    {
+      "created_at": "2026-05-05T16:57:08.754457+00:00",
+      "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
+      "mode": "sample",
+      "documents_path": "/app/documents.parquet",
+      "questions_path": "/app/questions.parquet",
+      "documents_seen": 18,
+      "questions_seen": 6,
+      "chunks_indexed": 631,
+      "expected_doc_ids_seeded": 6,
+      "sample_source_types": [
+        "fireflies",
+        "github",
+        "gmail",
+        "google_drive",
+        "linear"
+      ],
+      "enterprise_collection": "enterprise_rag_bench_v2",
+      "sparse_index": "/app/data/enterprise_sparse.db",
+      "reset": true
+    }
+  ]
+}

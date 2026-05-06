@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import DATA_DIR
+from app.session_transcript import append_transcript_event
 
 
 DB_PATH = DATA_DIR / "conversations.db"
@@ -249,7 +250,27 @@ def append_turn(
             "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
             (now, conversation_id),
         )
-    return get_turn(turn_id) or {}
+    turn = get_turn(turn_id) or {}
+    try:
+        append_transcript_event(
+            {
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "conversation_id": conversation_id,
+                "role": role,
+                "content": content,
+                "redacted_content": redacted_content,
+                "answer_summary": answer_summary,
+                "intent": intent,
+                "tool_calls": tool_calls or [],
+                "citations": citations or [],
+                "debug_payload": debug_payload or {},
+                "created_at": now,
+            }
+        )
+    except Exception:
+        pass
+    return turn
 
 
 def append_exchange(

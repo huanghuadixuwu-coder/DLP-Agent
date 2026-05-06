@@ -50,6 +50,30 @@ WORKFLOW_REJECTED_TOTAL = Counter("agent_workflow_rejected_total", "Total workfl
 WORKFLOW_RISK_TOTAL = Counter("agent_workflow_risk_total", "Total workflow risk decisions.", ["risk_level"])
 WORKFLOW_EMAIL_SENT_TOTAL = Counter("agent_workflow_email_sent_total", "Total workflow emails sent.")
 WORKFLOW_EMAIL_FAILED_TOTAL = Counter("agent_workflow_email_failed_total", "Total workflow email send failures.")
+TASKS_CREATED_TOTAL = Counter("agent_tasks_created_total", "Total asynchronous DLP tasks created.")
+TASK_RETRIES_TOTAL = Counter("agent_task_retries_total", "Total asynchronous task retries.", ["task_type"])
+TASKS_INFLIGHT = Gauge("agent_tasks_inflight", "Current asynchronous DLP tasks in non-terminal states.")
+TASK_STATUS_TOTAL = Gauge("agent_task_status_total", "Current DLP tasks grouped by status.", ["status"])
+TASK_LATENCY_MS = Gauge("agent_task_latency_ms", "Average terminal task latency in milliseconds.")
+QUEUE_BACKLOG = Gauge("agent_queue_backlog", "Current queue backlog size.", ["queue"])
+APPROVAL_PENDING_TOTAL = Gauge("agent_approval_pending_total", "Current DLP tasks waiting for human approval.")
+EMAIL_SEND_TOTAL = Gauge("agent_email_send_total", "Current number of successfully sent DLP emails.")
+EMAIL_SEND_FAILURES_TOTAL = Gauge("agent_email_send_failures_total", "Current number of failed DLP email sends.")
+SCENARIO_REPLAYS_TOTAL = Counter(
+    "agent_dlp_scenario_replays_total",
+    "Total DLP scenario replay tasks created.",
+    ["scenario_id"],
+)
+FAULT_INJECTIONS_TOTAL = Counter(
+    "agent_dlp_fault_injections_total",
+    "Total DLP fault injections triggered.",
+    ["fault_type"],
+)
+DEGRADATION_MODE_TOTAL = Counter(
+    "agent_dlp_degradation_mode_total",
+    "Total DLP degradation mode activations.",
+    ["mode"],
+)
 REQUEST_LATENCY_MS = Histogram(
     "agent_request_latency_ms",
     "Total request latency in milliseconds.",
@@ -241,6 +265,48 @@ def record_workflow_email_sent(success: bool) -> None:
         WORKFLOW_EMAIL_SENT_TOTAL.inc()
     else:
         WORKFLOW_EMAIL_FAILED_TOTAL.inc()
+
+
+def record_task_created() -> None:
+    TASKS_CREATED_TOTAL.inc()
+
+
+def record_task_retry(task_type: str) -> None:
+    TASK_RETRIES_TOTAL.labels(task_type=task_type).inc()
+
+
+def record_dlp_scenario_replay(scenario_id: str) -> None:
+    if scenario_id:
+        SCENARIO_REPLAYS_TOTAL.labels(scenario_id=scenario_id).inc()
+
+
+def record_fault_injection(fault_type: str) -> None:
+    if fault_type:
+        FAULT_INJECTIONS_TOTAL.labels(fault_type=fault_type).inc()
+
+
+def record_task_degradation(mode: str) -> None:
+    if mode:
+        DEGRADATION_MODE_TOTAL.labels(mode=mode).inc()
+
+
+def refresh_task_metrics(
+    *,
+    total: int,
+    inflight: int,
+    by_status: dict[str, int],
+    backlog: dict[str, int],
+    average_latency_ms: float,
+) -> None:
+    TASKS_INFLIGHT.set(inflight)
+    TASK_LATENCY_MS.set(average_latency_ms)
+    APPROVAL_PENDING_TOTAL.set(by_status.get("pending_approval", 0))
+    EMAIL_SEND_TOTAL.set(by_status.get("sent", 0))
+    EMAIL_SEND_FAILURES_TOTAL.set(by_status.get("send_failed", 0))
+    for status, count in by_status.items():
+        TASK_STATUS_TOTAL.labels(status=status).set(count)
+    for queue_name, count in backlog.items():
+        QUEUE_BACKLOG.labels(queue=queue_name).set(count)
 
 
 def render_metrics() -> bytes:

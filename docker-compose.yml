@@ -14,6 +14,32 @@ services:
     ports:
       - "8010:8000"
     depends_on:
+      - postgres
+      - redis
+      - chroma
+    volumes:
+      - .:/app
+      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >-
+      sh -c "
+      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=dlp_risk_queue --concurrency=$${RISK_WORKER_CONCURRENCY:-4} &
+      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=email_send_queue --concurrency=$${EMAIL_WORKER_CONCURRENCY:-2} &
+      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=mail_inbound_queue --concurrency=$${MAIL_WORKER_CONCURRENCY:-1} &
+      wait
+      "
+    env_file:
+      - .env
+    environment:
+      CHROMA_HOST: chroma
+      API_BASE_URL: http://api:8000
+    depends_on:
+      - postgres
+      - redis
       - chroma
     volumes:
       - .:/app
@@ -36,6 +62,24 @@ services:
       - .:/app
       - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dlp_agent
+      POSTGRES_USER: dlp_agent
+      POSTGRES_PASSWORD: dlp_agent
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+
   chroma:
     image: chromadb/chroma:1.0.15
     ports:
@@ -57,4 +101,6 @@ services:
 
 volumes:
   chroma_data:
+  postgres_data:
   prometheus_data:
+  redis_data:

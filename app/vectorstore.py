@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 import chromadb
@@ -10,6 +12,9 @@ from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from app.config import get_settings
+
+
+_EMBEDDING_INIT_LOCK = Lock()
 
 
 @lru_cache(maxsize=1)
@@ -22,57 +27,150 @@ def get_chroma_client() -> chromadb.HttpClient:
     )
 
 
-@lru_cache(maxsize=1)
+def _resolve_model_name(local_dir: str, model_name: str) -> str:
+    candidate = local_dir.strip()
+    if candidate and Path(candidate).exists():
+        return candidate
+    return model_name
+
+
+@lru_cache(maxsize=8)
+def _get_embeddings(model_name: str, device: str) -> HuggingFaceEmbeddings:
+    with _EMBEDDING_INIT_LOCK:
+        return HuggingFaceEmbeddings(
+            model_name=model_name,
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+
 def get_embeddings() -> HuggingFaceEmbeddings:
     settings = get_settings()
-    return HuggingFaceEmbeddings(
-        model_name=settings.embedding_local_dir or settings.embedding_model,
-        model_kwargs={"device": settings.embedding_device},
-        encode_kwargs={"normalize_embeddings": True},
+    model_name = _resolve_model_name(settings.embedding_local_dir, settings.embedding_model)
+    return _get_embeddings(model_name, settings.embedding_device)
+
+
+def get_enterprise_embeddings() -> HuggingFaceEmbeddings:
+    settings = get_settings()
+    model_name = _resolve_model_name(settings.enterprise_embedding_local_dir, settings.enterprise_embedding_model)
+    return _get_embeddings(model_name, settings.embedding_device)
+
+
+def get_named_vectorstore(collection_name: str, embedding_function: HuggingFaceEmbeddings) -> Chroma:
+    return Chroma(
+        client=get_chroma_client(),
+        collection_name=collection_name,
+        embedding_function=embedding_function,
     )
 
 
 @lru_cache(maxsize=1)
 def get_vectorstore() -> Chroma:
     settings = get_settings()
-    return Chroma(
-        client=get_chroma_client(),
-        collection_name=settings.chroma_collection,
-        embedding_function=get_embeddings(),
-    )
+    return get_named_vectorstore(settings.chroma_collection, get_embeddings())
+
+
+@lru_cache(maxsize=1)
+def get_enterprise_vectorstore() -> Chroma:
+    settings = get_settings()
+    return get_named_vectorstore(settings.enterprise_chroma_collection, get_enterprise_embeddings())
+
+
+@lru_cache(maxsize=1)
+def get_workspace_memory_vectorstore() -> Chroma:
+    settings = get_settings()
+    return get_named_vectorstore(settings.workspace_memory_chroma_collection, get_enterprise_embeddings())
+
+
+def get_collection(collection_name: str):
+    return get_chroma_client().get_or_create_collection(name=collection_name)
+
+
+def get_enterprise_collection():
+    settings = get_settings()
+    return get_collection(settings.enterprise_chroma_collection)
+
+
+def get_workspace_memory_collection():
+    settings = get_settings()
+    return get_collection(settings.workspace_memory_chroma_collection)
 
 
 def reset_caches() -> None:
     get_chroma_client.cache_clear()
-    get_embeddings.cache_clear()
+    _get_embeddings.cache_clear()
     get_vectorstore.cache_clear()
+    get_enterprise_vectorstore.cache_clear()
+    get_workspace_memory_vectorstore.cache_clear()
 
 
 def count_collection() -> int:
     settings = get_settings()
-    collection = get_chroma_client().get_or_create_collection(name=settings.chroma_collection)
-    return collection.count()
+    return get_collection(settings.chroma_collection).count()
 
 
 def reset_collection() -> None:
     settings = get_settings()
+    reset_named_collection(settings.chroma_collection)
+
+
+def reset_named_collection(collection_name: str) -> None:
     client = get_chroma_client()
     try:
-        client.delete_collection(name=settings.chroma_collection)
+        client.delete_collection(name=collection_name)
     except Exception:
         pass
     reset_caches()
+
+
+def _upsert_to_collection(
+    *,
+    collection,
+    embedding_function: HuggingFaceEmbeddings,
+    documents: list[Document],
+    batch_size: int = 32,
+) -> int:
+    if not documents:
+        return 0
+    for start in range(0, len(documents), batch_size):
+        batch = documents[start : start + batch_size]
+        ids = [str(doc.metadata["chunk_id"]) for doc in batch]
+        texts = [doc.page_content for doc in batch]
+        metadatas = [dict(doc.metadata) for doc in batch]
+        embeddings = embedding_function.embed_documents(texts)
+        collection.upsert(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings)
+    return len(documents)
 
 
 def upsert_documents(documents: Iterable[Document]) -> int:
     docs = list(documents)
     if not docs:
         return 0
+    settings = get_settings()
+    return _upsert_to_collection(
+        collection=get_collection(settings.chroma_collection),
+        embedding_function=get_embeddings(),
+        documents=docs,
+    )
 
-    vectorstore = get_vectorstore()
-    batch_size = 32
-    for start in range(0, len(docs), batch_size):
-        batch = docs[start : start + batch_size]
-        ids = [str(doc.metadata["chunk_id"]) for doc in batch]
-        vectorstore.add_documents(documents=batch, ids=ids)
-    return len(docs)
+
+def upsert_enterprise_documents(documents: Iterable[Document]) -> int:
+    docs = list(documents)
+    if not docs:
+        return 0
+    return _upsert_to_collection(
+        collection=get_enterprise_collection(),
+        embedding_function=get_enterprise_embeddings(),
+        documents=docs,
+    )
+
+
+def upsert_workspace_memory_documents(documents: Iterable[Document]) -> int:
+    docs = list(documents)
+    if not docs:
+        return 0
+    return _upsert_to_collection(
+        collection=get_workspace_memory_collection(),
+        embedding_function=get_enterprise_embeddings(),
+        documents=docs,
+    )
