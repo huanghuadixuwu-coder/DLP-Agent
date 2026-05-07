@@ -180,6 +180,7 @@ class UnifiedAgentRequest(BaseModel):
     uploaded_filename: str = ""
     uploaded_content_type: str = ""
     uploaded_text: str = ""
+    uploaded_file_base64: str = ""
     source_parse_status: str = "not_provided"
     source_parse_error: str = ""
 
@@ -213,11 +214,25 @@ class UnifiedAgentResponse(BaseModel):
     answer_collapsed: bool = False
     reflection_notes: str | None = None
     upload_context: dict[str, Any] = Field(default_factory=dict)
+    route_mode: str = "rule"
+    router_intent: str = ""
+    router_reason: str = ""
+    required_grounding: str = "none"
+    fast_path_used: bool = False
+    degraded_from: str = "none"
     planner_type: str = ""
     task_plan: dict[str, Any] = Field(default_factory=dict)
     subtask_results: list[dict[str, Any]] = Field(default_factory=list)
     aggregation_strategy: str = ""
     partial_failures: list[dict[str, Any]] = Field(default_factory=list)
+    react_trace: list[dict[str, Any]] = Field(default_factory=list)
+    loop_step_count: int = 0
+    termination_reason: str = ""
+    pending_confirmation: dict[str, Any] = Field(default_factory=dict)
+    confirmation_payload: dict[str, Any] = Field(default_factory=dict)
+    final_answer_source: str = ""
+    memory_reads: list[dict[str, Any]] = Field(default_factory=list)
+    tool_observations: list[dict[str, Any]] = Field(default_factory=list)
     workflow_id: str | None = None
     workflow_status: str | None = None
     workflow_risk_level: str | None = None
@@ -447,10 +462,23 @@ class DlpTaskCreateRequest(BaseModel):
     session_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)
     message: str = ""
+    request_message: str = ""
+    review_content: str = ""
+    resolved_outbound_content: str = ""
+    resolved_source_kind: str = ""
+    delivery_subject: str = ""
+    delivery_body: str = ""
+    delivery_plan_kind: str = ""
+    attachment_strategy: str = "none"
+    attachment_content: str = ""
+    attachment_filename: str = ""
+    attachment_content_type: str = ""
+    attachment_blob_id: str = ""
     destination_email: str = ""
     uploaded_filename: str = ""
     uploaded_content_type: str = ""
     uploaded_text: str = ""
+    uploaded_file_base64: str = ""
     source_parse_status: str = "not_provided"
     source_parse_error: str = ""
     requested_action: str = "summarize_and_send"
@@ -474,6 +502,7 @@ class DlpTaskSupplementRequest(BaseModel):
     uploaded_filename: str = ""
     uploaded_content_type: str = ""
     uploaded_text: str = ""
+    uploaded_file_base64: str = ""
     source_parse_status: str = "not_provided"
     source_parse_error: str = ""
 
@@ -509,6 +538,15 @@ class DlpTaskResponse(BaseModel):
     destination_email: str = ""
     requested_action: str = "summarize_and_send"
     message_raw: str
+    request_message: str = ""
+    delivery_subject: str = ""
+    delivery_body: str = ""
+    delivery_plan_kind: str = ""
+    resolved_source_kind: str = ""
+    attachment_strategy: str = "none"
+    attachment_filename: str = ""
+    attachment_content_type: str = ""
+    attachment_blob_id: str = ""
     message_redacted: str = ""
     source_filename: str = ""
     source_content_type: str = ""

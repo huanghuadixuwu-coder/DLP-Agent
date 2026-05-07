@@ -62,16 +62,21 @@ class AgentState(TypedDict, total=False):
     node_latencies_ms: dict[str, float]
 
 
-@lru_cache(maxsize=1)
-def get_llm() -> ChatOpenAI:
+@lru_cache(maxsize=16)
+def get_llm(
+    model: str | None = None,
+    timeout: float | None = None,
+    temperature: float = 0.2,
+    max_retries: int = 1,
+) -> ChatOpenAI:
     settings = get_settings()
     return ChatOpenAI(
-        model=settings.llm_model_main,
+        model=model or settings.llm_model_main,
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
-        temperature=0.2,
-        timeout=settings.llm_timeout_seconds,
-        max_retries=1,
+        temperature=temperature,
+        timeout=settings.llm_timeout_seconds if timeout is None else timeout,
+        max_retries=max_retries,
     )
 
 

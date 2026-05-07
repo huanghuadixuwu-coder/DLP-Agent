@@ -41,6 +41,7 @@ def build_turn_summary_document(
     intent: str,
     citations: list[dict[str, Any]],
     upload_context: dict[str, Any] | None = None,
+    dynamic_memory: dict[str, Any] | None = None,
 ) -> Document:
     source_turn_ids = f"{user_turn_id},{assistant_turn_id}"
     citation_terms = []
@@ -65,6 +66,18 @@ def build_turn_summary_document(
         if snippets:
             upload_lines.append(f"upload_snippets: {' | '.join(snippets[:3])}")
 
+    dynamic_memory = dict(dynamic_memory or {})
+    dynamic_lines: list[str] = []
+    if dynamic_memory:
+        for key in ("user_goal", "outcome", "failure_reason", "memory_scope"):
+            value = str(dynamic_memory.get(key) or "").strip()
+            if value:
+                dynamic_lines.append(f"{key}: {compact_text(value, 360)}")
+        for key in ("key_files", "recipients", "task_ids"):
+            values = [str(item).strip() for item in dynamic_memory.get(key) or [] if str(item).strip()]
+            if values:
+                dynamic_lines.append(f"{key}: {', '.join(values[:6])}")
+
     page_content = "\n".join(
         [
             f"question: {safe_question or question}",
@@ -73,6 +86,7 @@ def build_turn_summary_document(
             f"source_turn_ids: {source_turn_ids}",
             f"citations: {', '.join(citation_terms) if citation_terms else 'none'}",
             *upload_lines,
+            *dynamic_lines,
         ]
     )
     return Document(

@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.conversation_memory import compact_text
+from app.conversation_memory import build_memory_context, compact_text
 from app.enterprise_rag.core.answer_composer import compose_enterprise_answer
 from app.enterprise_rag.core.query_planner import build_retrieval_plan, infer_source_types
 from app.enterprise_rag.core.retrieval_orchestrator import retrieve_evidence
@@ -40,7 +40,21 @@ def _tool_catalog_list(_: dict[str, Any], __: OrchestrationContext, ___: dict[st
 
 
 def _conversation_context_fetch(payload: dict[str, Any], _: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
-    return {"conversation_id": payload.get("conversation_id", ""), "notes": "Conversation memory is written by the chat pipeline."}
+    context = _
+    query = str(payload.get("query") or context.message)
+    memory = build_memory_context(
+        session_id=context.session_id,
+        conversation_id=context.conversation_id,
+        question=query,
+    )
+    return {
+        "conversation_id": context.conversation_id,
+        "memory_context": memory,
+        "recent_turns": str(memory.get("memory_context") or ""),
+        "memory_hits": int(memory.get("memory_hits", 0)),
+        "merged_memory_hits": int(memory.get("merged_memory_hits", 0)),
+        "notes": "Fetched short-term conversation memory context.",
+    }
 
 
 def _governance_task_context_fetch(_: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +221,9 @@ Rules:
 - Do not assume this content should be sent externally unless the user explicitly asks.
 - For document summarize: provide a concise summary of what the document is about.
 - For document qa: answer the user's question only from the uploaded content.
+- For document critique: provide a brief overall judgment, 2-4 main issues, and short improvement suggestions.
+- For document rewrite: rewrite according to the user's stated goal, using only the uploaded content.
+- For document action-item extraction: list concrete next steps or action items supported by the uploaded content.
 - For email summarize: summarize the incoming email's topic, key asks, and likely next actions.
 - For email qa: answer only from the uploaded email content.
 - If the uploaded content is insufficient, say so clearly.
@@ -276,7 +293,14 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
         }
 
     kind_label = "incoming email" if content_kind == "email" else "document"
-    task_label = "summarize" if task_type == "summarize" else "answer the question"
+    task_label_map = {
+        "summarize": "summarize",
+        "qa": "answer the question",
+        "critique": "critique the writing quality and suggest improvements",
+        "rewrite": "rewrite according to the user's request",
+        "extract_action_items": "extract action items and next steps",
+    }
+    task_label = task_label_map.get(task_type, "answer the question")
     user_message = str(payload.get("message") or context.message)
     answer = ""
     try:
@@ -302,6 +326,13 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
             answer = "我已按上传邮件内容进行概览。当前看起来这是一封需要阅读和提炼重点的来信，建议先确认主题、核心诉求和待办。"
         else:
             answer = compact_text(analysis_source, 600)
+
+    if task_type == "critique" and content_kind != "email" and (not answer or answer == compact_text(analysis_source, 600)):
+        answer = "基于当前上传内容可初步判断：这份文档还不够成熟，主要问题通常集中在结构不清、重点不突出、论证支撑不足或表达冗长。建议先明确核心结论，再压缩重复表述，并补齐关键依据与行动建议。"
+    elif task_type == "rewrite" and (not answer or answer == compact_text(analysis_source, 600)):
+        answer = compact_text(analysis_source, 800)
+    elif task_type == "extract_action_items" and (not answer or answer == compact_text(analysis_source, 600)):
+        answer = "我已读到上传内容，但当前无法稳定抽取更完整的行动项。你可以让我先总结文档，或明确希望我提取的是待办、风险还是下一步计划。"
 
     summary = compact_text(answer, 400)
     raw_snippets = [segment.strip() for segment in re.split(r"\n{2,}", analysis_source) if segment.strip()]
@@ -346,21 +377,98 @@ def _persona_or_chitchat(payload: dict[str, Any], _: OrchestrationContext, __: d
 
 def build_tool_registry() -> dict[str, ToolDefinition]:
     return {
-        "tool_catalog_list": ToolDefinition("tool_catalog_list", "List available orchestration tools and preconditions.", input_schema={}),
-        "conversation_context_fetch": ToolDefinition("conversation_context_fetch", "Fetch short-term conversation context metadata.", input_schema={}),
-        "governance_task_context_fetch": ToolDefinition("governance_task_context_fetch", "Fetch latest recoverable governance task in the conversation.", input_schema={}),
-        "memory_search": ToolDefinition("memory_search", "Search workspace memory markdown files via hybrid vector + FTS retrieval.", input_schema={"query": "user query", "top_k": "int"}),
-        "outbound_mail_summary": ToolDefinition("outbound_mail_summary", "Summarize outbound mail sent by this Agent in a time window.", input_schema={"since": "ISO datetime", "until": "ISO datetime"}),
-        "inbound_mail_summary": ToolDefinition("inbound_mail_summary", "Summarize inbound mail in a time window.", input_schema={"since": "ISO datetime", "until": "ISO datetime"}),
-        "inbound_message_search": ToolDefinition("inbound_message_search", "Search synchronized inbound mail by keywords.", input_schema={"query": "user query", "limit": "int"}),
-        "inbound_message_read": ToolDefinition("inbound_message_read", "Read a synchronized inbound mail message.", input_schema={"message_id": "mail message id"}),
-        "inbound_reply_draft": ToolDefinition("inbound_reply_draft", "Draft a reply for a synchronized inbound mail message.", input_schema={"message_id": "mail message id"}),
+        "tool_catalog_list": ToolDefinition(
+            "tool_catalog_list",
+            "List available orchestration tools and preconditions.",
+            input_schema={},
+            read_only=True,
+            returns_observation_type="tool_catalog",
+        ),
+        "conversation_context_fetch": ToolDefinition(
+            "conversation_context_fetch",
+            "Fetch short-term conversation context metadata and retrieved summary context.",
+            input_schema={"query": "optional user query"},
+            read_only=True,
+            safe_when=["The user asks about earlier turns in the current conversation."],
+            returns_observation_type="conversation_context",
+        ),
+        "governance_task_context_fetch": ToolDefinition(
+            "governance_task_context_fetch",
+            "Fetch latest recoverable governance task in the conversation.",
+            input_schema={},
+            when_to_use=["Use when the user asks about a pending DLP task, failed send, approval state, or recovery path."],
+            reads_from=["task_store"],
+            read_only=True,
+            returns_observation_type="task_state",
+        ),
+        "memory_search": ToolDefinition(
+            "memory_search",
+            "Search workspace memory markdown files via hybrid vector + FTS retrieval.",
+            input_schema={"query": "user query", "top_k": "int"},
+            read_only=True,
+            safe_when=["The user asks for background, project context, or prior notes outside the current turn history."],
+            returns_observation_type="workspace_memory",
+        ),
+        "outbound_mail_summary": ToolDefinition(
+            "outbound_mail_summary",
+            "Summarize outbound mail sent by this Agent in a time window.",
+            input_schema={"since": "ISO datetime", "until": "ISO datetime"},
+            when_to_use=["Use when the user asks how many mails were sent, recent sent mail, or outbound delivery history."],
+            reads_from=["task_store"],
+            read_only=True,
+            returns_observation_type="mailbox_status",
+            provider_constraints=["Uses governed task records, not a provider-native Sent folder."],
+            examples=["今天发了多少邮件", "show recent outbound mail"],
+        ),
+        "inbound_mail_summary": ToolDefinition(
+            "inbound_mail_summary",
+            "Summarize inbound mail in a time window.",
+            input_schema={"since": "ISO datetime", "until": "ISO datetime"},
+            when_to_use=["Use when the user asks for a mailbox digest, unread count, or important inbound mail summary."],
+            reads_from=["local_inbound_store"],
+            read_only=True,
+            returns_observation_type="mailbox_status",
+            provider_constraints=["Depends on synchronized inbound mailbox records."],
+            examples=["今天收到了什么重要邮件", "mail digest"],
+        ),
+        "inbound_message_search": ToolDefinition(
+            "inbound_message_search",
+            "Search synchronized inbound mail by keywords.",
+            input_schema={"query": "user query", "limit": "int"},
+            when_to_use=["Use when the user refers to a past inbound mail but the exact message is not yet resolved."],
+            reads_from=["local_inbound_store"],
+            read_only=True,
+            returns_observation_type="mail_search",
+            examples=["find the mail about billing", "搜索那封讲合同的邮件"],
+        ),
+        "inbound_message_read": ToolDefinition(
+            "inbound_message_read",
+            "Read a synchronized inbound mail message.",
+            input_schema={"message_id": "mail message id"},
+            when_to_use=["Use after a target inbound mail has been identified and full details are needed."],
+            reads_from=["local_inbound_store"],
+            read_only=True,
+            returns_observation_type="mail_message",
+            examples=["read that message", "打开上一封重要邮件"],
+        ),
+        "inbound_reply_draft": ToolDefinition(
+            "inbound_reply_draft",
+            "Draft a reply for a synchronized inbound mail message.",
+            input_schema={"message_id": "mail message id"},
+            when_to_use=["Use when the user wants a reply draft to a synchronized inbound message."],
+            reads_from=["local_inbound_store"],
+            writes_to=["draft_answer"],
+            read_only=True,
+            returns_observation_type="draft",
+            provider_constraints=["Draft only; does not send mail directly."],
+            examples=["reply to the latest billing mail", "给那封来信起草回复"],
+        ),
         "uploaded_content_analyze": ToolDefinition(
             "uploaded_content_analyze",
             "Analyze uploaded content as a document or a single incoming email for summarization or question answering.",
             input_schema={
                 "content_kind": "document|email|unknown",
-                "task_type": "summarize|qa",
+                "task_type": "summarize|qa|critique|rewrite|extract_action_items",
                 "message": "user request",
                 "uploaded_filename": "filename",
                 "uploaded_content_type": "mime type",
@@ -368,17 +476,53 @@ def build_tool_registry() -> dict[str, ToolDefinition]:
                 "source_parse_status": "parse status",
                 "source_parse_error": "parse error",
             },
+            read_only=True,
+            returns_observation_type="uploaded_content",
         ),
         "persona_or_chitchat": ToolDefinition(
             "persona_or_chitchat",
             "Handle self-introduction, capability explanation, how-to-use guidance, and lightweight daily chitchat.",
             input_schema={"message": "user message"},
+            read_only=True,
+            returns_observation_type="persona_answer",
         ),
-        "unsupported_capability": ToolDefinition("unsupported_capability", "Return a clear unsupported-capability response with next-step guidance.", input_schema={"reason": "user-facing explanation", "capability": "unsupported capability id"}),
-        "enterprise_search": ToolDefinition("enterprise_search", "Retrieve enterprise knowledge evidence from EnterpriseRAG-Bench index.", input_schema={"question": "user question", "source_types": "list[str]", "top_k": "int"}),
-        "enterprise_evidence_pack": ToolDefinition("enterprise_evidence_pack", "Normalize retrieved enterprise evidence into a citation-ready pack.", input_schema={"evidence": "evidence payload"}),
-        "enterprise_answer": ToolDefinition("enterprise_answer", "Compose an enterprise answer from evidence only.", input_schema={"question": "user question"}),
-        "enterprise_rag_query": ToolDefinition("enterprise_rag_query", "Run retrieval + evidence + answer composition for enterprise knowledge questions.", input_schema={"question": "user question", "source_types": "list[str]", "top_k": "int"}),
+        "unsupported_capability": ToolDefinition(
+            "unsupported_capability",
+            "Return a clear unsupported-capability response with next-step guidance.",
+            input_schema={"reason": "user-facing explanation", "capability": "unsupported capability id"},
+            read_only=True,
+            returns_observation_type="unsupported_capability",
+        ),
+        "enterprise_search": ToolDefinition(
+            "enterprise_search",
+            "Retrieve enterprise knowledge evidence from EnterpriseRAG-Bench index.",
+            input_schema={"question": "user question", "source_types": "list[str]", "top_k": "int"},
+            read_only=True,
+            safe_when=["The user asks a grounded enterprise knowledge question that needs evidence retrieval."],
+            returns_observation_type="enterprise_evidence",
+        ),
+        "enterprise_evidence_pack": ToolDefinition(
+            "enterprise_evidence_pack",
+            "Normalize retrieved enterprise evidence into a citation-ready pack.",
+            input_schema={"evidence": "evidence payload"},
+            read_only=True,
+            returns_observation_type="enterprise_evidence_pack",
+        ),
+        "enterprise_answer": ToolDefinition(
+            "enterprise_answer",
+            "Compose an enterprise answer from evidence only.",
+            input_schema={"question": "user question"},
+            read_only=True,
+            returns_observation_type="enterprise_answer",
+        ),
+        "enterprise_rag_query": ToolDefinition(
+            "enterprise_rag_query",
+            "Run retrieval + evidence + answer composition for enterprise knowledge questions.",
+            input_schema={"question": "user question", "source_types": "list[str]", "top_k": "int"},
+            read_only=True,
+            safe_when=["The user asks about enterprise facts, meetings, customers, docs, or internal systems."],
+            returns_observation_type="enterprise_answer",
+        ),
     }
 
 

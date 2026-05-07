@@ -1,12 +1,18 @@
 # 项目 ToDo 总表
 
-更新时间：2026-05-06  
+更新时间：2026-05-07  
 项目目录：`E:\leetcode-rag-agent-enterprise`
 
 状态说明：
 - `[x]` 已完成
 - `[-]` 进行中 / 已部分落地
 - `[ ]` 未完成
+
+## 0. 开发自查约束
+- `[x]` 默认只以 Docker 作为运行与验收环境，不以本机 Python 作为有效基线
+- `[-]` 每次设计或改动前，必须先按 [总体要求.md](E:/leetcode-rag-agent-enterprise/总体要求.md) 自查
+- `[ ]` 每次 agent 相关改动前，额外对照 `总体要求.md` 第 2/3/6/7/8 条，确认“规则只管状态与边界，不管用户可见语言”
+- `[ ]` 每次架构调整前，额外查阅 `enterprise_rag_problems_and_solutions.md`，避免重复引入模板化、玩具化或错误分层
 
 ## 1. 产品主线
 - `[x]` 主线已切到“安全外发与邮件协作 Agent”
@@ -35,7 +41,19 @@
 - `[x]` 企业知识问答默认进入 `enterprise_rag_query`
 - `[x]` 已修复 planner 误传非法 `source_types` 导致 `/agent/chat` 检索被过滤为空的问题
 - `[x]` 企业问答可见引用已按文档去重，避免同一文档重复展示
-- `[ ]` 继续完善依赖图、并行执行和部分失败聚合
+- `[-]` `/agent/chat` 正在从静态 `planner -> executor -> aggregator` 升级为标准 ReAct 主循环
+- `[x]` 已新增 `think -> act -> observe -> remember -> terminate` controller 骨架
+- `[x]` capability 已开始从“用户语义入口”降级为“底层受控工具集合”
+- `[x]` 已为工具补充 `read_only / side_effectful / requires_confirmation / returns_observation_type` 元信息
+- `[x]` 新主链路已支持 `react_trace / termination_reason / pending_confirmation / memory_reads`
+- `[x]` 已新增 `/agent/chat` 轻量 `L0 router`，先分流到 `Fast Path` 或 `Slow Path`
+- `[x]` Fast Path 已覆盖 `persona / contextual_memory / upload_analysis / enterprise_fact / mail_status`
+- `[x]` `uploaded_content_analyze` 已扩展到 `summarize / qa / critique / rewrite / extract_action_items`
+- `[x]` `react_trace` 仅在 Slow Path 返回；Fast Path 直接返回空 trace
+- `[x]` ReAct `think` 超时或 orchestration 失败时，已优先降级到安全直答或澄清，而不是直接 500
+- `[-]` legacy orchestration fallback 默认关闭，仅在显式开关启用时保留为排障退路
+- `[ ]` 继续把更多旧的静态路由判断迁入 ReAct 循环
+- `[ ]` 继续完善副作用动作的确认节点与恢复执行衔接
 
 ## 5. EnterpriseRAG 答案质量修复
 - `[-]` `EnterpriseRAG answer quality repair` 持续进行中
@@ -101,12 +119,79 @@
 
 ## 6. Hermes 风格 Memory
 - `[x]` 已完成 memory / transcript / provider 分层方案
-- `[-]` workspace memory hybrid search 已落地
-- `[ ]` 把新的 context assembler 完整接入主推理链路
+- `[-]` workspace memory hybrid search 已落地，但还不是主 agent 的一等动作
+- `[x]` recent turns / conversation summary 已接入 ReAct 主循环的 memory read 动作
+- `[x]` contextual memory 问题不再只能依赖 persona 或企业检索路径
+- `[ ]` 继续提升 `conversation_recent -> conversation_summary -> workspace_memory` 的自主决策稳定性
+- `[ ]` 把新的 context assembler 完整接入所有主推理链路，统一成 ReAct 的 memory substrate
 
 ## 7. 下一阶段优先级
-1. `[ ]` 继续提升 recommendation 类问题的中文骨架答案质量
-2. `[ ]` 继续提升同主题不同问法下的 answer intent 稳定性
-3. `[ ]` 在 Docker 内重跑更大规模 benchmark，刷新稳定基线
-4. `[ ]` 继续收口 Hermes memory 到主推理链路
-5. `[ ]` 继续优化 DLP 外发摘要、邮件回复和异常治理
+1. `[ ]` 把邮件链路里仍写死的 `answer / clarification / draft` 文案全部迁出规则层，改成 `state/observation -> LLM renderer`
+2. `[-]` 保留并继续完善 mail authoring state model：pending draft / patch / confirm 三段式
+3. `[-]` 保留并继续完善 body_constraints + attachment/body/reference source separation，但只输出结构，不直接输出用户可见文案
+4. `[ ]` 在 Docker 内回归真实 UI bad case，重点验证“新问法不靠补模板也能泛化”
+5. `[ ]` 再继续收口 `/agent/chat` 余下 legacy 预判逻辑与 memory/context 稳定性
+
+## 7.1 ?????????
+- `[-]` legacy `planner -> executor -> aggregator` ?????????????????????????????memory/context ?????????????????
+- `[x]` ??? contextual memory ?????????????????????????????? LLM ??????????????????
+- `[x]` `/agent/chat` ????????orchestration ?????????`run_unified_agent`???????????legacy orchestration fallback
+
+## 7.2 Outbound resolution follow-up
+- `[x]` Referential outbound requests now clarify the target instead of turning the raw send instruction into `message_raw`.
+- `[x]` Explicit summary-send requests now preserve the original command in `request_message` and write the resolved assistant summary into `message_raw`.
+- `[x]` DLP task creation now separates `request_message` from the real outbound body, so worker summaries and delivery use resolved content rather than the user command itself.
+- `[x]` `send both / ???` now sends the summary in the email body and includes the original uploaded text as an attachment through the SMTP / DLP worker path.
+- `[x]` Uploaded raw files now persist as upload blobs and can be sent as true binary attachments through the SMTP / DLP worker path.
+- `[-]` Outbound email body / attachment semantics are being repaired so recipient-visible mail follows user intent instead of DLP summary boilerplate.
+- `[x]` Delivery planning has been extracted into a dedicated strategy module instead of continuing to grow inline `if/else` branches in `main.py`.
+- `[x]` Worker sending now uses stored `delivery_subject` / `delivery_body`; DLP summary stays on the review/audit path.
+- `[x]` Attachment-style requests can now produce a short cover note in the body while sending the original upload as the actual attachment.
+- `[-]` Add `mail_draft_state` so follow-up edits patch the pending draft instead of creating a new plan.
+- `[-]` Add structured `body_constraints` for self-intro / date / time / reason / tone.
+- `[-]` Add `body_source_provenance` guardrail to block attachment text from leaking into the email body.
+- `[-]` Remove rule-authored user-visible wording from outbound/mail authoring; rules may only emit `missing_fields / constraints / source_policy / draft_state / patch_kind`
+- `[x]` Replace hard-coded clarification and draft sentence assembly with LLM rendering over `mail_draft_result / mail_patch_result / mail_confirmation_result`
+- `[ ]` Only allow attachment content into the body when the user explicitly requests quoting/summarizing it there.
+- `[x]` Regression: “讲明我们是谁” must become body intent, not disappear into a default cover note.
+- `[x]` Regression: “需要更改，正文内容告知发送的时间、日期” must patch the existing pending draft and preserve recipient/attachment.
+- `[x]` When date/time is requested in a pending draft patch, structured `send_date_value / send_time_value` must be populated and rendered as concrete values instead of placeholders.
+- `[ ]` Regression: equivalent new phrasings should work without adding a new wording template branch
+
+## 8. Hermes Memory Dynamic Policy
+- `[-]` Hermes-style memory substrate is now the current implementation priority.
+- `[x]` Define memory write policy across `session_transcript / turn_summary / workspace_memory / user_model`.
+- `[x]` Add structured dynamic turn memory at turn end with goal, outcome, files, recipients, task ids, failure reason, and provenance.
+- `[x]` Extend ReAct memory reads to support `conversation_recent / conversation_summary / workspace_memory / user_model`.
+- `[x]` Add transcript compaction records that keep the recent raw window and summarize older turns with preserved identifiers.
+- `[x]` Add controlled `reflection_candidate` records; they do not mutate tools, prompts, approval policy, or delivery policy automatically.
+- `[x]` Store high-risk user memory as pending candidates instead of active long-term behavior.
+- `[ ]` Add UI or admin review flow for approving `pending_memory_update / reflection_candidate` records.
+- `[ ]` Tune memory routing after Docker regression with real conversations.
+
+## 8.1 Memory Safety Boundaries
+- `[x]` Memory may provide context, preferences, and task continuity.
+- `[x]` Enterprise factual answers must still use EnterpriseRAG evidence; memory cannot replace enterprise citations.
+- `[x]` Side-effect policy, approval rules, and outbound delivery defaults cannot be changed by reflection automatically.
+- `[ ]` Add explicit regression cases for memory-vs-EnterpriseRAG boundary.
+
+## 8.2 Updated Next Priorities
+1. `[x]` Complete the first Hermes-style memory substrate.
+2. `[x]` Connect controlled reflection and transcript compaction strategy.
+3. `[ ]` Fix outbound email body / attachment semantics so recipient-visible mail follows the user request instead of DLP summaries.
+4. `[ ]` Add calendar and Tencent Meeting capabilities.
+
+## 9. Observation-First Answer Rendering
+- `[-]` `/agent/chat` is being de-templated so Router/Guardrail stay deterministic but most user-visible answers come from LLM rendering over observations.
+- `[x]` Add a shared final answer renderer for Fast Path and Slow Path.
+- `[x]` Fast Path upload/persona/enterprise/memory/mail-status now produce structured observations before answer rendering.
+- `[x]` Slow Path final answer composition now uses the shared renderer instead of a separate local prompt path.
+- `[x]` Tool observations in ReAct now preserve payload and citations for downstream answer rendering.
+- `[x]` Router fallback now adds explicit English/contextual memory cues, reducing mixed-language recall questions from slipping into Slow Path.
+- `[-]` Deterministic user-visible answers are now constrained to confirmation / clarification / unsupported capability / hard timeout fallback, but a few rule-path helpers still need follow-up cleanup.
+- `[-]` `mail draft / task queue / mailbox summary / compound request` are being migrated onto the same observation-first renderer.
+- `[-]` Mail draft rendering is being upgraded from plain `resolved_body` to structured draft state + body constraints + body sources.
+- `[-]` Mail follow-up edits should emit `mail_patch_result` observations before final confirmation rendering.
+- `[-]` Clarification text itself must also be generated by LLM from structured `missing_fields / constraints`, not hand-written in business rules
+- `[x]` Mail body generation must move from clause/template assembly to `body_constraints + body_sources + draft_state -> LLM authoring renderer`
+- `[ ]` Regress document critique, contextual recall, enterprise fact QA, and mailbox status flows in Docker after the renderer unification.

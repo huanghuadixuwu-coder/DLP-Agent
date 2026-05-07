@@ -26,10 +26,49 @@ def _smtp_provider_name(host: str) -> str:
     return normalized or "smtp"
 
 
-def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
+def _normalize_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in attachments or []:
+        content_bytes = item.get("content_bytes")
+        if isinstance(content_bytes, (bytes, bytearray)) and content_bytes:
+            normalized.append(
+                {
+                    "filename": str(item.get("filename") or "attachment.bin"),
+                    "content_type": str(item.get("content_type") or "application/octet-stream"),
+                    "content_bytes": bytes(content_bytes),
+                }
+            )
+            continue
+        content = str(item.get("content") or item.get("text") or "").strip()
+        if content:
+            normalized.append(
+                {
+                    "filename": str(item.get("filename") or "attachment.txt"),
+                    "content_type": str(item.get("content_type") or "text/plain"),
+                    "content": content,
+                }
+            )
+    return normalized
+
+
+def _split_content_type(content_type: str) -> tuple[str, str]:
+    cleaned = (content_type or "text/plain").strip().lower()
+    if "/" not in cleaned:
+        return ("text", "plain")
+    maintype, subtype = cleaned.split("/", 1)
+    return (maintype or "text", subtype or "plain")
+
+
+def send_email_smtp(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
     provider = _smtp_provider_name(settings.smtp_host)
     from_email = settings.smtp_from or settings.smtp_username
+    normalized_attachments = _normalize_attachments(attachments)
 
     if not settings.email_send_enabled:
         return {
@@ -38,6 +77,7 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
             "to_email": to_email,
             "from_email_masked": _mask_email(from_email),
             "sent_at": "",
+            "attachments_sent": 0,
             "error": "EMAIL_SEND_ENABLED is false. Set EMAIL_SEND_ENABLED=true after configuring SMTP credentials.",
         }
     if not settings.smtp_username or not settings.smtp_password or not from_email:
@@ -47,6 +87,7 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
             "to_email": to_email,
             "from_email_masked": _mask_email(from_email),
             "sent_at": "",
+            "attachments_sent": 0,
             "error": "SMTP credentials are incomplete. Configure SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM.",
         }
 
@@ -57,6 +98,29 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
     message["To"] = to_email
     message["Subject"] = subject
     message.set_content(body, charset="utf-8")
+    for attachment in normalized_attachments:
+        maintype, subtype = _split_content_type(attachment["content_type"])
+        if "content_bytes" in attachment:
+            message.add_attachment(
+                attachment["content_bytes"],
+                maintype=maintype,
+                subtype=subtype,
+                filename=attachment["filename"],
+            )
+        elif maintype == "text":
+            message.add_attachment(
+                attachment["content"],
+                subtype=subtype,
+                filename=attachment["filename"],
+                charset="utf-8",
+            )
+        else:
+            message.add_attachment(
+                attachment["content"].encode("utf-8"),
+                maintype=maintype,
+                subtype=subtype,
+                filename=attachment["filename"],
+            )
 
     try:
         with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=20) as smtp:
@@ -73,6 +137,7 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
             "to_email": to_email,
             "from_email_masked": _mask_email(from_email),
             "sent_at": "",
+            "attachments_sent": len(normalized_attachments),
             "error": str(exc),
         }
 
@@ -82,10 +147,16 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
         "to_email": to_email,
         "from_email_masked": _mask_email(from_email),
         "sent_at": datetime.now(timezone.utc).isoformat(),
+        "attachments_sent": len(normalized_attachments),
         "error": "",
     }
 
 
-def send_email_163(to_email: str, subject: str, body: str) -> dict[str, Any]:
+def send_email_163(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     # Backward-compatible alias kept for older workflow/tool names.
-    return send_email_smtp(to_email=to_email, subject=subject, body=body)
+    return send_email_smtp(to_email=to_email, subject=subject, body=body, attachments=attachments)

@@ -17,6 +17,38 @@ SUMMARY_HINTS = (
     "内容概览",
 )
 
+CRITIQUE_HINTS = (
+    "不好",
+    "问题",
+    "评价",
+    "评估",
+    "审阅",
+    "review",
+    "critique",
+    "evaluate",
+    "feedback",
+    "improve",
+)
+
+REWRITE_HINTS = (
+    "改写",
+    "重写",
+    "润色",
+    "优化表达",
+    "rewrite",
+    "polish",
+    "improve wording",
+)
+
+ACTION_ITEM_HINTS = (
+    "行动项",
+    "待办",
+    "TODO",
+    "action items",
+    "next steps",
+    "follow-up",
+)
+
 QA_HINTS = (
     "?",
     "？",
@@ -92,6 +124,7 @@ def build_upload_context(
     uploaded_filename: str = "",
     uploaded_content_type: str = "",
     uploaded_text: str = "",
+    upload_blob_id: str = "",
     source_parse_status: str = "not_provided",
     source_parse_error: str = "",
     summary: str = "",
@@ -115,6 +148,7 @@ def build_upload_context(
         "parse_error": source_parse_error or "",
         "content_available": bool(text.strip() or summary.strip() or (key_snippets or []) or filename or source_parse_error),
         "uploaded_text": text,
+        "upload_blob_id": upload_blob_id.strip(),
         "summary": summary.strip(),
         "key_snippets": [item.strip() for item in (key_snippets or []) if str(item).strip()][:3],
         "recalled": recalled,
@@ -141,6 +175,12 @@ def infer_upload_content_kind(
 
 def infer_upload_task_type(message: str) -> str:
     text = (message or "").strip().lower()
+    if any(hint in message or hint in text for hint in REWRITE_HINTS):
+        return "rewrite"
+    if any(hint in message or hint in text for hint in ACTION_ITEM_HINTS):
+        return "extract_action_items"
+    if any(hint in message or hint in text for hint in CRITIQUE_HINTS):
+        return "critique"
     if any(hint in message or hint in text for hint in SUMMARY_HINTS):
         return "summarize"
     if any(hint in message or hint in text for hint in QA_HINTS):

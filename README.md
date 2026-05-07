@@ -125,6 +125,89 @@ docker compose exec api python scripts/enterprise_rag_regression.py --reset --li
 
 ## 当前能力
 
+### 2026-05-07 当前主线状态
+
+当前主线已经从早期的“DLP 外发演示 + 若干独立实验页”收口为一个更接近企业落地形态的统一 Agent。  
+当前正式可用并且已经进入 Docker 回归范围的能力主要有：
+
+1. 企业知识问答
+   - `EnterpriseRAG-Bench` 新主链已接入 `/agent/chat`
+   - 检索主链为：
+     - dense retrieval：`Chroma + BAAI/bge-m3`
+     - sparse retrieval：`SQLite FTS5 + BM25`
+     - rerank：`BAAI/bge-reranker-v2-m3`
+   - 已补齐：
+     - sentence-level evidence
+     - canonical facts
+     - answer intent / question focus
+     - recommendation slot assembly
+     - debug / benchmark fields
+
+2. 统一 `/agent/chat`
+   - 当前主路径已经切成：
+     - 安全硬分支
+     - 轻量 Router
+     - Fast Path / Slow Path(ReAct)
+     - observation-first renderer
+   - Fast Path 已覆盖：
+     - enterprise fact
+     - contextual memory
+     - upload analysis
+     - mailbox / task status
+     - persona / capability
+   - 目标是不再让所有请求都先进重型 think。
+
+3. 邮件协作与 DLP 外发
+   - 用户可直接在聊天里生成外发计划，不再依赖手动创建外发任务入口
+   - 已支持真实附件持久化与二进制附件发送
+   - 已支持 DLP 风险判定、审批流、任务台与 SMTP 真实发送
+   - 已支持 pending draft follow-up patch：
+     - 第二轮、第三轮追问会修改上一版待确认草稿，而不是重建新计划
+   - 已补齐正文结构约束：
+     - greeting
+     - sender identity / “我们是谁”
+     - send date / send time
+     - reason / tone / do_not_include
+   - 已加入 `attachment_source / reference_source / body_source` 分离，默认禁止附件全文直接进入收件人正文
+
+4. 上传文档分析
+   - 已支持：
+     - summarize
+     - qa
+     - critique
+     - rewrite
+     - extract_action_items
+   - 文档评价类请求可以直接走 Fast Path，不再强制先进重型 ReAct。
+
+5. Hermes-style Memory（第一版）
+   - 已落地四层 memory：
+     - `session_transcript`
+     - `turn_summary`
+     - `workspace_memory`
+     - `user_model`
+   - 已支持：
+     - `conversation_recent`
+     - `conversation_summary`
+     - `workspace_memory`
+     - `user_model`
+     作为主链中的 first-class read target
+   - 已补上 transcript compaction 与 controlled reflection 的基本策略
+
+6. 当前明确边界
+   - Docker 是唯一有效验收环境；不以本机 Python 作为完成标准
+   - 邮件的 reply / forward 目标绑定仍可继续增强
+   - 日历 / 腾讯会议能力尚未接入当前主链
+   - DLP review content 出于审计目的仍可能包含附件文本，但收件人可见正文已与之分离
+
+7. 推荐回归方式
+   - 启动：
+     - `docker compose up --build -d`
+   - EnterpriseRAG 回归：
+     - `docker compose exec api python scripts/enterprise_rag_regression.py --reset --limit 20`
+   - UI 回归：
+     - Web：`http://localhost:8511`
+     - API docs：`http://localhost:8010/docs`
+
 - `LeetCode RAG`：支持少量算法题的思路解释、复杂度说明、局部代码问答。
 - `统一 Agent`：同一个入口自动处理长文档上下文预算、隐私预警、Apple 歧义消解、框架观点问答、提醒助手。
 - `混合路由`：先走规则，再在模糊场景下调用 `GLM-4.5-Air` 做 LLM routing。

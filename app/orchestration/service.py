@@ -1,18 +1,67 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import logging
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+from app.config import get_settings
+from app.conversation_memory import is_memory_follow_up
 from app.orchestration.aggregator import aggregate_results
 from app.orchestration.executor import execute_task_plan
 from app.orchestration.planner import plan_message
+from app.orchestration.react_controller import run_react_agent_request
 from app.orchestration.tracing import render_task_plan
 from app.orchestration.types import OrchestrationContext
 
+logger = logging.getLogger(__name__)
+
 
 def orchestrate_agent_request(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    safe_message: str,
+    display_message: str = "",
+    upload_context: dict[str, Any] | None = None,
+    router_intent: str = "",
+    required_grounding: str = "none",
+    recommended_tool: str = "",
+    router_reason: str = "",
+    degraded_from: str = "none",
+) -> dict[str, Any]:
+    try:
+        return run_react_agent_request(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            safe_message=safe_message,
+            display_message=display_message,
+            upload_context=upload_context,
+            router_intent=router_intent,
+            required_grounding=required_grounding,
+            recommended_tool=recommended_tool,
+            router_reason=router_reason,
+            degraded_from=degraded_from,
+        )
+    except Exception:
+        logger.exception("ReAct controller failed; evaluating legacy fallback")
+        settings = get_settings()
+        if is_memory_follow_up(safe_message or message) or not settings.enable_legacy_orchestration_fallback:
+            raise
+        return _legacy_orchestrate_agent_request(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            safe_message=safe_message,
+            display_message=display_message,
+            upload_context=upload_context,
+        )
+
+
+def _legacy_orchestrate_agent_request(
     *,
     session_id: str,
     conversation_id: str,
@@ -48,7 +97,7 @@ def orchestrate_agent_request(
         "routing_confidence": float(plan.confidence),
         "routing_reason": plan.planner_reason,
         "candidate_intents": sorted({item.capability for item in plan.subtasks}),
-        "mode_used": "orchestration",
+        "mode_used": "legacy_orchestration",
         "tool_calls": [
             {
                 "tool_name": item.capability,
@@ -74,11 +123,25 @@ def orchestrate_agent_request(
         "user_model_used": bool(aggregated.get("user_model_used", False)),
         "reflection_notes": None,
         "upload_context": aggregated.get("upload_context") or dict(upload_context or {}),
+        "route_mode": "slow",
+        "router_intent": "",
+        "router_reason": "",
+        "required_grounding": "none",
+        "fast_path_used": False,
+        "degraded_from": "none",
         "planner_type": plan.planner_type,
         "task_plan": render_task_plan(plan),
         "subtask_results": aggregated["subtask_results"],
         "aggregation_strategy": plan.aggregation_strategy,
         "partial_failures": aggregated["partial_failures"],
+        "react_trace": [],
+        "loop_step_count": 0,
+        "termination_reason": "",
+        "pending_confirmation": {},
+        "confirmation_payload": {},
+        "final_answer_source": "legacy_aggregator",
+        "memory_reads": [],
+        "tool_observations": [],
         "node_latencies_ms": {"total": latency_ms},
         "token_in": 0,
         "token_out": 0,

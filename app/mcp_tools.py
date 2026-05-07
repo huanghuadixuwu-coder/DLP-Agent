@@ -29,12 +29,22 @@ def tool_disambiguate_entity(query: str) -> dict:
     return answer_apple_query(query)
 
 
-def tool_send_email_163(to_email: str, subject: str, body: str) -> dict:
-    return send_email_163(to_email=to_email, subject=subject, body=body)
+def tool_send_email_163(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict] | None = None,
+) -> dict:
+    return send_email_163(to_email=to_email, subject=subject, body=body, attachments=attachments)
 
 
-def tool_send_email_smtp(to_email: str, subject: str, body: str) -> dict:
-    return send_email_smtp(to_email=to_email, subject=subject, body=body)
+def tool_send_email_smtp(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict] | None = None,
+) -> dict:
+    return send_email_smtp(to_email=to_email, subject=subject, body=body, attachments=attachments)
 
 
 TOOLS = {

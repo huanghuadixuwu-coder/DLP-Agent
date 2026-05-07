@@ -3,6 +3,7 @@
 import json
 import os
 import uuid
+import base64
 
 import httpx
 import streamlit as st
@@ -86,6 +87,7 @@ def api_delete(path: str, params: dict | None = None, timeout: float = 30.0):
         raise RuntimeError(friendly_api_error(exc)) from exc
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def load_conversations(session_id: str) -> list[dict]:
     try:
         return api_get("/conversations", params={"session_id": session_id})
@@ -93,6 +95,7 @@ def load_conversations(session_id: str) -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=2, show_spinner=False)
 def load_turns(conversation_id: str | None) -> list[dict]:
     if not conversation_id:
         return []
@@ -102,6 +105,7 @@ def load_turns(conversation_id: str | None) -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def load_summary(conversation_id: str | None) -> dict:
     if not conversation_id:
         return {}
@@ -127,39 +131,12 @@ def delete_conversation(session_id: str, conversation_id: str) -> dict:
     return api_delete(f"/conversations/{conversation_id}", params={"session_id": session_id})
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def list_sensitive_workflows(session_id: str) -> list[dict]:
     try:
         return api_get("/tasks", params={"session_id": session_id})
     except Exception:
         return []
-
-
-def create_sensitive_workflow(
-    session_id: str,
-    conversation_id: str | None,
-    message: str,
-    destination_email: str,
-    source_filename: str = "",
-    source_content_type: str = "",
-    uploaded_text: str = "",
-    source_parse_status: str = "not_provided",
-    source_parse_error: str = "",
-) -> dict:
-    return api_post(
-        "/tasks/dlp-outbound",
-        {
-            "session_id": session_id,
-            "conversation_id": conversation_id,
-            "message": message,
-            "destination_email": destination_email,
-            "uploaded_filename": source_filename,
-            "uploaded_content_type": source_content_type,
-            "uploaded_text": uploaded_text,
-            "source_parse_status": source_parse_status,
-            "source_parse_error": source_parse_error,
-            "requested_action": "summarize_and_send",
-        },
-    )
 
 
 def supplement_dlp_task(
@@ -171,6 +148,7 @@ def supplement_dlp_task(
     source_filename: str = "",
     source_content_type: str = "",
     uploaded_text: str = "",
+    uploaded_file_base64: str = "",
     source_parse_status: str = "not_provided",
     source_parse_error: str = "",
 ) -> dict:
@@ -184,6 +162,7 @@ def supplement_dlp_task(
             "uploaded_filename": source_filename,
             "uploaded_content_type": source_content_type,
             "uploaded_text": uploaded_text,
+            "uploaded_file_base64": uploaded_file_base64,
             "source_parse_status": source_parse_status,
             "source_parse_error": source_parse_error,
         },
@@ -232,14 +211,17 @@ def generate_daily_mail_digest() -> dict:
     return api_post("/mail/inbound/digest", {}, timeout=60.0)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_inbound_mail_summary() -> dict:
     return api_get("/mail/inbound/summary", timeout=30.0)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_inbound_mail_messages(limit: int = 5) -> list[dict]:
     return api_get("/mail/inbound/messages", params={"limit": limit}, timeout=30.0)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_notification_outbox(limit: int = 5) -> list[dict]:
     return api_get("/notifications/outbox", params={"limit": limit}, timeout=30.0)
 
@@ -266,6 +248,7 @@ def run_unified_agent(
     uploaded_filename: str = "",
     uploaded_content_type: str = "",
     uploaded_text: str = "",
+    uploaded_file_base64: str = "",
     source_parse_status: str = "not_provided",
     source_parse_error: str = "",
 ) -> dict:
@@ -281,6 +264,7 @@ def run_unified_agent(
             "uploaded_filename": uploaded_filename,
             "uploaded_content_type": uploaded_content_type,
             "uploaded_text": uploaded_text,
+            "uploaded_file_base64": uploaded_file_base64,
             "source_parse_status": source_parse_status,
             "source_parse_error": source_parse_error,
         },
@@ -337,21 +321,22 @@ def latest_debug_from_turns(turns: list[dict]) -> dict | None:
     return None
 
 
-def decode_uploaded_file(uploaded_file) -> tuple[str, str, str]:
+def decode_uploaded_file(uploaded_file) -> tuple[str, str, str, str]:
     if uploaded_file is None:
-        return "", "not_provided", ""
+        return "", "not_provided", "", ""
     raw = uploaded_file.getvalue()
+    raw_base64 = base64.b64encode(raw).decode("ascii") if raw else ""
     if len(raw) > MAX_UPLOAD_BYTES:
-        return "", "parse_failed", "上传文件超过 2MB，当前仅支持较小的文本、日志和表格文件。"
+        return "", "parse_failed", "上传文件超过 2MB，当前仅支持较小的文本、日志和表格文件。", raw_base64
     for encoding in ("utf-8", "gbk", "gb18030"):
         try:
             decoded = raw.decode(encoding)
             if decoded.strip():
-                return decoded, "parsed", ""
-            return "", "empty", "上传文件为空或没有可解析的文本内容。"
+                return decoded, "parsed", "", raw_base64
+            return "", "empty", "上传文件为空或没有可解析的文本内容。", raw_base64
         except UnicodeDecodeError:
             continue
-    return "", "parse_failed", "文件解码失败。请上传 UTF-8、GBK 或 GB18030 编码的文本类文件。"
+    return "", "parse_failed", "文件解码失败。请上传 UTF-8、GBK 或 GB18030 编码的文本类文件。", raw_base64
 
 
 def workflow_sort_key(item: dict) -> tuple[int, str]:
@@ -886,7 +871,8 @@ def render_realtime_task_panel_v2(
       refreshTimer: null,
       wsScheme: cfg.apiBase.startsWith("https") ? "wss" : "ws",
       appliedFocusNonce: null,
-      supplementDrafts: {}
+      supplementDrafts: {},
+      lastTasksSignature: ""
     };
 
     const rank = {
@@ -1013,6 +999,17 @@ def render_realtime_task_panel_v2(
       return state.tasks.filter((task) => task.status === status).length;
     }
 
+    function taskSignature(tasks) {
+      return JSON.stringify(
+        (tasks || []).map((task) => ({
+          task_id: task.task_id,
+          status: task.status,
+          updated_at: task.updated_at,
+          delivery_status: task.delivery_status
+        }))
+      );
+    }
+
     function applyExternalFocus(tasks) {
       if (cfg.preferredFilter && state.filter !== cfg.preferredFilter) {
         state.filter = cfg.preferredFilter;
@@ -1053,7 +1050,13 @@ def render_realtime_task_panel_v2(
 
     async function loadTasks() {
       const tasks = await fetchJson(`/tasks?session_id=${encodeURIComponent(cfg.sessionId)}`);
+      const signature = taskSignature(tasks);
+      if (signature === state.lastTasksSignature) {
+        syncSockets();
+        return;
+      }
       state.tasks = tasks;
+      state.lastTasksSignature = signature;
       applyExternalFocus(tasks);
       syncSockets();
       render();
@@ -1067,6 +1070,7 @@ def render_realtime_task_panel_v2(
       } else {
         state.tasks.unshift(task);
       }
+      state.lastTasksSignature = taskSignature(state.tasks);
       applyExternalFocus(state.tasks);
       render();
     }
@@ -1103,7 +1107,10 @@ def render_realtime_task_panel_v2(
     }
 
     function syncSockets() {
-      const keep = new Set(state.tasks.slice(0, 20).map((task) => task.task_id));
+      const keep = new Set(state.tasks.slice(0, 6).map((task) => task.task_id));
+      if (state.selectedTaskId) {
+        keep.add(state.selectedTaskId);
+      }
       Object.keys(state.sockets).forEach((taskId) => {
         if (!keep.has(taskId)) closeSocket(taskId);
       });
@@ -1142,6 +1149,7 @@ def render_realtime_task_panel_v2(
         uploaded_filename: "",
         uploaded_content_type: "",
         uploaded_text: "",
+        uploaded_file_base64: "",
         source_parse_status: "empty",
         source_parse_error: ""
       };
@@ -1150,6 +1158,14 @@ def render_realtime_task_panel_v2(
         payload.uploaded_filename = file.name || "";
         payload.uploaded_content_type = file.type || "";
         try {
+          const arrayBuffer = await file.arrayBuffer();
+          const bytes = new Uint8Array(arrayBuffer);
+          let binary = "";
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode(...bytes.slice(i, i + chunkSize));
+          }
+          payload.uploaded_file_base64 = btoa(binary);
           payload.uploaded_text = await file.text();
           payload.source_parse_status = payload.uploaded_text ? "parsed" : "empty";
         } catch (err) {
@@ -1373,7 +1389,7 @@ def render_realtime_task_panel_v2(
     async function init() {
       await loadTasks();
       if (state.refreshTimer) clearInterval(state.refreshTimer);
-      state.refreshTimer = setInterval(loadTasks, 5000);
+      state.refreshTimer = setInterval(loadTasks, 15000);
     }
 
     init().catch((err) => {
@@ -1440,6 +1456,8 @@ if "task_panel_focus_nonce" not in st.session_state:
     st.session_state.task_panel_focus_nonce = ""
 if "chat_upload_nonce" not in st.session_state:
     st.session_state.chat_upload_nonce = 0
+if "visible_turn_limit" not in st.session_state:
+    st.session_state.visible_turn_limit = 30
 
 
 conversations = load_conversations(st.session_state.session_id)
@@ -1471,7 +1489,9 @@ with st.sidebar:
     with create_col:
         if st.button("新建对话"):
             created = create_conversation(st.session_state.session_id)
+            st.cache_data.clear()
             st.session_state.current_conversation_id = created["conversation_id"]
+            st.session_state.visible_turn_limit = 30
             st.session_state.last_debug = None
             st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
             sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
@@ -1480,6 +1500,7 @@ with st.sidebar:
         if st.session_state.current_conversation_id and st.button("删除对话", type="secondary"):
             try:
                 delete_conversation(st.session_state.session_id, st.session_state.current_conversation_id)
+                st.cache_data.clear()
                 st.session_state.last_debug = None
                 st.session_state.last_debug_conversation_id = None
                 remaining = load_conversations(st.session_state.session_id)
@@ -1488,6 +1509,7 @@ with st.sidebar:
                 else:
                     created = create_conversation(st.session_state.session_id)
                     st.session_state.current_conversation_id = created["conversation_id"]
+                st.session_state.visible_turn_limit = 30
                 sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
                 st.success("对话已删除")
                 st.rerun()
@@ -1505,6 +1527,7 @@ with st.sidebar:
         selected_conversation_id = conversation_options[selected_label]
         if selected_conversation_id != st.session_state.current_conversation_id:
             st.session_state.current_conversation_id = selected_conversation_id
+            st.session_state.visible_turn_limit = 30
             st.session_state.last_debug_conversation_id = selected_conversation_id
             sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
         st.caption("当前 conversation_id")
@@ -1519,7 +1542,9 @@ with st.sidebar:
                 [conversation_options[label] for label in merge_choices],
                 merge_name.strip() or None,
             )
+            st.cache_data.clear()
             st.session_state.current_conversation_id = result["merged_conversation_id"]
+            st.session_state.visible_turn_limit = 30
             st.session_state.last_debug = {"merge_result": result}
             st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
             sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
@@ -1556,53 +1581,6 @@ with st.sidebar:
             apply_task_panel_filter("all")
             st.rerun()
     st.caption(f"待审批: {pending_count} / 发送失败: {failed_count} / 全部任务: {len(workflows)}")
-
-    with st.expander("手动创建外发任务", expanded=False):
-        manual_destination = st.text_input("收件邮箱（可留空，留空将进入待补充）", value=DEFAULT_DESTINATION_EMAIL)
-        manual_uploaded = st.file_uploader(
-            "上传日志或文本文件",
-            type=["txt", "log", "md", "json", "csv"],
-            key="manual_upload",
-        )
-        manual_uploaded_text, manual_source_parse_status, manual_upload_error = decode_uploaded_file(manual_uploaded)
-        manual_source_parse_error = manual_upload_error
-        if manual_upload_error:
-            st.warning(manual_upload_error)
-        manual_text = st.text_area(
-            "粘贴文本或补充说明",
-            value="帮我把这段日志总结一下，并发给邮箱。User: 张三, Phone: 13800000000, API_KEY: sk-123456, 数据库报错连接超时。",
-            height=130,
-        )
-        if st.button("创建安全外发任务"):
-            combined_text = manual_text.strip()
-            if manual_uploaded_text:
-                combined_text = (
-                    f"{combined_text}\n\n[上传文件: {manual_uploaded.name}]\n{manual_uploaded_text}"
-                    if combined_text
-                    else manual_uploaded_text
-                )
-            if not combined_text.strip() and not manual_uploaded:
-                st.error("请粘贴文本或上传文件。")
-            else:
-                try:
-                    created_workflow = create_sensitive_workflow(
-                        st.session_state.session_id,
-                        st.session_state.current_conversation_id,
-                        combined_text,
-                        manual_destination,
-                        manual_uploaded.name if manual_uploaded else "",
-                        manual_uploaded.type if manual_uploaded else "",
-                        manual_uploaded_text,
-                        manual_source_parse_status,
-                        manual_source_parse_error,
-                    )
-                    st.session_state.last_debug = {"workflow_result": created_workflow}
-                    st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
-                    set_task_panel_focus(created_workflow.get("task_id"), created_workflow.get("status"))
-                    st.success(f"任务已创建: {created_workflow.get('task_id')} ({created_workflow.get('status')})")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"创建任务失败: {exc}")
 
     st.caption("实时任务台会持续刷新外发治理状态，并支持审批、驳回和补充恢复。")
     render_realtime_task_panel_v2(
@@ -1649,7 +1627,17 @@ with left:
         st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
     if not turns:
         st.caption("这个对话还没有消息。")
-    for turn in turns:
+    hidden_turn_count = max(0, len(turns) - st.session_state.visible_turn_limit)
+    if hidden_turn_count:
+        info_col, action_col = st.columns([3, 1])
+        with info_col:
+            st.caption(f"当前仅渲染最近 {st.session_state.visible_turn_limit} 条消息，已隐藏更早的 {hidden_turn_count} 条，以保证页面流畅。")
+        with action_col:
+            if st.button("加载更早消息", key=f"load_more_{st.session_state.current_conversation_id}"):
+                st.session_state.visible_turn_limit += 20
+                st.rerun()
+    visible_turns = turns[-st.session_state.visible_turn_limit :]
+    for turn in visible_turns:
         render_message(turn, st.session_state.auto_collapse_answers)
 
     st.markdown(
@@ -1658,10 +1646,9 @@ with left:
     )
     chat_uploaded = st.file_uploader(
         "上传给本轮对话的文件",
-        type=["txt", "log", "md", "json", "csv"],
         key=f"chat_upload_{st.session_state.current_conversation_id}_{st.session_state.chat_upload_nonce}",
     )
-    chat_uploaded_text, chat_source_parse_status, chat_upload_error = decode_uploaded_file(chat_uploaded)
+    chat_uploaded_text, chat_source_parse_status, chat_upload_error, chat_uploaded_base64 = decode_uploaded_file(chat_uploaded)
     chat_source_parse_error = chat_upload_error
     if chat_upload_error:
         st.warning(chat_upload_error)
@@ -1686,10 +1673,13 @@ with left:
                         chat_uploaded.name if chat_uploaded else "",
                         chat_uploaded.type if chat_uploaded else "",
                         chat_uploaded_text,
+                        chat_uploaded_base64,
                         chat_source_parse_status,
                         chat_source_parse_error,
                     )
+                    st.cache_data.clear()
                     st.session_state.current_conversation_id = result["conversation_id"]
+                    st.session_state.visible_turn_limit = 30
                     st.session_state.last_debug = result
                     st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
                     if result.get("task_id"):
