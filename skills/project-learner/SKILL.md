@@ -23,11 +23,11 @@ Discovery → Check History → User Intent → Select Domain → Select Sub-top
 
 Autonomously build project understanding. Do NOT ask user anything yet.
 
-1. Read `DEV_SPEC.md` — project goals, architecture, tech stack, module design
-2. Read `config/settings.yaml` — configuration system
-3. List `src/` directory tree — module structure (core/, ingestion/, libs/, mcp_server/, observability/)
-4. Read key entry points: `main.py`, `scripts/ingest.py`, `scripts/query.py`
-5. List `tests/` — testing strategy overview
+1. Read `README.md` — project goals, architecture, tech stack, module design
+2. Read `技术文档.md` and `enterprise_rag_architecture.md` — configuration system and architecture
+3. List `app/` directory tree — module structure (enterprise_rag/, orchestration/, inbound_mail/, outbound_delivery/, etc.)
+4. Read key entry points: `app/main.py`, `app/enterprise_rag/core/service.py`, `app/orchestration/planner.py`
+5. Read `myproject_for learn/` folder — project evolution, problem-solving, and design rationale
 
 Build an internal mental model covering these **10 Knowledge Domains**, each containing **3-5 Sub-topics** (知识点), totaling **45 interview knowledge points**:
 
@@ -35,61 +35,65 @@ Build an internal mental model covering these **10 Knowledge Domains**, each con
 
 | ID | 知识域 / 知识点 | Key Code Areas |
 |----|----------------|---------------|
-| **D1** | **RAG Pipeline 整体架构** | |
-| D1.1 | 端到端数据流：从文档上传到生成回答的完整链路 | `DEV_SPEC.md`, `main.py`, `scripts/` |
-| D1.2 | 三层架构设计：core/ingestion/libs 各层职责与依赖方向 | `src/core/`, `src/ingestion/`, `src/libs/` |
-| D1.3 | Pipeline 组装：配置驱动的组件组合机制 | `main.py`, `config/settings.yaml`, `src/core/settings.py` |
-| D1.4 | 核心数据类型：Document、Chunk、QueryResult 等类型系统 | `src/core/types.py` |
-| D1.5 | 入口脚本设计：CLI 脚本的职责划分与参数传递 | `scripts/ingest.py`, `scripts/query.py`, `scripts/evaluate.py` |
-| **D2** | **Ingestion Pipeline** | |
-| D2.1 | Pipeline 整体流程：从文档加载到向量存储的阶段设计 | `src/ingestion/pipeline.py` |
-| D2.2 | Chunking 策略：RecursiveSplitter 的分割逻辑与参数调优 | `src/ingestion/chunking/`, `src/libs/splitter/` |
-| D2.3 | Transform 链：ChunkRefiner、MetadataEnricher 的职责与执行顺序 | `src/ingestion/transform/` |
-| D2.4 | Embedding 编码：Dense/Sparse 双编码与 BatchProcessor 批处理 | `src/ingestion/embedding/` |
-| D2.5 | 存储层：VectorUpserter、BM25Indexer、ImageStorage 三类存储协同 | `src/ingestion/storage/` |
-| **D3** | **Hybrid Search & Retrieval** | |
-| D3.1 | Dense Retrieval：向量检索原理与 DenseRetriever 实现 | `src/core/query_engine/dense_retriever.py` |
-| D3.2 | Sparse Retrieval：BM25 稀疏检索与 SparseRetriever 实现 | `src/core/query_engine/sparse_retriever.py` |
-| D3.3 | Hybrid Search 融合：RRF 算法与 Fusion 模块设计 | `src/core/query_engine/hybrid_search.py`, `fusion.py` |
-| D3.4 | QueryProcessor：查询预处理与查询扩展机制 | `src/core/query_engine/query_processor.py` |
-| D3.5 | Response 构建：ResponseBuilder、CitationGenerator、MultimodalAssembler | `src/core/response/` |
-| **D4** | **Rerank 机制** | |
-| D4.1 | Reranker 抽象与工厂模式：BaseReranker 与 RerankerFactory 设计 | `src/libs/reranker/base_reranker.py`, `reranker_factory.py` |
-| D4.2 | CrossEncoder Reranker：模型原理与实现细节 | `src/libs/reranker/cross_encoder_reranker.py` |
-| D4.3 | LLM Reranker：基于大语言模型的重排序方案与 Prompt 设计 | `src/libs/reranker/llm_reranker.py` |
-| D4.4 | Rerank 在检索 Pipeline 中的集成位置与效果分析 | `src/core/query_engine/reranker.py` |
-| **D5** | **MCP Server 协议** | |
-| D5.1 | MCP 协议概述：JSON-RPC 交互模型与标准规范 | `src/mcp_server/server.py` |
-| D5.2 | Tool 注册机制：三个工具的定义、参数与执行逻辑 | `src/mcp_server/tools/` |
-| D5.3 | ProtocolHandler：请求路由、分发与能力协商 | `src/mcp_server/protocol_handler.py` |
-| D5.4 | Server 生命周期管理与异常处理 | `src/mcp_server/server.py`, `protocol_handler.py` |
-| **D6** | **可插拔架构 & 配置系统** | |
-| D6.1 | 工厂模式全景：LLM/Embedding/Reranker/VectorStore/Evaluator 五大工厂 | `src/libs/*/factory*.py` |
-| D6.2 | settings.yaml 配置结构与 Settings 类加载机制 | `config/settings.yaml`, `src/core/settings.py` |
-| D6.3 | LLM Provider 多厂商支持：Azure/OpenAI/DeepSeek/Ollama 切换逻辑 | `src/libs/llm/` |
-| D6.4 | Embedding Provider 抽象：多后端实现对比与选型策略 | `src/libs/embedding/` |
-| D6.5 | Base 类设计哲学：接口抽象、继承层次与扩展点 | `src/libs/*/base_*.py` |
-| **D7** | **多模态处理** | |
-| D7.1 | PDF 解析：PDFLoader 实现与 FileIntegrity 文件校验 | `src/libs/loader/` |
-| D7.2 | Vision LLM：Azure/OpenAI Vision 图片理解能力集成 | `src/libs/llm/azure_vision_llm.py`, `openai_vision_llm.py` |
-| D7.3 | ImageCaptioner：图片描述生成流程与 Prompt 模板设计 | `src/ingestion/transform/image_captioner.py`, `config/prompts/` |
-| D7.4 | 多模态 Chunk 存储与检索：ImageStorage 与 MultimodalAssembler 协同 | `src/ingestion/storage/image_storage.py`, `src/core/response/multimodal_assembler.py` |
-| **D8** | **可观测性 & 评估体系** | |
-| D8.1 | Trace 系统：TraceCollector 与 TraceContext 的采集与关联设计 | `src/core/trace/` |
-| D8.2 | Dashboard 架构：Streamlit App 分页、Services 层数据流 | `src/observability/dashboard/` |
-| D8.3 | 评估指标体系：Recall、Precision、MRR 等核心指标定义与计算 | `src/observability/evaluation/`, `scripts/evaluate.py` |
-| D8.4 | 评估框架：CompositeEvaluator、CustomEvaluator、RAGAS 集成架构 | `src/libs/evaluator/`, `src/observability/evaluation/` |
-| D8.5 | 日志系统：Logger 设计、日志分级与调试支持 | `src/observability/logger.py` |
-| **D9** | **测试策略 & 工程化** | |
-| D9.1 | 测试分层策略：Unit/Integration/E2E 各层覆盖范围与边界 | `tests/unit/`, `tests/integration/`, `tests/e2e/` |
-| D9.2 | Test Fixtures 与 conftest.py：Mock 策略与测试数据管理 | `tests/conftest.py`, `tests/fixtures/` |
-| D9.3 | pyproject.toml 工程配置：依赖管理、构建配置、工具链集成 | `pyproject.toml` |
-| D9.4 | 脚本入口设计：四大脚本的职责边界与参数化设计 | `scripts/` |
-| **D10** | **Document Manager & 幂等性** | |
-| D10.1 | 文档去重：Hash 计算与重复检测机制 | `src/ingestion/document_manager.py`, `src/libs/loader/file_integrity.py` |
-| D10.2 | 增量 Ingestion：幂等性保证与文档更新策略 | `src/ingestion/document_manager.py`, `pipeline.py` |
-| D10.3 | Collection 管理：集合元数据关联与文档生命周期 | `src/ingestion/document_manager.py` |
-| D10.4 | 文档状态追踪：已入库/待更新/已删除的状态流转 | `src/ingestion/document_manager.py` |
+| **D1** | **企业邮件协作系统架构** | |
+| D1.1 | 端到端邮件处理流程：从IMAP同步到SMTP发送的完整链路 | `app/inbound_mail.py`, `app/outbound_delivery.py`, `app/email_sender.py` |
+| D1.2 | 邮件协作三层架构：inbound/outbound/dlp 各层职责与数据流 | `app/inbound_mail.py`, `app/outbound_delivery.py`, `app/dlp_entry.py` |
+| D1.3 | 任务编排机制：TaskQueue、TaskWorker、TaskStore 的异步执行模型 | `app/task_queue.py`, `app/task_worker.py`, `app/task_store.py` |
+| D1.4 | 核心数据类型：MailMessage、DeliveryStatus、DLPResult 等类型系统 | `app/models.py`, `app/enterprise_rag/core/types.py` |
+| D1.5 | 配置驱动架构：环境变量、邮箱配置、SMTP/IMAP 参数管理 | `app/config.py`, `.env.example`, `技术文档.md` |
+| **D2** | **DLP 安全检测与审批工作流** | |
+| D2.1 | DLP 检测引擎：敏感信息识别、风险等级评估、脱敏处理机制 | `app/dlp_entry.py`, `app/dlp_runtime.py`, `app/privacy_lab.py` |
+| D2.2 | 审批状态机：任务流转、人工审批、驳回处理的状态机设计 | `app/dlp_scenarios.py`, `app/workflow_store.py`, `app/sensitive_workflow.py` |
+| D2.3 | 敏感信息类型：手机号、身份证、API Key、客户名单等检测规则 | `app/disambiguation_lab.py`, `app/dlp_entry.py` |
+| D2.4 | 治理化任务管理：任务创建、状态更新、审计日志记录 | `app/task_events.py`, `app/session_store.py`, `app/upload_analysis.py` |
+| D2.5 | 邮件事件通知：notification_outbox、daily_mail_digest、new_mail_received 事件机制 | `app/inbound_mail_store.py`, `app/reminder_store.py` |
+| **D3** | **EnterpriseRAG 核心架构** | |
+| D3.1 | EnterpriseRAG 服务层：query_planner、retrieval_orchestrator、answer_composer 协同 | `app/enterprise_rag/core/service.py`, `app/enterprise_rag/core/query_planner.py` |
+| D3.2 | 检索规划引擎：问题类型推断、源类型识别、检索策略生成 | `app/enterprise_rag/core/query_planner.py`, `app/enterprise_rag/core/types.py` |
+| D3.3 | 混合检索编排：Dense检索、Sparse检索、候选去重与融合机制 | `app/enterprise_rag/core/retrieval_orchestrator.py`, `app/enterprise_rag/libs/sparse_index.py` |
+| D3.4 | 证据打包机制：EvidencePack构建、citation生成、missing_evidence 分析 | `app/enterprise_rag/core/evidence_pack.py`, `app/enterprise_rag/core/types.py` |
+| D3.5 | 答案生成引擎：compose_enterprise_answer 支持的事实覆盖、引用生成 | `app/enterprise_rag/core/answer_composer.py` |
+| **D4** | **混合检索与重排序系统** | |
+| D4.1 | Dense检索实现：Chroma向量库、BGE-M3嵌入模型、语义相似度计算 | `app/vectorstore.py`, `app/enterprise_rag/libs/embedding/` |
+| D4.2 | Sparse检索实现：SQLite FTS5、BM25、关键词匹配与索引构建 | `app/enterprise_rag/libs/sparse_index.py`, `app/enterprise_rag/libs/text_cleaning.py` |
+| D4.3 | 检索融合策略：候选合并、heuristic评分、diversification 策略 | `app/enterprise_rag/core/retrieval_orchestrator.py`, `app/enterprise_rag/libs/scoring.py` |
+| D4.4 | 轻量级重排序：lexical rerank、source_type优先级、候选质量评估 | `app/enterprise_rag/libs/reranker/`, `app/enterprise_rag/libs/scoring.py` |
+| **D5** | **Memory 系统与上下文管理** | |
+| D5.1 | Hermes记忆系统：workspace_memory、transcript、user_memory 的三级存储 | `app/hermes_memory.py`, `app/hermes_dynamic_memory.py` |
+| D5.2 | 上下文构建：build_runtime_context_bundle 会话记忆与工作空间记忆检索 | `app/hermes_memory.py`, `app/enterprise_rag/core/service.py` |
+| D5.3 | 记忆压缩策略：compact_text、summary merge、记忆结构化 | `app/conversation_memory.py`, `app/raw_vs_langgraph.py` |
+| D5.4 | 会话管理：ConversationStore、SessionStore 的状态持久化 | `app/conversation_store.py`, `app/session_store.py` |
+| D5.5 | 动态记忆策略：memory_policy、缓存失效、热更新机制 | `app/enterprise_rag/core/memory_policy.py` |
+| **D6** | **编排层与任务规划** | |
+| D6.1 | 统一编排入口：planner.py 的复合任务分解与能力路由 | `app/orchestration/planner.py`, `app/orchestration/fast_router.py` |
+| D6.2 | 能力注册表：Agent能力发现、动态加载、API映射机制 | `app/orchestration/registry.py`, `app/unified_agent.py` |
+| D6.3 | 任务执行器：executor.py 的子任务调度、结果聚合、错误处理 | `app/orchestration/executor.py`, `app/orchestration/aggregator.py` |
+| D6.4 | 渲染层设计：final_renderer 的结果格式化、对话上下文管理 | `app/orchestration/final_renderer.py`, `app/graph.py` |
+| D6.5 | Agent路由策略：hybrid_router 的能力选择、负载均衡、故障转移 | `app/hybrid_router.py`, `app/orchestration/policies.py` |
+| **D7** | **企业知识库 Ingestion** | |
+| D7.1 | EnterpriseRAG 数据接入：loader、normalizer、chunker、indexer 流程 | `app/enterprise_rag/ingestion/`, `app/enterprise_rag/ingestion/indexer.py` |
+| D7.2 | 元数据标准化：normalize_source_type、business_domain、timestamp 标准化 | `app/enterprise_rag/libs/metadata.py`, `app/enterprise_rag/libs/text_cleaning.py` |
+| D7.3 | 企业文档隔离：domain=enterprise_knowledge 与历史语料隔离机制 | `app/enterprise_rag/core/types.py`, `app/vectorstore.py` |
+| D7.4 | Benchmark 评测体系：casebook构建、benchmark_runner、指标计算 | `app/enterprise_rag/eval/casebook.py`, `app/enterprise_rag/eval/benchmark_runner.py` |
+| D7.5 | 证据覆盖分析：doc recall、answer facts coverage、missing evidence 评估 | `app/enterprise_rag/eval/`, `app/enterprise_rag/eval/metrics.py` |
+| **D8** | **MCP 工具集成与 API 设计** | |
+| D8.1 | MCP 客户端架构：mcp_client.py 的工具发现、调用、结果处理 | `app/mcp_client.py`, `app/mcp_tools.py` |
+| D8.2 | 邮件工具实现：send_email_163 的 SMTP 集成、163 邮箱配置 | `app/mcp/interview-agent-tools/`, `app/email_sender.py` |
+| D8.3 | API 接口设计：RESTful API、WebSocket 实时通信、异步处理 | `app/main.py`, `技术文档.md` |
+| D8.4 | 前端界面：Streamlit App 的聊天界面、文件上传、任务监控 | `web/streamlit_app.py`, `app/observability/dashboard/` |
+| D8.5 | 工具注册表：unified_tools 的能力注册、参数校验、执行封装 | `app/unified_tools.py`, `app/agent_cli.py` |
+| **D9** | **监控、观测与工程化** | |
+| D9.1 | 可观测性系统：metrics、tracing、logging 的三维度监控 | `app/metrics.py`, `app/observability/`, `app/orchestration/tracing.py` |
+| D9.2 | 业务指标监控：邮件处理量、DLP 检测率、RAG 检索成功率 | `app/metrics.py`, `app/observability/dashboard/` |
+| D9.3 | 性能追踪系统：TraceContext、request_id、性能瓶颈分析 | `app/orchestration/tracing.py`, `app/enterprise_rag/core/service.py` |
+| D9.4 | 容器化部署：Docker、docker-compose、环境变量管理 | `Dockerfile`, `docker-compose.yml`, `.env.example` |
+| D9.5 | 日志与审计：操作日志、安全审计、错误追踪 | `app/observability/logger.py`, `app/task_events.py` |
+| **D10** | **集成测试与生产运维** | |
+| D10.1 | 回归测试策略：EnterpriseRAG-Bench、DLP 场景、邮件协作集成测试 | `scripts/`, `app/enterprise_rag/eval/` |
+| D10.2 | 数据集验证：公开办公数据集、Enron邮件、QMSum会议数据 | `技术文档.md`, `enterprise_rag_bench_documents_sample.csv` |
+| D10.3 | 配置管理：环境隔离、动态配置、热更新机制 | `app/config.py`, `app/observability/` |
+| D10.4 | 容错与降级：服务降级、熔断机制、优雅关闭 | `app/main.py`, `app/orchestration/policies.py` |
+| D10.5 | 生产部署架构：多进程、异步队列、健康检查 | `docker-compose.yml`, `app/task_queue.py`, `app/task_worker.py` |
 
 > **Total: 10 domains × 3-5 sub-topics = 45 knowledge points**
 > Each sub-topic can be studied multiple times with different questions, providing 100+ possible interview questions.
@@ -158,22 +162,23 @@ Based on the selected **sub-topic** (not just domain):
 
 - Questions MUST reference real code/architecture from THIS project, never generic
 - Questions should be specific to the sub-topic, not the whole domain
+- Focus on enterprise-specific challenges: DLP security, mail collaboration, EnterpriseRAG benchmark
 - Difficulty progression for follow-ups:
-  - Follow-up 1: "为什么这样设计？" (design rationale)
-  - Follow-up 2: "和替代方案对比有什么优劣？" (trade-offs)
-  - Follow-up 3: "边界条件/异常情况怎么处理？" (edge cases)
-  - Follow-up 4: "如果让你重新设计，会怎么做？" (redesign thinking)
+  - Follow-up 1: "为什么这样设计？" (design rationale for enterprise scenarios)
+  - Follow-up 2: "和替代方案对比有什么优劣？" (trade-offs in enterprise context)
+  - Follow-up 3: "边界条件/异常情况怎么处理？" (edge cases in production)
+  - Follow-up 4: "如果让你重新设计，会怎么做？" (redesign for scale)
 - Adjust follow-ups dynamically based on what the user actually answers
 
 ### Question Angle Variety
 
 Each sub-topic can be asked from multiple angles. When a sub-topic is revisited, pick a DIFFERENT angle:
-- **What**: 描述这个模块/机制做了什么
-- **How**: 具体实现细节，代码层面怎么做的
-- **Why**: 为什么选择这种设计方案
-- **Compare**: 和替代方案的对比
-- **Debug**: 如果出了问题怎么排查
-- **Extend**: 如果要扩展功能怎么做
+- **What**: 描述这个企业级模块/机制的功能和价值
+- **How**: 具体实现细节，代码层面怎么做的（关注enterprise场景的特殊性）
+- **Why**: 为什么选择这种设计方案（企业安全、治理、合规考量）
+- **Compare**: 和传统方案的对比，企业级优势
+- **Debug**: 如果出了问题怎么排查（生产环境调试技巧）
+- **Extend**: 如何扩展到更大规模或更多场景
 
 ### Question Format
 
@@ -272,8 +277,10 @@ Immediately after evaluation, provide targeted study resources (中文):
 - [file_path](file_path#LX-LY) — 说明这段代码的作用和关键逻辑
 
 ### 📄 相关文档
-- [DEV_SPEC.md 对应章节](DEV_SPEC.md) — 设计原理
-- [config/settings.yaml](config/settings.yaml) — 相关配置项
+- [README.md](README.md) — 项目整体介绍和功能定位
+- [技术文档.md](技术文档.md) — 技术实现细节和配置说明
+- [enterprise_rag_architecture.md](enterprise_rag_architecture.md) — EnterpriseRAG架构设计原理
+- [enterprise_rag_problems_and_solutions.md](enterprise_rag_problems_and_solutions.md) — 问题解决思路
 
 ### 🔗 参考资料
 - [External concept name] — 1-sentence explanation of relevance
@@ -281,8 +288,9 @@ Immediately after evaluation, provide targeted study resources (中文):
 ### 💡 建议学习路径
 1. 先阅读 [file] 理解 [what]
 2. 再看 [file] 掌握 [implementation detail]
-3. 运行 `[command]` 实际体验效果
+3. 运行 `[command] 实际体验效果
 4. 尝试修改 [config/code] 观察变化
+5. 使用公开数据集进行验证和测试
 ```
 
 Guidelines:
@@ -349,9 +357,12 @@ After persisting, ask the user (中文):
 
 | File | Purpose |
 |------|---------|
-| `.github/skills/project-learner/references/LEARNING_PROGRESS.md` | Persistent learning state (45 sub-topics) |
-| `DEV_SPEC.md` | Project specification & architecture |
-| `config/settings.yaml` | Configuration reference |
-| `src/` | All source code modules |
-| `tests/` | Test suite for understanding test strategy |
-| `scripts/` | CLI entry points (ingest/query/evaluate) |
+| `skills/project-learner/references/LEARNING_PROGRESS.md` | Persistent learning state (45 sub-topics) |
+| `README.md` | Project overview & product positioning |
+| `技术文档.md` | Technical documentation & configuration |
+| `enterprise_rag_architecture.md` | EnterpriseRAG architecture design |
+| `myproject_for learn/` | Project evolution & problem-solving history |
+| `app/` | All source code modules (enterprise_rag/, orchestration/, etc.) |
+| `web/` | Frontend interface (Streamlit app) |
+| `scripts/` | CLI entry points & evaluation scripts |
+| `data/` | EnterpriseRAG-Bench datasets and manifests |
