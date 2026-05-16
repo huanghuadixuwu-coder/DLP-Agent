@@ -45,6 +45,14 @@ QUESTION_FOCUS_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     "quoted_text": (re.compile(r"['\"“”‘’].+?['\"“”‘’]"), "Question explicitly references quoted wording."),
     "button_or_field": (re.compile(r"(refresh button|retry button|按钮|字段|label)", re.IGNORECASE), "Question explicitly asks about a button or field."),
 }
+FOCUS_SLOT_MAP: dict[str, list[str]] = {
+    "error_state": ["error_avoidance", "user_facing_message"],
+    "message_text": ["user_facing_message"],
+    "support_channel": ["support_path", "fallback_path"],
+    "sla": ["support_path", "fallback_path"],
+    "quoted_text": ["user_facing_message"],
+    "button_or_field": ["recovery_step", "last_checked_feedback"],
+}
 
 SECONDARY_DETAIL_HINTS = (
     "support sla",
@@ -72,6 +80,22 @@ Rules:
 - Never include speaker names, timestamps, meeting-log formatting, or raw transcript quotes.
 - If the question is asking for a direct fact, answer that fact first.
 - If the evidence is partial, say so conservatively without inventing anything.
+"""
+
+RECOMMENDATION_RENDER_PROMPT = """You are a technical summarization assistant, not a meeting transcript forwarder.
+
+Use only the structured observations below:
+- canonical/core facts
+- answer slots
+- answer plan
+
+Rules:
+- Answer in Chinese.
+- Do not output speaker names, timestamps, action-item wording, or raw meeting transcript style.
+- Do not quote or paste raw English evidence sentences.
+- Do not invent facts that are not present in the structured facts.
+- For recommendation questions, give a direct synthesized recommendation first, then concise handling details.
+- If evidence is partial but enough to answer, use conservative wording rather than falling back to a fact list.
 """
 
 
@@ -181,10 +205,33 @@ def _detect_question_focus(question: str) -> dict[str, object]:
         if pattern.search(question):
             labels.append(label)
             reasons.append(reason)
+    focused_slots = _dedupe_values([slot for label in labels for slot in FOCUS_SLOT_MAP.get(label, [])])
+    focused_entities = _dedupe_values([match.group(0).strip() for pattern, _reason in QUESTION_FOCUS_PATTERNS.values() for match in pattern.finditer(question)])
     return {
         "labels": labels,
+        "focus_type": labels[0] if labels else "general",
+        "focused_entities": focused_entities,
+        "focused_slots": focused_slots,
+        "confidence": 0.9 if labels else 0.35,
+        "source_fact_ids": [],
         "reason": "; ".join(reasons) if reasons else "No narrow secondary-detail focus detected.",
     }
+
+
+def _attach_focus_source_fact_ids(question_focus: dict[str, object], facts: list[CanonicalFact]) -> dict[str, object]:
+    focus_labels = list(question_focus.get("labels") or [])
+    if not focus_labels:
+        return question_focus
+    source_fact_ids: list[str] = []
+    for fact in facts:
+        if not _fact_matches_focus(fact, focus_labels):
+            continue
+        for source_id in fact.source_fact_ids:
+            if source_id and source_id not in source_fact_ids:
+                source_fact_ids.append(source_id)
+    updated = dict(question_focus)
+    updated["source_fact_ids"] = source_fact_ids[:8]
+    return updated
 
 
 def _override_intent_for_focus(answer_intent: str, focus_labels: list[str]) -> tuple[str, str]:
@@ -226,6 +273,15 @@ def _is_secondary_detail(fact: CanonicalFact) -> bool:
     return any(token in lowered for token in SECONDARY_DETAIL_HINTS)
 
 
+def _is_transcript_noise_fact(fact: CanonicalFact) -> bool:
+    lowered = fact.normalized_fact.lower()
+    if any(token in lowered for token in ("action item", "update copy", "owner:", "attendees:", "joins late", "walkthrough", "dry run", "rounding differences", "simple diagram")):
+        return True
+    if lowered.startswith(("chloe,", "priya,", "alex,", "sam,", "maya,")):
+        return True
+    return False
+
+
 def _split_core_and_secondary_facts(
     question: str,
     canonical_facts: list[CanonicalFact],
@@ -245,6 +301,9 @@ def _split_core_and_secondary_facts(
         seen.add(key)
         if _fact_matches_focus(fact, focus_labels):
             core.append(fact)
+            continue
+        if _is_transcript_noise_fact(fact):
+            secondary.append(fact)
             continue
         if answer_intent == "recommendation":
             if _is_secondary_detail(fact):
@@ -304,13 +363,13 @@ def _build_answer_slots(core_facts: list[CanonicalFact]) -> dict[str, list[str]]
     for fact in core_facts:
         lowered = fact.normalized_fact.lower()
         rendered = _render_canonical_fact(fact)
-        if any(token in lowered for token in ("delay", "propagation", "syncing", "subscription", "entitlement")):
+        if any(token in lowered for token in ("delay", "delays", "propagation", "syncing", "subscription", "entitlement", "not immediately available", "not available")):
             slots["issue_context"].append(rendered)
-        if any(token in lowered for token in ("pending", "gracefully", "rather than failed", "instead of failed")):
+        if any(token in lowered for token in ("pending", "gracefully", "rather than failed", "instead of failed", "not failed", "intermediate state")):
             slots["recommended_state"].append(rendered)
-        if any(token in lowered for token in ("recommend", "should", "handle", "provide", "allow")):
+        if any(token in lowered for token in ("recommend", "should", "handle", "provide", "allow", "avoid", "tell the user", "include")):
             slots["recommended_action"].append(rendered)
-        if any(token in lowered for token in ("still syncing", "few minutes", "may take", "tell the user", "say")):
+        if any(token in lowered for token in ("still syncing", "few minutes", "may take", "tell the user", "say", "message", "copy", "wording")):
             slots["user_facing_message"].append(rendered)
         if any(token in lowered for token in ("retry", "refresh", "last checked")):
             slots["recovery_step"].append(rendered)
@@ -319,7 +378,7 @@ def _build_answer_slots(core_facts: list[CanonicalFact]) -> dict[str, list[str]]
         if any(token in lowered for token in ("support", "contacting support", "support instructions", "support channel")):
             slots["fallback_path"].append(rendered)
             slots["support_path"].append(rendered)
-        if any(token in lowered for token in ("don't show", "do not show", "not entitled", "avoid")):
+        if any(token in lowered for token in ("don't show", "do not show", "not entitled", "avoid", "scary error", "entitlement not found")):
             slots["error_avoidance"].append(rendered)
         slots["recommendation_summary"].append(rendered)
     return {key: _dedupe_values(values) for key, values in slots.items()}
@@ -536,6 +595,58 @@ def _polish_recommendation_template(
         return template_answer, False, True, "generation_error"
 
 
+def _generate_recommendation_answer_from_state(
+    *,
+    question: str,
+    core_facts: list[CanonicalFact],
+    secondary_facts: list[CanonicalFact],
+    answer_slots: dict[str, list[str]],
+    slot_coverage: dict[str, object],
+    answer_plan: AnswerPlan,
+    question_focus: dict[str, object],
+) -> tuple[str, str, str, dict[str, str]]:
+    if not core_facts:
+        return INSUFFICIENT_EVIDENCE_TEXT, "weak_template", "insufficient_core_facts", {}
+    payload = {
+        "question": question,
+        "question_focus": question_focus,
+        "core_facts": [asdict(fact) for fact in core_facts[:8]],
+        "secondary_facts": [asdict(fact) for fact in secondary_facts[:4]],
+        "answer_slots": {key: value for key, value in answer_slots.items() if value},
+        "slot_coverage": slot_coverage,
+        "answer_plan": asdict(answer_plan),
+        "format": {
+            "direct_answer": "1句直接结论",
+            "details": "1到3句处理建议",
+            "style": "自然中文总结，不要证据句罗列",
+        },
+    }
+    try:
+        response = get_llm().invoke(
+            [
+                SystemMessage(content=RECOMMENDATION_RENDER_PROMPT),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+        answer = str(response.content).strip()
+        accepted, reason = _postcheck_polished_answer(answer, core_facts)
+        if answer and accepted:
+            return answer, "llm_structured", "none", {}
+        template_answer, template_source = _build_recommendation_template(question, answer_slots, slot_coverage)
+        return template_answer, template_source, "transcript_style_leak" if reason != "none" else "generation_error", {
+            "stage": "postcheck",
+            "error_type": reason,
+            "message": "Structured recommendation renderer output failed post-check.",
+        }
+    except Exception as exc:
+        template_answer, template_source = _build_recommendation_template(question, answer_slots, slot_coverage)
+        return template_answer, template_source, "generation_error", {
+            "stage": "llm_invoke",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+
+
 def _dedupe_visible_citations(citations) -> list[dict]:
     visible: list[dict] = []
     seen_doc_ids: set[str] = set()
@@ -561,6 +672,27 @@ def _dedupe_visible_citations(citations) -> list[dict]:
                 "score": item.score,
             }
         )
+        if len(visible) >= 3:
+            break
+    return visible
+
+
+def _dedupe_citation_objects(citations):
+    visible = []
+    seen_doc_ids: set[str] = set()
+    seen_titles: set[str] = set()
+    for item in citations:
+        doc_id = str(item.doc_id or "").strip()
+        title = str(item.title or "").strip().lower()
+        if doc_id and doc_id in seen_doc_ids:
+            continue
+        if not doc_id and title and title in seen_titles:
+            continue
+        if doc_id:
+            seen_doc_ids.add(doc_id)
+        if title:
+            seen_titles.add(title)
+        visible.append(item)
         if len(visible) >= 3:
             break
     return visible
@@ -633,6 +765,7 @@ def compose_enterprise_answer(
         answer_intent=answer_intent,
         focus_labels=list(question_focus.get("labels") or []),
     )
+    question_focus = _attach_focus_source_fact_ids(question_focus, [*core_facts, *secondary_facts])
     answer_slots = _build_answer_slots(core_facts) if answer_intent == "recommendation" else {}
     slot_coverage = _measure_slot_coverage(answer_slots) if answer_intent == "recommendation" else {}
     answer_plan = _build_answer_plan(answer_intent, answer_slots, question_focus)
@@ -643,6 +776,7 @@ def compose_enterprise_answer(
         ]
     )
     visible_citations = _dedupe_visible_citations(evidence.citations)
+    visible_citation_objects = _dedupe_citation_objects(evidence.citations)
 
     draft_answer = ""
     rewritten_answer = ""
@@ -652,29 +786,30 @@ def compose_enterprise_answer(
     polish_rejected_reason = "none"
     fallback_reason = "none"
     final_answer_source = "template"
+    renderer_error: dict[str, str] = {}
 
     if evidence.missing_evidence or not core_facts:
         answer = INSUFFICIENT_EVIDENCE_TEXT
         fallback_reason = "insufficient_core_facts"
         final_answer_source = "weak_template"
     elif answer_intent == "recommendation":
-        answer, final_answer_source = _build_recommendation_template(question, answer_slots, slot_coverage)
+        answer, final_answer_source, fallback_reason, renderer_error = _generate_recommendation_answer_from_state(
+            question=question,
+            core_facts=core_facts,
+            secondary_facts=secondary_facts,
+            answer_slots=answer_slots,
+            slot_coverage=slot_coverage,
+            answer_plan=answer_plan,
+            question_focus=question_focus,
+        )
         draft_answer = answer
-        if not bool(slot_coverage.get("has_minimum_recommendation_structure")):
+        if fallback_reason == "none" and not bool(slot_coverage.get("has_minimum_recommendation_structure")):
+            # Low slot coverage is diagnostic only when the structured renderer still produced a safe answer.
+            final_answer_source = "llm_structured_partial"
+        elif fallback_reason == "generation_error" and not bool(slot_coverage.get("has_minimum_recommendation_structure")):
             fallback_reason = "slot_coverage_too_low"
-        else:
-            answer, polish_applied, polish_rejected, polish_rejected_reason = _polish_recommendation_template(
-                question,
-                answer,
-                answer_slots,
-                core_facts,
-            )
-            if polish_applied and not polish_rejected:
-                rewritten_answer = answer
-                rewrite_applied = True
-                final_answer_source = "polished_template"
-            elif polish_rejected:
-                fallback_reason = "polish_rejected"
+        rewrite_applied = final_answer_source.startswith("llm_structured")
+        rewritten_answer = answer if rewrite_applied else ""
     else:
         answer, fallback_reason = _generate_non_recommendation_answer(
             answer_intent=answer_intent,
@@ -698,7 +833,7 @@ def compose_enterprise_answer(
 
     return EnterpriseRagAnswer(
         answer=answer,
-        citations=evidence.citations,
+        citations=visible_citation_objects,
         supporting_doc_ids=evidence.supporting_doc_ids,
         missing_evidence=evidence.missing_evidence,
         confidence=evidence.confidence,
@@ -730,6 +865,7 @@ def compose_enterprise_answer(
             "polish_applied": polish_applied,
             "polish_rejected": polish_rejected,
             "polish_rejected_reason": polish_rejected_reason,
+            "renderer_error": renderer_error,
             "fallback_reason": fallback_reason,
             "final_answer_source": final_answer_source,
             "template_used": answer_intent == "recommendation",

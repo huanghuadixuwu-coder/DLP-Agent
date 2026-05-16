@@ -144,6 +144,11 @@ class PrivacyScanResponse(BaseModel):
     context_pack: dict[str, int | str]
     storage_policy: str
     alert: bool
+    policy_id: str = "static"
+    policy_version: str = "static"
+    policy_source: str = "static"
+    policy_loaded_at: str = ""
+    policy_load_error: str = ""
 
 
 class DisambiguationQueryRequest(BaseModel):

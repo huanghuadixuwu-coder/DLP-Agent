@@ -103,7 +103,12 @@ def iter_huggingface_rows(split: str, *, streaming: bool = True) -> Iterable[dic
             "The optional `datasets` package is required for direct HuggingFace loading. "
             "Use a local JSONL/JSON/CSV export or install `datasets` in the environment."
         ) from exc
-    dataset = load_dataset(DATASET_NAME, split=split, streaming=streaming)
+    try:
+        dataset = load_dataset(DATASET_NAME, split, split="test", streaming=streaming)
+    except Exception:
+        dataset = load_dataset(DATASET_NAME, split, streaming=streaming)
+        if isinstance(dataset, dict):
+            dataset = dataset.get("test") or next(iter(dataset.values()))
     yield from dataset
 
 

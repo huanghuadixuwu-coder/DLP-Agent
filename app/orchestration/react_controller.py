@@ -370,9 +370,16 @@ def _memory_request_scope(message: str) -> str:
 
 def _format_structured_turn_summary(item: dict[str, Any]) -> str:
     pieces = [
+        f"summary={compact_text(str(item.get('summary') or ''), 220)}",
+        f"intent={compact_text(str(item.get('intent') or ''), 80)}",
+        f"risk={compact_text(str(item.get('risk_level') or 'low'), 40)}",
         f"goal={compact_text(str(item.get('user_goal') or ''), 160)}",
         f"outcome={compact_text(str(item.get('outcome') or ''), 180)}",
     ]
+    if item.get("entities"):
+        pieces.append("entities=" + ", ".join(str(value) for value in list(item.get("entities") or [])[:6]))
+    if item.get("files_uploaded"):
+        pieces.append("files_uploaded=" + ", ".join(str(value) for value in list(item.get("files_uploaded") or [])[:4]))
     if item.get("task_ids"):
         pieces.append("tasks=" + ", ".join(str(value) for value in list(item.get("task_ids") or [])[:4]))
     if item.get("key_files"):
@@ -526,7 +533,15 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
     started = perf_counter()
     memory_kind = memory_kind or "conversation_recent"
     if len(state.get("memory_reads", [])) >= int(state.get("max_memory_reads", 2)):
-        observation = {"kind": memory_kind, "summary": "Memory read budget exhausted.", "hits": 0, "provenance": {"source": "budget_guardrail"}}
+        observation = {
+            "kind": memory_kind,
+            "observation_type": f"read_memory.{memory_kind}",
+            "summary": "Memory read budget exhausted.",
+            "hits": 0,
+            "provenance": {"source": "budget_guardrail"},
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
+        }
         state.setdefault("observations", []).append(observation)
         return observation
 
@@ -597,6 +612,9 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
         state.setdefault("memory_context", {})["recent_turns"] = turns
         state["transcript_hits"] = len(turns)
 
+    observation.setdefault("observation_type", f"read_memory.{observation['kind']}")
+    observation.setdefault("memory_boundary", "context_only")
+    observation.setdefault("enterprise_citation_required", True)
     state.setdefault("memory_reads", []).append({"kind": observation["kind"], "hits": observation["hits"], "summary": observation["summary"], "provenance": observation.get("provenance", {})})
     state.setdefault("tool_calls", []).append(
         {

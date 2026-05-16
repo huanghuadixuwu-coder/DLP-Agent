@@ -9,20 +9,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from app.mcp_tools import TOOLS  # noqa: E402
+from app.mcp_tools import build_mcp_tool_manifest  # noqa: E402
+from app.orchestration.tool_discovery import dispatch_tool_call  # noqa: E402
 
 
 def handle(payload: dict[str, Any]) -> dict[str, Any]:
     name = payload.get("tool")
     args = payload.get("args") or {}
     if name == "list_tools":
-        return {"ok": True, "tools": sorted(TOOLS)}
-    if name not in TOOLS:
-        return {"ok": False, "error": f"unknown tool: {name}"}
-    try:
-        return {"ok": True, "result": TOOLS[name](**args)}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": True, "tools": build_mcp_tool_manifest()}
+    return dispatch_tool_call(str(name or ""), args if isinstance(args, dict) else {}, allow_side_effects=False)
 
 
 def main() -> None:

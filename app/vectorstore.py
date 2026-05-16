@@ -96,6 +96,11 @@ def get_workspace_memory_collection():
     return get_collection(settings.workspace_memory_chroma_collection)
 
 
+def _batched(values: list[str], batch_size: int = 128) -> Iterable[list[str]]:
+    for start in range(0, len(values), batch_size):
+        yield values[start : start + batch_size]
+
+
 def reset_caches() -> None:
     get_chroma_client.cache_clear()
     _get_embeddings.cache_clear()
@@ -121,6 +126,30 @@ def reset_named_collection(collection_name: str) -> None:
     except Exception:
         pass
     reset_caches()
+
+
+def delete_enterprise_documents_by_doc_ids(doc_ids: Iterable[str]) -> dict[str, int]:
+    """Hard-delete existing enterprise chunks for the provided document ids."""
+    normalized = sorted({str(doc_id).strip() for doc_id in doc_ids if str(doc_id or "").strip()})
+    if not normalized:
+        return {"documents_requested": 0, "chunks_deleted": 0}
+
+    collection = get_enterprise_collection()
+    chunk_ids: list[str] = []
+    for batch in _batched(normalized):
+        try:
+            result = collection.get(where={"doc_id": {"$in": batch}}, include=[])
+            chunk_ids.extend(str(item) for item in result.get("ids", []) if item)
+        except Exception:
+            # Older Chroma builds can be picky about $in; fall back to one doc_id at a time.
+            for doc_id in batch:
+                result = collection.get(where={"doc_id": {"$eq": doc_id}}, include=[])
+                chunk_ids.extend(str(item) for item in result.get("ids", []) if item)
+
+    unique_chunk_ids = sorted(set(chunk_ids))
+    for batch in _batched(unique_chunk_ids):
+        collection.delete(ids=batch)
+    return {"documents_requested": len(normalized), "chunks_deleted": len(unique_chunk_ids)}
 
 
 def _upsert_to_collection(

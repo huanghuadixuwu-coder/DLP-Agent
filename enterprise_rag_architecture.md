@@ -205,10 +205,12 @@ chunk 逻辑位于 [chunker.py](/E:/leetcode-rag-agent-enterprise/app/enterprise
 
 - `source_types`
 - `question_type`
+- `budget_profile`
 - `dense_top_k`
 - `sparse_top_k`
 - `rerank_top_k`
 - `evidence_top_k`
+- `expansion_enabled`
 
 ### 6.2 `source_types`
 
@@ -231,16 +233,30 @@ chunk 逻辑位于 [chunker.py](/E:/leetcode-rag-agent-enterprise/app/enterprise
 
 不同题型会影响召回范围：
 
-- `semantic / constrained` 通常扩大 dense/sparse/rerank 候选规模
-- 简单问题则保持较保守的 top-k
+- `basic / fact_lookup` 类问题通常使用 `small` 预算
+- `semantic` 类问题通常使用 `medium` 预算
+- `constrained / conflicting / recommendation` 类问题通常使用 `large` 预算
+- `expanded` 只作为 evidence 不足时的二阶段扩展预算
 
-### 6.4 作用
+### 6.4 Adaptive Budget
+
+这一版开始，EnterpriseRAG 不再把“提高质量”简单等同于“固定扩大 top_k”。`RetrievalPlan` 会显式记录 `budget_profile`：
+
+- `small`：dense/sparse/rerank 都较小，服务明确事实查找。
+- `medium`：服务普通语义问答。
+- `large`：服务 recommendation、constrained、conflicting 等高召回问题。
+- `expanded`：只在第一轮候选或证据不足时触发。
+
+当前 GCP onboarding 这类 recommendation case 默认保持 `large`，保留旧主路径的高召回能力；但如果 dense 已经有足够候选，只是 sparse 为空，系统不会再盲目扩展到 `expanded`。
+
+### 6.5 作用
 
 这一层的职责不是回答问题，而是决定：
 
 - 该去哪些来源找
 - 候选集要开多大
 - 后续证据应该走什么强度的收口策略
+- 是否允许 evidence 不足时进入二阶段扩展
 
 ---
 
@@ -250,13 +266,16 @@ chunk 逻辑位于 [chunker.py](/E:/leetcode-rag-agent-enterprise/app/enterprise
 
 完整流程如下：
 
-1. `_dense_recall(plan)`
-2. `_sparse_recall(plan)`
-3. `_merge_candidates(plan, dense_docs, sparse_docs)`
-4. `_rerank_candidates(plan, docs, retrieval_sources)`
-5. `_select_evidence_docs(...)`
-6. 构造 citations
-7. 调用 `build_evidence_pack(...)`
+1. `_retrieve_evidence_once(plan)`
+2. `_should_expand_retrieval(plan, evidence)`
+3. 必要时 `expand_retrieval_plan(plan)`
+4. `_dense_recall(plan)`
+5. `_sparse_recall(plan)`
+6. `_merge_candidates(plan, dense_docs, sparse_docs)`
+7. `_rerank_candidates(plan, docs, retrieval_sources)`
+8. `_select_evidence_docs(...)`
+9. 构造 citations
+10. 调用 `build_evidence_pack(...)`
 
 ### 7.1 Dense Recall
 
@@ -303,6 +322,26 @@ Rerank 默认使用：
 
 - 同一文档最多保留一定数量
 - 保证证据多样性
+
+### 7.7 Expansion Gate
+
+二阶段扩展不是默认行为。系统只有在这些信号出现时才会从当前预算扩展到 `expanded`：
+
+- dense 和 sparse 同时为空
+- merged candidates 少于 rerank 预算
+- rerank 命中明显不足
+- selected evidence 少于最低证据数量
+- evidence confidence 过低
+
+单侧召回失败会被谨慎处理：例如 sparse 为空但 dense 已经提供足够候选和 evidence 时，不触发扩展。这避免了“只要 sparse 没命中就把 dense_top_k 继续放大”的浪费。
+
+debug 字段会记录：
+
+- `budget_profile`
+- `expansion_triggered`
+- `expansion_reason`
+- `first_pass_counts`
+- `second_pass_counts`
 
 ---
 
@@ -396,11 +435,10 @@ EvidencePack 是当前 EnterpriseRAG 和传统“chunk 检索式 RAG”的最大
 3. `core_facts / secondary_facts` 划分
 4. recommendation 类问题做 `answer_slots` 抽取
 5. 构造 `answer_plan`
-6. recommendation 走 template-first
-7. 非 recommendation 走非模板生成
-8. 可选 LLM polish
-9. transcript-style post-check
-10. fallback
+6. recommendation 由 LLM 基于 `core_facts / answer_slots / answer_plan` 渲染用户可见答案
+7. 非 recommendation 走 intent-specific 生成
+8. transcript-style post-check
+9. fallback
 
 ### 9.3 `answer_intent`
 
@@ -424,14 +462,24 @@ EvidencePack 是当前 EnterpriseRAG 和传统“chunk 检索式 RAG”的最大
 
 这一步能避免某些原本 secondary 的内容在被明确追问时仍被压低。
 
-### 9.5 Recommendation 模板路径
+当前 `question_focus` 会稳定输出：
 
-Recommendation 类问题当前不是完全自由生成，而是：
+- `focus_type`
+- `focused_entities`
+- `focused_slots`
+- `confidence`
+- `source_fact_ids`
+
+### 9.5 Recommendation 结构化渲染路径
+
+Recommendation 类问题当前不是把检索到的句子直接拼接，也不是为某个 bad case 写固定答案，而是：
 
 1. 提取 `answer_slots`
 2. 计算 `slot_coverage`
-3. 用模板先组装骨架答案
-4. 再可选让 LLM 做润色
+3. 构造 `answer_plan`
+4. LLM 只读取 `core_facts / secondary_facts / answer_slots / answer_plan`
+5. 规则 post-check 检查是否泄漏 transcript 风格
+6. slot 模板只作为 LLM 失败或格式泄漏时的安全兜底
 
 槽位包括：
 
@@ -448,7 +496,7 @@ Recommendation 类问题当前不是完全自由生成，而是：
 
 ### 9.6 Post-check
 
-润色后的答案还会经过规则检查：
+LLM 渲染后的答案还会经过规则检查：
 
 - 是否泄漏 transcript 风格
 - 是否出现时间戳
@@ -456,7 +504,7 @@ Recommendation 类问题当前不是完全自由生成，而是：
 - 是否出现大段英文原句
 - 是否英文占比过高
 
-如果失败，系统会退回未润色模板答案。
+如果失败，系统会退回保守结构化兜底答案，并在 debug 中记录 `fallback_reason`。
 
 ---
 

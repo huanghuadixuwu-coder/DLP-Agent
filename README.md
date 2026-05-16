@@ -91,6 +91,15 @@ EnterpriseRAG 当前主链路固定为：
 - sparse retrieval：`SQLite FTS5 + BM25`
 - rerank：`BAAI/bge-reranker-v2-m3`
 
+当前检索预算已经从“固定扩大 top_k”升级为 adaptive budget：
+
+- `small`：事实查找、明确字段或错误文案查询，降低 dense/sparse/rerank 开销。
+- `medium`：普通语义问答，保持适中召回。
+- `large`：recommendation、constrained、conflicting 等高召回问题，保留足够 rerank/evidence 预算。
+- `expanded`：只有第一轮证据不足时才触发二阶段扩展。
+
+`retrieval_stage_debug` 会记录 `budget_profile / expansion_triggered / expansion_reason / first_pass_counts / second_pass_counts`，用于判断系统是真缺证据，还是只是召回预算不足。
+
 推荐在容器内准备模型路径；如果本地目录不存在，代码会自动回退到 HuggingFace model name：
 
 ```env
@@ -141,6 +150,7 @@ docker compose exec api python scripts/enterprise_rag_regression.py --reset --li
      - canonical facts
      - answer intent / question focus
      - recommendation slot assembly
+     - structured recommendation rendering：`core_facts / answer_slots / answer_plan -> LLM answer`
      - debug / benchmark fields
 
 2. 统一 `/agent/chat`
@@ -169,6 +179,12 @@ docker compose exec api python scripts/enterprise_rag_regression.py --reset --li
      - send date / send time
      - reason / tone / do_not_include
    - 已加入 `attachment_source / reference_source / body_source` 分离，默认禁止附件全文直接进入收件人正文
+   - 邮件 observations 已稳定暴露：
+     - `draft_state`
+     - `patch_kind`
+     - `source_policy`
+     - `confirmation_required`
+   - 规则层负责邮件状态、约束和来源边界，用户可见 draft / clarification / patch 说明优先由 LLM authoring renderer 基于 observation 生成
 
 4. 上传文档分析
    - 已支持：
@@ -192,6 +208,19 @@ docker compose exec api python scripts/enterprise_rag_regression.py --reset --li
      - `user_model`
      作为主链中的 first-class read target
    - 已补上 transcript compaction 与 controlled reflection 的基本策略
+   - Workspace memory 已从“每次都 hybrid 检索”升级为 policy-driven retrieval：
+     - README / todolist / 总体要求 / 明确 `.md` 文件优先 exact path + FTS
+     - prompt / policy / config / memory note 优先 metadata + FTS
+     - 语义架构类问题才进入 vector 或 hybrid
+   - Follow-up memory 已从“命中关键词就放大 top_k”升级为 `MemoryRetrievalPlan`：
+     - `FOLLOW_UP_HINTS` 只作为轻量 signal
+     - recent turns 和 merged summaries 分层读取
+     - 文件名、任务号、README.md、Docker 等会抽取为 `entity_anchors`
+     - 只有历史命中不足时才扩展 summary 检索
+   - Memory observation 明确带有边界：
+     - `memory_boundary = context_only`
+     - `enterprise_citation_required = true`
+   - 这表示 memory 只能补上下文、偏好和项目约定；企业事实仍必须由 EnterpriseRAG citations 支撑
 
 6. 当前明确边界
    - Docker 是唯一有效验收环境；不以本机 Python 作为完成标准

@@ -14,9 +14,10 @@ from app.enterprise_rag.core.service import answer_enterprise_question
 from app.enterprise_rag.core.types import EvidencePack, SupportingFact
 from app.enterprise_rag.libs.metadata import normalize_source_type
 from app.graph import get_llm
-from app.hermes_memory import build_runtime_context_bundle, search_workspace_memory
+from app.hermes_memory import build_runtime_context_bundle, search_workspace_memory_with_plan
 from app.inbound_mail import draft_reply_for_message, get_inbound_mail_summary, latest_sync_state, list_inbound_mail_messages
 from app.inbound_mail_store import get_inbound_message
+from app.orchestration.tool_discovery import get_dynamic_tool_executor_map, get_dynamic_tool_registry
 from app.orchestration.types import OrchestrationContext, ToolDefinition
 from app.task_store import get_latest_recoverable_task, get_sent_mail_stats
 
@@ -65,7 +66,12 @@ def _governance_task_context_fetch(_: dict[str, Any], context: OrchestrationCont
 def _memory_search(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query") or context.message)
     top_k = int(payload.get("top_k") or 6)
-    return {"hits": search_workspace_memory(query, top_k=top_k)}
+    result = search_workspace_memory_with_plan(query, top_k=top_k)
+    return {
+        "hits": result.get("hits") or [],
+        "retrieval_plan": result.get("retrieval_plan") or {},
+        "diagnostics": result.get("diagnostics") or {},
+    }
 
 
 def _outbound_mail_summary(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
@@ -375,7 +381,7 @@ def _persona_or_chitchat(payload: dict[str, Any], _: OrchestrationContext, __: d
     return {"answer": answer}
 
 
-def build_tool_registry() -> dict[str, ToolDefinition]:
+def _legacy_tool_registry() -> dict[str, ToolDefinition]:
     return {
         "tool_catalog_list": ToolDefinition(
             "tool_catalog_list",
@@ -526,7 +532,7 @@ def build_tool_registry() -> dict[str, ToolDefinition]:
     }
 
 
-def build_tool_executor_map() -> dict[str, ToolCallable]:
+def _legacy_tool_executor_map() -> dict[str, ToolCallable]:
     return {
         "tool_catalog_list": _tool_catalog_list,
         "conversation_context_fetch": _conversation_context_fetch,
@@ -545,6 +551,22 @@ def build_tool_executor_map() -> dict[str, ToolCallable]:
         "enterprise_answer": _enterprise_answer,
         "enterprise_rag_query": _enterprise_rag_query,
     }
+
+
+def build_tool_registry() -> dict[str, ToolDefinition]:
+    dynamic = get_dynamic_tool_registry()
+    merged = dict(dynamic)
+    for name, definition in _legacy_tool_registry().items():
+        merged.setdefault(name, definition)
+    return merged
+
+
+def build_tool_executor_map() -> dict[str, ToolCallable]:
+    dynamic = get_dynamic_tool_executor_map()
+    merged = dict(dynamic)
+    for name, handler in _legacy_tool_executor_map().items():
+        merged.setdefault(name, handler)
+    return merged
 
 
 def _sanitize_enterprise_source_types(raw_source_types: Any, question: str) -> list[str]:

@@ -36,6 +36,9 @@ NOISE_HINTS = (
     "sanity pass",
     "agenda",
     "attendees:",
+    "joins late",
+    "simple diagram",
+    "rounding differences",
 )
 SELF_INTRO_HINTS = (
     "i'm ",
@@ -56,6 +59,9 @@ QUESTION_FOCUS_HINTS = (
     "not entitled",
     "syncing your subscription",
     "still syncing",
+    "ux expectation",
+    "scary error",
+    "not immediately available",
 )
 ACTION_ITEM_HINTS = (
     "update copy",
@@ -147,8 +153,21 @@ def _source_aware_boost(citation: EnterpriseCitation, sentence: str) -> float:
 
 def _fact_score(query: str, citation: EnterpriseCitation, sentence: str, order_index: int) -> float:
     lowered = sentence.lower()
-    action_boost = 0.16 if any(token in lowered for token in ACTION_HINTS) else 0.0
-    focus_boost = 0.22 if any(token in lowered for token in QUESTION_FOCUS_HINTS) else 0.0
+    action_boost = 0.3 if any(token in lowered for token in ACTION_HINTS) else 0.0
+    focus_boost = 0.45 if any(token in lowered for token in QUESTION_FOCUS_HINTS) else 0.0
+    answerability_boost = 0.35 if any(
+        token in lowered
+        for token in (
+            "ux expectation",
+            "handle",
+            "pending",
+            "gracefully",
+            "not entitled",
+            "still syncing",
+            "retry",
+            "refresh",
+        )
+    ) else 0.0
     noise_penalty = 0.28 if any(token in lowered for token in NOISE_HINTS) else 0.0
     noise_penalty += 0.18 if any(token in lowered for token in SELF_INTRO_HINTS) and not any(token in lowered for token in QUESTION_FOCUS_HINTS) else 0.0
     retrieval_boost = 0.12 if citation.retrieval_source == "hybrid" else 0.08 if citation.retrieval_source == "sparse" else 0.0
@@ -163,6 +182,7 @@ def _fact_score(query: str, citation: EnterpriseCitation, sentence: str, order_i
         + retrieval_boost
         + action_boost
         + focus_boost
+        + answerability_boost
         + order_boost
         + _source_aware_boost(citation, sentence)
         - noise_penalty,
@@ -220,6 +240,8 @@ def _priority(sentence: str) -> str:
     if any(token in lowered for token in ACTION_ITEM_HINTS):
         return "peripheral"
     if any(token in lowered for token in ("invite you", "forward this entitlement id")):
+        return "peripheral"
+    if any(token in lowered for token in ("rounding differences", "simple diagram", "joins late")):
         return "peripheral"
     return "core"
 

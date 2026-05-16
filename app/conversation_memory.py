@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from langchain_core.documents import Document
@@ -10,6 +12,19 @@ from app.vectorstore import get_vectorstore, upsert_documents
 
 
 FOLLOW_UP_HINTS = ("之前", "上次", "刚才", "我们讨论过", "合并", "历史", "前面", "remember", "previous", "earlier")
+
+
+@dataclass(slots=True)
+class MemoryRetrievalPlan:
+    is_follow_up: bool
+    memory_strategy: str
+    turn_top_k: int = 3
+    merged_top_k: int = 2
+    entity_anchors: list[str] = field(default_factory=list)
+    expansion_reason: str = "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _now() -> str:
@@ -69,14 +84,19 @@ def build_turn_summary_document(
     dynamic_memory = dict(dynamic_memory or {})
     dynamic_lines: list[str] = []
     if dynamic_memory:
-        for key in ("user_goal", "outcome", "failure_reason", "memory_scope"):
+        for key in ("summary", "intent", "risk_level", "user_goal", "outcome", "failure_reason", "memory_scope"):
             value = str(dynamic_memory.get(key) or "").strip()
             if value:
                 dynamic_lines.append(f"{key}: {compact_text(value, 360)}")
-        for key in ("key_files", "recipients", "task_ids"):
+        for key in ("entities", "files_uploaded", "key_files", "recipients", "task_ids"):
             values = [str(item).strip() for item in dynamic_memory.get(key) or [] if str(item).strip()]
             if values:
                 dynamic_lines.append(f"{key}: {', '.join(values[:6])}")
+    memory_scope = str(dynamic_memory.get("memory_scope") or "session") if dynamic_memory else "session"
+    memory_intent = str(dynamic_memory.get("intent") or intent or "conversation") if dynamic_memory else (intent or "conversation")
+    memory_risk_level = str(dynamic_memory.get("risk_level") or "low") if dynamic_memory else "low"
+    memory_entities = ",".join(str(item) for item in list(dynamic_memory.get("entities") or [])[:12]) if dynamic_memory else ""
+    memory_files = ",".join(str(item) for item in list(dynamic_memory.get("files_uploaded") or [])[:12]) if dynamic_memory else ""
 
     page_content = "\n".join(
         [
@@ -101,6 +121,11 @@ def build_turn_summary_document(
             "source_conversation_ids": conversation_id,
             "source_turn_ids": source_turn_ids,
             "topic": intent or "conversation",
+            "memory_scope": memory_scope,
+            "memory_intent": memory_intent,
+            "memory_risk_level": memory_risk_level,
+            "memory_entities": memory_entities,
+            "files_uploaded": memory_files,
             "created_at": _now(),
             "is_runtime_memory": "true",
         },
@@ -154,6 +179,62 @@ def write_merged_summary(**kwargs: Any) -> bool:
 def is_memory_follow_up(question: str) -> bool:
     lowered = question.lower()
     return any(hint in question for hint in FOLLOW_UP_HINTS) or any(hint in lowered for hint in FOLLOW_UP_HINTS)
+
+
+def extract_memory_entity_anchors(question: str) -> list[str]:
+    text = question or ""
+    anchors: list[str] = []
+    anchors.extend(re.findall(r"[\w./-]+\.(?:pdf|docx?|xlsx?|csv|md|py|json|toml|yaml|yml)", text, flags=re.IGNORECASE))
+    anchors.extend(re.findall(r"(?:task|ticket|issue|pr|doc|file)[-_:# ]+[A-Za-z0-9._-]+", text, flags=re.IGNORECASE))
+    for quoted in re.findall(r"[\"'“”‘’`]([^\"'“”‘’`]{2,40})[\"'“”‘’`]", text):
+        anchors.append(quoted.strip())
+    for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", text):
+        anchors.append(token.strip())
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for anchor in anchors:
+        normalized = " ".join(anchor.split())
+        key = normalized.lower()
+        if normalized and key not in seen:
+            deduped.append(normalized)
+            seen.add(key)
+    return deduped[:8]
+
+
+def build_memory_retrieval_plan(question: str) -> MemoryRetrievalPlan:
+    follow_up = is_memory_follow_up(question)
+    anchors = extract_memory_entity_anchors(question)
+    if follow_up and anchors:
+        return MemoryRetrievalPlan(
+            is_follow_up=True,
+            memory_strategy="follow_up_with_entity_anchors",
+            turn_top_k=4,
+            merged_top_k=2,
+            entity_anchors=anchors,
+        )
+    if follow_up:
+        return MemoryRetrievalPlan(
+            is_follow_up=True,
+            memory_strategy="follow_up_recent_first",
+            turn_top_k=4,
+            merged_top_k=2,
+            entity_anchors=anchors,
+        )
+    if anchors:
+        return MemoryRetrievalPlan(
+            is_follow_up=False,
+            memory_strategy="entity_anchor_lookup",
+            turn_top_k=3,
+            merged_top_k=2,
+            entity_anchors=anchors,
+        )
+    return MemoryRetrievalPlan(
+        is_follow_up=False,
+        memory_strategy="standard_recent_and_summary",
+        turn_top_k=3,
+        merged_top_k=2,
+        entity_anchors=[],
+    )
 
 
 def _filter_by_source_conversation(docs: list[Document], conversation_id: str) -> list[Document]:
@@ -233,15 +314,22 @@ def build_memory_context(
     recent_context = recent_turns_context(conversation_id, limit=6)
     turn_docs: list[Document] = []
     merged_docs: list[Document] = []
+    plan = build_memory_retrieval_plan(question)
+    retrieval_query = question
+    if plan.entity_anchors:
+        retrieval_query = f"{question}\nanchors: {', '.join(plan.entity_anchors)}"
 
     try:
-        turn_top_k = 5 if is_memory_follow_up(question) else 3
-        merged_top_k = 3 if is_memory_follow_up(question) else 2
-        turn_docs = retrieve_turn_memory(session_id, conversation_id, question, top_k=turn_top_k)
-        merged_docs = retrieve_merged_memory(session_id, conversation_id, question, top_k=merged_top_k)
+        turn_docs = retrieve_turn_memory(session_id, conversation_id, retrieval_query, top_k=plan.turn_top_k)
+        merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k)
+        if plan.is_follow_up and not merged_docs:
+            plan.merged_top_k = 4
+            plan.expansion_reason = "follow_up_summary_not_found"
+            merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k)
     except Exception:
         turn_docs = []
         merged_docs = []
+        plan.expansion_reason = "memory_retrieval_error"
 
     context_sections = []
     if recent_context:
@@ -275,4 +363,11 @@ def build_memory_context(
             }
             for doc in merged_docs
         ],
+        "memory_retrieval_plan": plan.to_dict(),
+        "is_follow_up": plan.is_follow_up,
+        "memory_strategy": plan.memory_strategy,
+        "entity_anchors": list(plan.entity_anchors),
+        "turn_top_k": plan.turn_top_k,
+        "merged_top_k": plan.merged_top_k,
+        "expansion_reason": plan.expansion_reason,
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from langchain_core.documents import Document
@@ -11,8 +12,17 @@ from app.enterprise_rag.ingestion.hf_loader import iter_dataset_rows, iter_parqu
 from app.enterprise_rag.ingestion.manifest_store import append_manifest_run
 from app.enterprise_rag.ingestion.normalizer import normalize_document
 from app.enterprise_rag.ingestion.question_loader import load_questions
-from app.enterprise_rag.libs.sparse_index import reset_enterprise_sparse_index, upsert_enterprise_sparse_chunks
-from app.vectorstore import get_enterprise_collection, reset_named_collection, upsert_enterprise_documents
+from app.enterprise_rag.libs.sparse_index import (
+    delete_enterprise_sparse_documents_by_doc_ids,
+    reset_enterprise_sparse_index,
+    upsert_enterprise_sparse_chunks,
+)
+from app.vectorstore import (
+    delete_enterprise_documents_by_doc_ids,
+    get_enterprise_collection,
+    reset_named_collection,
+    upsert_enterprise_documents,
+)
 
 
 def _to_langchain_documents(chunks: list) -> list[Document]:
@@ -25,7 +35,43 @@ def _to_langchain_documents(chunks: list) -> list[Document]:
     ]
 
 
-def upsert_enterprise_documents_hybrid(documents: list) -> int:
+def _document_content_hash(document: Any) -> str:
+    digest = hashlib.sha256()
+    for value in (
+        getattr(document, "doc_id", ""),
+        getattr(document, "source_type", ""),
+        getattr(document, "title", ""),
+        getattr(document, "content", ""),
+    ):
+        digest.update(str(value or "").encode("utf-8", errors="ignore"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _batch_content_hash(documents: list[Any]) -> str:
+    digest = hashlib.sha256()
+    for document in sorted(documents, key=lambda item: str(getattr(item, "doc_id", "") or "")):
+        digest.update(str(getattr(document, "doc_id", "") or "").encode("utf-8", errors="ignore"))
+        digest.update(b":")
+        digest.update(_document_content_hash(document).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest() if documents else ""
+
+
+def upsert_enterprise_documents_hybrid(
+    documents: list,
+    *,
+    replace_existing: bool = True,
+    return_details: bool = False,
+) -> int | dict[str, Any]:
+    documents = list(documents or [])
+    doc_ids = sorted({str(getattr(document, "doc_id", "") or "").strip() for document in documents if str(getattr(document, "doc_id", "") or "").strip()})
+    dense_delete = {"documents_requested": 0, "chunks_deleted": 0}
+    sparse_delete = {"documents_requested": 0, "chunks_deleted": 0}
+    if replace_existing and doc_ids:
+        dense_delete = delete_enterprise_documents_by_doc_ids(doc_ids)
+        sparse_delete = delete_enterprise_sparse_documents_by_doc_ids(doc_ids)
+
     chunks = []
     for document in documents:
         chunks.extend(chunk_document(document))
@@ -49,7 +95,22 @@ def upsert_enterprise_documents_hybrid(documents: list) -> int:
             for chunk in chunks
         ]
     )
-    return len(docs)
+    details = {
+        "chunks_indexed": len(docs),
+        "documents_seen": len(documents),
+        "replace_existing": replace_existing,
+        "doc_ids_replaced": doc_ids if replace_existing else [],
+        "documents_replaced": len(doc_ids) if replace_existing else 0,
+        "dense_chunks_deleted": int(dense_delete.get("chunks_deleted", 0)),
+        "sparse_chunks_deleted": int(sparse_delete.get("chunks_deleted", 0)),
+        "content_hash": _batch_content_hash(documents),
+        "content_hash_sample": {
+            str(getattr(document, "doc_id", "") or ""): _document_content_hash(document)
+            for document in documents[:20]
+            if str(getattr(document, "doc_id", "") or "").strip()
+        },
+    }
+    return details if return_details else len(docs)
 
 
 def count_enterprise_chunks() -> int:
@@ -118,7 +179,8 @@ def ingest_enterprise_rag_bench(
                 if len(seen_doc_ids) >= len(expected_doc_ids) + distractor_limit:
                     break
 
-    indexed_chunks = upsert_enterprise_documents_hybrid(documents)
+    index_details = upsert_enterprise_documents_hybrid(documents, replace_existing=True, return_details=True)
+    indexed_chunks = int(index_details["chunks_indexed"])
 
     run = {
         "dataset": "onyx-dot-app/EnterpriseRAG-Bench",
@@ -128,6 +190,13 @@ def ingest_enterprise_rag_bench(
         "documents_seen": len(documents),
         "questions_seen": indexed_questions,
         "chunks_indexed": indexed_chunks,
+        "doc_ids_replaced": index_details.get("doc_ids_replaced", []),
+        "documents_replaced": index_details.get("documents_replaced", 0),
+        "replace_existing": index_details.get("replace_existing", True),
+        "dense_chunks_deleted": index_details.get("dense_chunks_deleted", 0),
+        "sparse_chunks_deleted": index_details.get("sparse_chunks_deleted", 0),
+        "content_hash": index_details.get("content_hash", ""),
+        "content_hash_sample": index_details.get("content_hash_sample", {}),
         "expected_doc_ids_seeded": len(expected_doc_ids),
         "sample_source_types": sorted(sample_source_types),
         "enterprise_collection": get_settings().enterprise_chroma_collection,

@@ -68,6 +68,29 @@ def reset_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
     init_enterprise_sparse_index(db_path)
 
 
+def delete_enterprise_sparse_documents_by_doc_ids(
+    doc_ids: list[str] | tuple[str, ...] | set[str],
+    db_path: str | Path | None = None,
+) -> dict[str, int]:
+    normalized = sorted({str(doc_id).strip() for doc_id in doc_ids if str(doc_id or "").strip()})
+    if not normalized:
+        return {"documents_requested": 0, "chunks_deleted": 0}
+    init_enterprise_sparse_index(db_path)
+    with _connect(db_path) as conn:
+        placeholders = ",".join("?" for _ in normalized)
+        chunk_rows = conn.execute(
+            f"SELECT chunk_id FROM enterprise_chunks WHERE doc_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        chunk_ids = [str(row["chunk_id"]) for row in chunk_rows if row["chunk_id"]]
+        for chunk_id in chunk_ids:
+            conn.execute("DELETE FROM enterprise_chunks_fts WHERE chunk_id = ?", (chunk_id,))
+        conn.execute(f"DELETE FROM enterprise_chunks WHERE doc_id IN ({placeholders})", normalized)
+        # Defensive cleanup for legacy rows that might exist without a matching dense row.
+        conn.execute(f"DELETE FROM enterprise_chunks_fts WHERE doc_id IN ({placeholders})", normalized)
+    return {"documents_requested": len(normalized), "chunks_deleted": len(chunk_ids)}
+
+
 def upsert_enterprise_sparse_chunks(rows: list[dict[str, Any]], db_path: str | Path | None = None) -> int:
     if not rows:
         return 0

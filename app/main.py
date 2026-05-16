@@ -671,9 +671,19 @@ def _build_mail_plan_observation(
 ) -> dict[str, Any]:
     resolved_body = str(mail_plan.get("resolved_body") or "")
     resolved_subject = str(mail_plan.get("resolved_subject") or "")
+    patch_kind_value = str((extra_payload or {}).get("patch_kind") or mail_plan.get("patch_kind") or "")
+    confirmation_required = bool(
+        mail_plan.get("requires_confirmation")
+        or str(mail_plan.get("status") or "") == "pending_confirmation"
+        or draft_mode == "confirmation_required"
+    )
+    draft_state = "patch" if patch_kind_value else "confirm" if confirmation_required else "pending_draft"
     payload = {
         "draft_id": str(mail_plan.get("draft_id") or ""),
         "draft_status": str(mail_plan.get("status") or ""),
+        "draft_state": draft_state,
+        "patch_kind": patch_kind_value,
+        "confirmation_required": confirmation_required,
         "mail_action_type": str(mail_plan.get("mail_action_type") or ""),
         "recipients": list(mail_plan.get("resolved_recipients") or []),
         "subject": resolved_subject,
@@ -1897,6 +1907,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "user_model",
             "source": "user_model",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(summary_text or "User preference memory was checked.", 220),
             "payload": {"facts": facts, "summary": summary_text, "reflection_candidates": list(user_memory.get("reflection_candidates") or [])},
             "citations": [],
@@ -1917,6 +1929,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "workspace_memory",
             "source": "workspace_memory",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(summary_text or "Workspace memory was checked.", 220),
             "payload": {"items": items[:4], "summary": summary_text},
             "citations": [],
@@ -1938,6 +1952,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "conversation_recent",
             "source": "conversation_recent",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(recent_summary or "Recent conversation memory was checked.", 220),
             "payload": {"turns": turns},
             "citations": [],
@@ -1967,6 +1983,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
                 "observation_type": "conversation_summary",
                 "source": "conversation_summary",
                 "grounding_kind": "memory",
+                "memory_boundary": "context_only",
+                "enterprise_citation_required": True,
                 "summary": compact_text(summary_text or "Conversation summary memory was checked.", 220),
                 "payload": {
                     "summary": summary_text,
@@ -3204,6 +3222,11 @@ def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tu
             citations=result.get("citations", []),
             upload_context=result.get("upload_context", {}) or {},
             dynamic_memory={
+                "summary": str(dynamic_memory_result.get("summary") or ""),
+                "intent": str(dynamic_memory_result.get("intent") or result.get("intent") or ""),
+                "entities": dynamic_memory_result.get("entities") or [],
+                "files_uploaded": dynamic_memory_result.get("files_uploaded") or [],
+                "risk_level": str(dynamic_memory_result.get("risk_level") or "low"),
                 "user_goal": question,
                 "outcome": answer_summary,
                 "failure_reason": _summarize_memory_failure_for_doc(result),

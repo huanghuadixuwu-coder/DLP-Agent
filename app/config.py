@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     workspace_memory_root: str = Field(default=str(ROOT_DIR / "memory"), alias="WORKSPACE_MEMORY_ROOT")
     transcript_export_path: str = Field(default=str(DATA_DIR / "transcripts" / "session_transcript.jsonl"), alias="TRANSCRIPT_EXPORT_PATH")
     hermes_memory_db_path: str = Field(default=str(DATA_DIR / "hermes_memory.db"), alias="HERMES_MEMORY_DB_PATH")
+    privacy_policy_db_path: str = Field(default=str(DATA_DIR / "privacy_policies.db"), alias="PRIVACY_POLICY_DB_PATH")
     hermes_compaction_turn_threshold: int = Field(default=80, alias="HERMES_COMPACTION_TURN_THRESHOLD")
     hermes_compaction_keep_turns: int = Field(default=16, alias="HERMES_COMPACTION_KEEP_TURNS")
     hermes_reflection_tool_call_interval: int = Field(default=8, alias="HERMES_REFLECTION_TOOL_CALL_INTERVAL")

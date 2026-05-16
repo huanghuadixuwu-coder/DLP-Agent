@@ -131,7 +131,7 @@ Workspace memory 不是整文件入库，而是先按 Markdown heading 做 secti
 
 ### 4.3 索引结构
 
-Workspace memory 同样采用双索引：
+Workspace memory 底层仍保留双索引：
 
 1. SQLite FTS
 2. Vectorstore
@@ -146,7 +146,7 @@ Vectorstore 部分通过：
 - `get_workspace_memory_vectorstore()`
 - `upsert_workspace_memory_documents(...)`
 
-也就是说，workspace memory 和 EnterpriseRAG 主知识库一样，也走 hybrid 检索思路。
+但这一版之后，Workspace memory 不再每次查询都强制走 hybrid。它会先生成 `WorkspaceRetrievalPlan`，再决定本次是否需要 vector。
 
 ### 4.4 Chunk 元数据
 
@@ -156,6 +156,7 @@ Vectorstore 部分通过：
 - `file_path`
 - `heading`
 - `content`
+- `doc_role`
 - `file_hash`
 - `file_mtime`
 
@@ -164,21 +165,42 @@ Vectorstore 部分通过：
 - `domain = workspace_memory`
 - `source_type = workspace_memory`
 - `title = heading`
+- `doc_role`
 
 ### 4.5 检索方式
 
-入口函数是：
+兼容入口仍然是：
 
 - `search_workspace_memory(question, top_k=6)`
 
-它会：
+新增的计划化入口是：
+
+- `search_workspace_memory_with_plan(question, top_k=6)`
+
+它会先调用 `build_workspace_retrieval_plan(...)`，产出：
+
+- `strategy`
+- `top_k`
+- `filters`
+- `enable_fts`
+- `enable_vector`
+- `sync_mode`
+- `reason_codes`
+
+当前策略为：
+
+- README / todolist / 总体要求 / 明确 `.md` 查询：`exact_path + FTS`，不开 vector。
+- prompt / policy / config / memory note：优先 metadata + FTS。
+- 架构、设计、为什么、如何等语义问题：进入 vector 或 hybrid。
+- 默认不无限扩大 top_k，而是 bounded hybrid。
+
+执行流程变为：
 
 1. 先 `sync_workspace_memory_index()`
-2. 用 FTS 做 sparse 命中
-3. 用 vectorstore 做 dense 命中
+2. 生成 `WorkspaceRetrievalPlan`
+3. 根据 plan 选择 exact path、FTS、vector 或 hybrid
 4. 以 `chunk_id` 合并结果
-5. 形成 hybrid score
-6. 输出 top-k
+5. 输出 hits、retrieval_plan 和 diagnostics
 
 输出的每条命中包括：
 
@@ -191,9 +213,25 @@ Vectorstore 部分通过：
 
 其中 `source` 可能是：
 
+- `exact_path`
+- `exact_fts`
 - `fts`
 - `vector`
 - `hybrid`
+
+diagnostics 会记录：
+
+- sync stats
+- exact_hits
+- fts_hits
+- vector_hits
+- merged_hits
+
+### 4.5.1 增量同步
+
+`sync_workspace_memory_index()` 现在会根据 `file_hash / file_mtime` 跳过未变化文件。这样 README、notes、skills 等 Markdown 没有更新时，不会重复切 chunk、写 SQLite、写 Chroma embedding。
+
+如果文件被删除或重命名，旧 chunk 会从 SQLite FTS 和 Chroma collection 中清理，避免 Workspace memory 出现过期片段。
 
 ### 4.6 在 runtime bundle 中的表现
 
@@ -220,6 +258,35 @@ Workspace memory 特别适合放：
 - 手工维护的策略文档
 
 它的价值在于：这些内容通常不适合和企业知识主库混成一锅，但又确实应该在回答时被看见。
+
+---
+
+## 4.8 Follow-up Memory Retrieval Plan
+
+短期和合并摘要记忆也已经从“追问就扩大 top_k”改成计划化读取。
+
+入口位于 [conversation_memory.py](/E:/leetcode-rag-agent-enterprise/app/conversation_memory.py)：
+
+- `build_memory_retrieval_plan(question)`
+- `MemoryRetrievalPlan`
+
+`FOLLOW_UP_HINTS` 仍然保留，但它只作为轻量 signal。真正执行时会生成：
+
+- `is_follow_up`
+- `memory_strategy`
+- `turn_top_k`
+- `merged_top_k`
+- `entity_anchors`
+- `expansion_reason`
+
+当前策略：
+
+- 普通问题：`standard_recent_and_summary`，读取较小的 turn summary 和 merged summary。
+- 追问问题：`follow_up_recent_first`，优先 recent turns，再读 merged summaries。
+- 带文件名、任务号、README.md、Docker 等实体：`follow_up_with_entity_anchors` 或 `entity_anchor_lookup`，把 anchors 注入检索 query。
+- 只有 follow-up 且 merged summary 没命中时，才扩展 `merged_top_k`。
+
+这样可以回答面试中的一个常见追问：系统不是让 LLM 每轮判断“是不是追问”，也不是简单把 top_k 放大，而是用低成本 signal 生成结构化 memory retrieval plan。
 
 ---
 
@@ -737,6 +804,8 @@ Memory 现在不是旁路补丁，而是主链路里可主动读取的上下文�
 - 跨轮总结问题再读 `conversation_summary`
 - 项目约定、长期规则走 `workspace_memory`
 - 个性化偏好、默认行为走 `user_model`
+- 所有 memory observation 都带 `memory_boundary=context_only`
+- 对企业事实类问题，memory observation 同时标记 `enterprise_citation_required=true`
 
 这意味着 memory 的职责已经比旧版清楚得多：  
 **它主要负责上下文连续性和偏好，而不是替代企业知识证据库。**

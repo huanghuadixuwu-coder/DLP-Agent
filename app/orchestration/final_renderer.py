@@ -282,9 +282,15 @@ def fallback_mail_authoring(
 def _trim_mail_plan_for_render(mail_plan: dict[str, Any]) -> dict[str, Any]:
     selected_candidate = dict(mail_plan.get("selected_candidate") or {})
     attachment_candidate = dict(mail_plan.get("attachment_candidate") or {})
+    patch_kind = str(mail_plan.get("patch_kind") or "")
+    confirmation_required = bool(mail_plan.get("requires_confirmation") or str(mail_plan.get("status") or "") == "pending_confirmation")
+    draft_state = "patch" if patch_kind else "confirm" if confirmation_required else "pending_draft"
     trimmed = {
         "draft_id": str(mail_plan.get("draft_id") or ""),
         "status": str(mail_plan.get("status") or ""),
+        "draft_state": draft_state,
+        "patch_kind": patch_kind,
+        "confirmation_required": confirmation_required,
         "mail_action_type": str(mail_plan.get("mail_action_type") or ""),
         "resolved_recipients": list(mail_plan.get("resolved_recipients") or []),
         "resolved_subject": str(mail_plan.get("resolved_subject") or ""),

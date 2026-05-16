@@ -375,6 +375,8 @@ def _base_mail_plan(
         "draft_id": draft_id or uuid4().hex,
         "conversation_id": conversation_id,
         "status": "pending_confirmation" if requires_confirmation else (draft_status or "draft"),
+        "draft_state": "confirm" if requires_confirmation else (draft_status or "draft"),
+        "patch_kind": "",
         "mail_action_type": action_type,
         "target_object": str((selected_candidate or {}).get("kind") or ""),
         "resolved_recipients": [destination_email] if destination_email else [],
@@ -850,6 +852,8 @@ def patch_pending_mail_plan(
         patch_kind = "remove_pending_attachment"
     else:
         patch_kind = "edit_pending_draft"
+    updated["draft_state"] = "patch"
+    updated["patch_kind"] = patch_kind
     return {
         "ok": True,
         "mode": "confirmation_required",
