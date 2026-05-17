@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 
 from app.enterprise_rag.core.types import AgentSubTask, AgentTaskPlan, RetrievalPlan
@@ -23,6 +24,13 @@ QUESTION_TYPE_HINTS = {
     "constrained": ("default", "limit", "限制", "最大", "最小", "policy", "规定", "recommend"),
     "semantic": ("why", "how", "recommend", "建议", "原因", "处理", "flow", "onboarding"),
     "info_not_found": ("not found", "unknown", "有没有提到", "是否提到"),
+}
+
+BUDGET_PROFILES = {
+    "small": {"dense_top_k": 24, "sparse_top_k": 12, "rerank_top_k": 6, "evidence_top_k": 4},
+    "medium": {"dense_top_k": 40, "sparse_top_k": 24, "rerank_top_k": 10, "evidence_top_k": 5},
+    "large": {"dense_top_k": 60, "sparse_top_k": 40, "rerank_top_k": 16, "evidence_top_k": 8},
+    "expanded": {"dense_top_k": 80, "sparse_top_k": 60, "rerank_top_k": 20, "evidence_top_k": 10},
 }
 
 
@@ -60,24 +68,40 @@ def infer_question_type(question: str) -> str:
 def build_retrieval_plan(question: str, *, source_types: list[str] | None = None, top_k: int = 8) -> RetrievalPlan:
     normalized_sources = [normalize_source_type(item) for item in (source_types or infer_source_types(question))]
     question_type = infer_question_type(question)
-    rerank_top_k = min(max(top_k, 8), 12)
-    evidence_top_k = min(max(4, top_k // 2), 6)
-    dense_top_k = max(top_k * 5, 40)
-    sparse_top_k = max(top_k * 2 + 4, 20)
-    if question_type in {"constrained", "semantic"}:
-        dense_top_k = max(dense_top_k, 60)
-        sparse_top_k = max(sparse_top_k, 40)
-        rerank_top_k = 16
-        evidence_top_k = 8
+    if question_type in {"constrained", "conflicting"}:
+        budget_profile = "large"
+    elif question_type == "semantic":
+        budget_profile = "medium"
+    else:
+        budget_profile = "small"
+    budget = dict(BUDGET_PROFILES[budget_profile])
+    if top_k > budget["rerank_top_k"]:
+        budget["rerank_top_k"] = min(max(top_k, budget["rerank_top_k"]), BUDGET_PROFILES["expanded"]["rerank_top_k"])
+        budget["evidence_top_k"] = min(max(4, top_k // 2), BUDGET_PROFILES["expanded"]["evidence_top_k"])
     return RetrievalPlan(
         query=question,
         source_types=normalized_sources,
         question_type=question_type,
-        dense_top_k=dense_top_k,
-        sparse_top_k=sparse_top_k,
-        rerank_top_k=rerank_top_k,
-        evidence_top_k=evidence_top_k,
+        budget_profile=budget_profile,
+        dense_top_k=budget["dense_top_k"],
+        sparse_top_k=budget["sparse_top_k"],
+        rerank_top_k=budget["rerank_top_k"],
+        evidence_top_k=budget["evidence_top_k"],
         require_evidence=True,
+        expansion_enabled=True,
+    )
+
+
+def expand_retrieval_plan(plan: RetrievalPlan) -> RetrievalPlan:
+    budget = BUDGET_PROFILES["expanded"]
+    return replace(
+        plan,
+        budget_profile="expanded",
+        dense_top_k=max(plan.dense_top_k, budget["dense_top_k"]),
+        sparse_top_k=max(plan.sparse_top_k, budget["sparse_top_k"]),
+        rerank_top_k=max(plan.rerank_top_k, budget["rerank_top_k"]),
+        evidence_top_k=max(plan.evidence_top_k, budget["evidence_top_k"]),
+        expansion_enabled=False,
     )
 
 

@@ -552,6 +552,16 @@ class DlpTaskApprovalRequest(BaseModel):
     roles: list[str] = Field(default_factory=list)
 
 
+class MemoryReviewRequest(BaseModel):
+    reviewer: str = Field(default="local_reviewer", min_length=1)
+    status: Literal["active", "approved", "rejected", "pending"]
+    reason: str = ""
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
+
+
 class DlpTaskSupplementRequest(BaseModel):
     session_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)

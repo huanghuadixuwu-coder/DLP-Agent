@@ -51,6 +51,9 @@ from app.hermes_dynamic_memory import (
     get_user_memory_context,
     get_workspace_memory_context,
     init_hermes_dynamic_memory_store,
+    list_memory_review_candidates,
+    review_reflection_candidate,
+    review_user_memory_fact,
     write_dynamic_turn_memory,
 )
 from app.ingest import ingest_if_needed
@@ -135,6 +138,7 @@ from app.models import (
     InboundMailSummaryResponse,
     InboundMailSyncRequest,
     InboundMailSyncResponse,
+    MemoryReviewRequest,
     NotificationOutboxItem,
     OutboundMailSummaryResponse,
     LongDocQueryRequest,
@@ -172,6 +176,7 @@ from app.task_queue import (
     enqueue_enterprise_benchmark,
     enqueue_enterprise_ingest,
     enqueue_inbound_mail_sync,
+    get_async_task_status,
     get_queue_health,
 )
 from app.task_store import (
@@ -3229,6 +3234,19 @@ def _ensure_conversation(
     return created, True
 
 
+def _ensure_conversation_read_access(conversation: dict[str, Any] | None, actor: ActorContext) -> dict[str, Any]:
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Unknown conversation_id")
+    if not actor.is_local_dev:
+        if str(conversation.get("tenant_id") or "") != actor.tenant_id:
+            raise HTTPException(status_code=403, detail="conversation_id does not belong to this tenant_id")
+        if str(conversation.get("user_id") or "") != actor.user_id:
+            raise HTTPException(status_code=403, detail="conversation_id does not belong to this user_id")
+        if str(conversation.get("workspace_id") or "") != actor.workspace_id:
+            raise HTTPException(status_code=403, detail="conversation_id does not belong to this workspace_id")
+    return conversation
+
+
 def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
     answer_text = str(result.get("answer", ""))
     return {
@@ -3478,22 +3496,65 @@ def admin_policy_version(request: Request) -> dict[str, Any]:
 @app.get("/admin/memory-candidates")
 def admin_memory_candidates(
     request: Request,
-    session_id: str,
+    session_id: str = "",
     conversation_id: str = "",
+    status: str = "pending",
     limit: int = 20,
 ) -> dict[str, Any]:
     actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
     permission_decision = _ensure_permission(actor, "admin.read", "memory_candidates")
-    candidates = get_structured_turn_summaries(
-        session_id=session_id,
-        conversation_id=conversation_id,
-        limit=max(1, min(limit, 100)),
-    )
+    candidates = list_memory_review_candidates(session_id=session_id, conversation_id=conversation_id, status=status, limit=limit)
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
         "permission_decision": permission_decision,
         "candidates": candidates,
+    }
+
+
+@app.post("/admin/memory-candidates/user-facts/{fact_id}/review")
+def admin_review_user_memory_fact(fact_id: str, payload: MemoryReviewRequest, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request, payload=payload)
+    permission_decision = _ensure_permission(actor, "memory.review", "user_memory_fact")
+    try:
+        candidate = review_user_memory_fact(
+            fact_id=fact_id,
+            status="active" if payload.status == "approved" else payload.status,
+            reviewer=payload.reviewer,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Unknown fact_id")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "candidate": candidate,
+    }
+
+
+@app.post("/admin/memory-candidates/reflections/{candidate_id}/review")
+def admin_review_reflection_candidate(candidate_id: str, payload: MemoryReviewRequest, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request, payload=payload)
+    permission_decision = _ensure_permission(actor, "memory.review", "reflection_candidate")
+    try:
+        candidate = review_reflection_candidate(
+            candidate_id=candidate_id,
+            status=payload.status,
+            reviewer=payload.reviewer,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Unknown candidate_id")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "candidate": candidate,
     }
 
 
@@ -3509,6 +3570,18 @@ def admin_rag_manifest(request: Request, limit: int = 20) -> dict[str, Any]:
         "actor_context": actor.to_dict(),
         "permission_decision": permission_decision,
         "manifest": manifest,
+    }
+
+
+@app.get("/admin/async-tasks/{task_id}")
+def admin_async_task_status(task_id: str, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "async_task")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "task": get_async_task_status(task_id),
     }
 
 
@@ -3532,12 +3605,14 @@ def create_conversation_api(payload: ConversationCreateRequest, request: Request
 
 
 @app.post("/conversations/merge", response_model=ConversationMergeResponse)
-def merge_conversations_api(payload: ConversationMergeRequest) -> ConversationMergeResponse:
+def merge_conversations_api(payload: ConversationMergeRequest, request: Request) -> ConversationMergeResponse:
+    actor = build_actor_context(request=request, payload=payload, session_id=payload.session_id)
     source_conversations = []
     for conversation_id in payload.conversation_ids:
         conversation = get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail=f"Unknown conversation_id: {conversation_id}")
+        conversation = _ensure_conversation_read_access(conversation, actor)
         if conversation["session_id"] != payload.session_id:
             raise HTTPException(status_code=403, detail="All conversations must belong to the same session_id")
         source_conversations.append(conversation)
@@ -3556,6 +3631,7 @@ def merge_conversations_api(payload: ConversationMergeRequest) -> ConversationMe
         merged_title,
         is_merged=True,
         source_conversation_ids=payload.conversation_ids,
+        actor_context=actor.to_dict(),
     )
     merged_id = str(merged_conversation["conversation_id"])
     update_conversation_summary(merged_id, merged["summary"], title=merged_title)
@@ -3599,18 +3675,16 @@ def merge_conversations_api(payload: ConversationMergeRequest) -> ConversationMe
 
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationSummary)
-def get_conversation_api(conversation_id: str) -> ConversationSummary:
-    conversation = get_conversation(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Unknown conversation_id")
+def get_conversation_api(conversation_id: str, request: Request) -> ConversationSummary:
+    actor = build_actor_context(request=request, conversation_id=conversation_id)
+    conversation = _ensure_conversation_read_access(get_conversation(conversation_id), actor)
     return ConversationSummary(**conversation)
 
 
 @app.delete("/conversations/{conversation_id}")
-def delete_conversation_api(conversation_id: str, session_id: str) -> dict:
-    conversation = get_conversation(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Unknown conversation_id")
+def delete_conversation_api(conversation_id: str, session_id: str, request: Request) -> dict:
+    actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
+    conversation = _ensure_conversation_read_access(get_conversation(conversation_id), actor)
     if conversation["session_id"] != session_id:
         raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
 
@@ -3623,17 +3697,16 @@ def delete_conversation_api(conversation_id: str, session_id: str) -> dict:
 
 
 @app.get("/conversations/{conversation_id}/turns", response_model=list[ConversationTurn])
-def get_conversation_turns_api(conversation_id: str) -> list[ConversationTurn]:
-    if not get_conversation(conversation_id):
-        raise HTTPException(status_code=404, detail="Unknown conversation_id")
+def get_conversation_turns_api(conversation_id: str, request: Request) -> list[ConversationTurn]:
+    actor = build_actor_context(request=request, conversation_id=conversation_id)
+    _ensure_conversation_read_access(get_conversation(conversation_id), actor)
     return [ConversationTurn(**turn) for turn in get_turns(conversation_id)]
 
 
 @app.get("/conversations/{conversation_id}/summary")
-def get_conversation_summary_api(conversation_id: str) -> dict:
-    conversation = get_conversation(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Unknown conversation_id")
+def get_conversation_summary_api(conversation_id: str, request: Request) -> dict:
+    actor = build_actor_context(request=request, conversation_id=conversation_id)
+    conversation = _ensure_conversation_read_access(get_conversation(conversation_id), actor)
     merge = get_merge(conversation_id)
     return {"conversation": conversation, "merge": merge}
 

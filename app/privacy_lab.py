@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from app.config import DATA_DIR, get_settings
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -63,6 +71,8 @@ RISK_KEYWORDS = {
 }
 
 STRUCTURED_FILE_HINTS = (".csv", ".json", ".log", "text/csv", "application/json", "text/plain")
+_POLICY_CACHE_LOCK = Lock()
+_POLICY_CACHE: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -71,11 +81,238 @@ class Redaction:
     count: int
 
 
+@dataclass(frozen=True)
+class PrivacyPolicy:
+    policy_id: str
+    version: str
+    status: str
+    high_keywords: tuple[str, ...]
+    medium_keywords: tuple[str, ...]
+    regex_overrides: tuple[dict[str, str], ...]
+    loaded_at: str
+    source: str = "static"
+    load_error: str = ""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _policy_db_path(db_path: str | Path | None = None) -> Path:
+    configured = db_path or getattr(get_settings(), "privacy_policy_db_path", str(DATA_DIR / "privacy_policies.db"))
+    path = Path(configured)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _connect_policy_store(db_path: str | Path | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(_policy_db_path(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_privacy_policy_store(db_path: str | Path | None = None) -> None:
+    with _connect_policy_store(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS privacy_policies (
+                policy_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                high_keywords TEXT NOT NULL DEFAULT '[]',
+                medium_keywords TEXT NOT NULL DEFAULT '[]',
+                regex_overrides TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_privacy_policies_status_version
+                ON privacy_policies(status, version, updated_at);
+            """
+        )
+
+
+def _json_list(value: Any, *, default: list[Any] | None = None) -> list[Any]:
+    if value is None or value == "":
+        return list(default or [])
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    parsed = json.loads(str(value))
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return [parsed]
+    return list(default or [])
+
+
+def _static_policy(*, source: str = "static", load_error: str = "") -> PrivacyPolicy:
+    return PrivacyPolicy(
+        policy_id="static",
+        version="static",
+        status="active",
+        high_keywords=tuple(RISK_KEYWORDS["high"]),
+        medium_keywords=tuple(RISK_KEYWORDS["medium"]),
+        regex_overrides=(),
+        loaded_at=_now(),
+        source=source,
+        load_error=load_error,
+    )
+
+
+def _policy_from_row(row: sqlite3.Row) -> PrivacyPolicy:
+    high_keywords = tuple(str(item).strip() for item in _json_list(row["high_keywords"]) if str(item).strip())
+    medium_keywords = tuple(str(item).strip() for item in _json_list(row["medium_keywords"]) if str(item).strip())
+    overrides: list[dict[str, str]] = []
+    for index, item in enumerate(_json_list(row["regex_overrides"])):
+        if isinstance(item, str):
+            item = {"name": f"dynamic_regex_{index}", "pattern": item, "replacement": "[SENSITIVE]"}
+        if not isinstance(item, dict):
+            continue
+        pattern = str(item.get("pattern") or "").strip()
+        if not pattern:
+            continue
+        overrides.append(
+            {
+                "name": str(item.get("name") or f"dynamic_regex_{index}"),
+                "pii_type": str(item.get("pii_type") or item.get("name") or "dynamic_sensitive"),
+                "pattern": pattern,
+                "replacement": str(item.get("replacement") or "[SENSITIVE]"),
+            }
+        )
+    return PrivacyPolicy(
+        policy_id=str(row["policy_id"]),
+        version=str(row["version"]),
+        status=str(row["status"]),
+        high_keywords=high_keywords,
+        medium_keywords=medium_keywords,
+        regex_overrides=tuple(overrides),
+        loaded_at=_now(),
+        source="sqlite",
+    )
+
+
+def load_active_privacy_policy(db_path: str | Path | None = None) -> PrivacyPolicy:
+    """Load the active policy, reusing the cached policy while its version is unchanged."""
+    try:
+        init_privacy_policy_store(db_path)
+        with _connect_policy_store(db_path) as conn:
+            head = conn.execute(
+                """
+                SELECT policy_id, version, updated_at
+                FROM privacy_policies
+                WHERE status = 'active'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not head:
+                return _static_policy()
+            cache_key = str(_policy_db_path(db_path))
+            cached = _POLICY_CACHE.get(cache_key)
+            if (
+                isinstance(cached, PrivacyPolicy)
+                and cached.policy_id == str(head["policy_id"])
+                and cached.version == str(head["version"])
+            ):
+                return cached
+            row = conn.execute(
+                """
+                SELECT policy_id, version, status, high_keywords, medium_keywords, regex_overrides, updated_at
+                FROM privacy_policies
+                WHERE policy_id = ?
+                LIMIT 1
+                """,
+                (head["policy_id"],),
+            ).fetchone()
+            if not row:
+                return _static_policy()
+            policy = _policy_from_row(row)
+            with _POLICY_CACHE_LOCK:
+                _POLICY_CACHE[cache_key] = policy
+            return policy
+    except Exception as exc:
+        return _static_policy(source="static_fallback", load_error=str(exc))
+
+
+def upsert_privacy_policy(
+    *,
+    policy_id: str,
+    version: str,
+    status: str = "draft",
+    high_keywords: list[str] | tuple[str, ...] | None = None,
+    medium_keywords: list[str] | tuple[str, ...] | None = None,
+    regex_overrides: list[dict[str, str] | str] | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, str]:
+    init_privacy_policy_store(db_path)
+    normalized_status = status if status in {"draft", "active", "archived"} else "draft"
+    now = _now()
+    with _connect_policy_store(db_path) as conn:
+        if normalized_status == "active":
+            conn.execute("UPDATE privacy_policies SET status = 'archived' WHERE status = 'active' AND policy_id != ?", (policy_id,))
+        conn.execute(
+            """
+            INSERT INTO privacy_policies (
+                policy_id, version, status, high_keywords, medium_keywords, regex_overrides, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(policy_id) DO UPDATE SET
+                version = excluded.version,
+                status = excluded.status,
+                high_keywords = excluded.high_keywords,
+                medium_keywords = excluded.medium_keywords,
+                regex_overrides = excluded.regex_overrides,
+                updated_at = excluded.updated_at
+            """,
+            (
+                policy_id,
+                version,
+                normalized_status,
+                json.dumps(list(high_keywords or []), ensure_ascii=False),
+                json.dumps(list(medium_keywords or []), ensure_ascii=False),
+                json.dumps(list(regex_overrides or []), ensure_ascii=False),
+                now,
+            ),
+        )
+    with _POLICY_CACHE_LOCK:
+        _POLICY_CACHE.pop(str(_policy_db_path(db_path)), None)
+    return {"policy_id": policy_id, "version": version, "status": normalized_status, "updated_at": now}
+
+
+def activate_privacy_policy(policy_id: str, *, db_path: str | Path | None = None) -> dict[str, str]:
+    init_privacy_policy_store(db_path)
+    now = _now()
+    with _connect_policy_store(db_path) as conn:
+        row = conn.execute("SELECT policy_id, version FROM privacy_policies WHERE policy_id = ?", (policy_id,)).fetchone()
+        if not row:
+            raise ValueError(f"privacy policy not found: {policy_id}")
+        conn.execute("UPDATE privacy_policies SET status = 'archived', updated_at = ? WHERE status = 'active' AND policy_id != ?", (now, policy_id))
+        conn.execute("UPDATE privacy_policies SET status = 'active', updated_at = ? WHERE policy_id = ?", (now, policy_id))
+    with _POLICY_CACHE_LOCK:
+        _POLICY_CACHE.pop(str(_policy_db_path(db_path)), None)
+    return {"policy_id": str(row["policy_id"]), "version": str(row["version"]), "status": "active", "updated_at": now}
+
+
 def rough_tokens(text: str) -> int:
     return max(1, len(text) // 2)
 
 
-def redact_message(message: str) -> tuple[str, list[Redaction]]:
+def _compile_dynamic_patterns(policy: PrivacyPolicy | None) -> list[tuple[str, re.Pattern[str], str]]:
+    compiled: list[tuple[str, re.Pattern[str], str]] = []
+    for override in (policy.regex_overrides if policy else ()):
+        try:
+            compiled.append(
+                (
+                    str(override.get("pii_type") or override.get("name") or "dynamic_sensitive"),
+                    re.compile(str(override.get("pattern") or ""), re.I | re.M),
+                    str(override.get("replacement") or "[SENSITIVE]"),
+                )
+            )
+        except re.error:
+            continue
+    return compiled
+
+
+def redact_message(message: str, policy: PrivacyPolicy | None = None) -> tuple[str, list[Redaction]]:
     redactions: list[Redaction] = []
     patterns = [
         ("email", EMAIL_RE, "[EMAIL]"),
@@ -89,6 +326,7 @@ def redact_message(message: str) -> tuple[str, list[Redaction]]:
         ("internal_ip", INTERNAL_IP_RE, "[INTERNAL_IP]"),
         ("phone", PHONE_RE, "[PHONE]"),
     ]
+    patterns.extend(_compile_dynamic_patterns(policy))
 
     redacted = message or ""
     for pii_type, pattern, replacement in patterns:
@@ -117,15 +355,22 @@ def classify_risk(
     *,
     source_filename: str = "",
     source_content_type: str = "",
+    policy: PrivacyPolicy | None = None,
 ) -> tuple[str, list[str]]:
     lowered = redacted_message.lower()
     reasons: list[str] = []
     field_hits = _field_value_hits(raw_message)
     structured_source = _is_structured_source(source_filename, source_content_type)
+    high_keywords = tuple(RISK_KEYWORDS["high"]) + tuple(policy.high_keywords if policy else ())
+    medium_keywords = tuple(RISK_KEYWORDS["medium"]) + tuple(policy.medium_keywords if policy else ())
 
-    if any(keyword.lower() in lowered for keyword in RISK_KEYWORDS["high"]):
+    if any(keyword.lower() in lowered for keyword in high_keywords):
         reasons.append("命中高风险关键词或敏感资产标识。")
-    if any(item.pii_type in {"id_card", "secret", "bank_card", "private_key", "db_url", "jwt"} for item in redactions):
+    if any(
+        item.pii_type in {"id_card", "secret", "bank_card", "private_key", "db_url", "jwt"}
+        or item.pii_type.startswith("dynamic")
+        for item in redactions
+    ):
         reasons.append("包含高敏结构化信息或凭证。")
     if structured_source and any(
         key in {"token", "secret", "password", "passwd", "pwd", "api_key", "access_key", "db_url", "connection_string", "密钥", "密码", "数据库连接"}
@@ -142,23 +387,25 @@ def classify_risk(
     ):
         reasons.append("结构化文件中命中了个人信息或业务敏感字段。")
         return "medium", reasons
-    if non_destination_redactions or any(keyword.lower() in lowered for keyword in RISK_KEYWORDS["medium"]):
+    if non_destination_redactions or any(keyword.lower() in lowered for keyword in medium_keywords):
         reasons.append("包含个人信息或业务敏感信息。")
         return "medium", reasons
 
     return "low", ["未发现明显敏感关键词或结构化 PII。"]
 
 
-def pack_context(redacted_message: str, budget_tokens: int) -> dict:
+def pack_context(redacted_message: str, budget_tokens: int, policy: PrivacyPolicy | None = None) -> dict:
     segments = [segment.strip() for segment in re.split(r"[。；;\n]+", redacted_message) if segment.strip()]
     if not segments:
         segments = [redacted_message.strip()]
+    scoring_keywords = tuple(RISK_KEYWORDS["high"]) + tuple(RISK_KEYWORDS["medium"])
+    if policy:
+        scoring_keywords += tuple(policy.high_keywords) + tuple(policy.medium_keywords)
 
     def score(segment: str) -> int:
         lowered = segment.lower()
         score_value = 0
-        for level_keywords in RISK_KEYWORDS.values():
-            score_value += sum(3 for keyword in level_keywords if keyword.lower() in lowered)
+        score_value += sum(3 for keyword in scoring_keywords if keyword.lower() in lowered)
         score_value += 5 if any(
             marker in segment for marker in ("[PHONE]", "[ID_CARD]", "[SECRET]", "[BANK_CARD]", "[INTERNAL_IP]")
         ) else 0
@@ -188,15 +435,17 @@ def scan_sensitive_message(
     source_filename: str = "",
     source_content_type: str = "",
 ) -> dict:
-    redacted, redactions = redact_message(message)
+    policy = load_active_privacy_policy()
+    redacted, redactions = redact_message(message, policy=policy)
     risk_level, reasons = classify_risk(
         message,
         redacted,
         redactions,
         source_filename=source_filename,
         source_content_type=source_content_type,
+        policy=policy,
     )
-    packed = pack_context(redacted, context_budget)
+    packed = pack_context(redacted, context_budget, policy=policy)
     return {
         "redacted_text": redacted,
         "risk_level": risk_level,
@@ -205,4 +454,9 @@ def scan_sensitive_message(
         "context_pack": packed,
         "storage_policy": "只存脱敏摘要、风险标签和审计元数据，不把原始敏感文本写入向量库或长期记忆。",
         "alert": risk_level in {"medium", "high", "critical"},
+        "policy_id": policy.policy_id,
+        "policy_version": policy.version,
+        "policy_source": policy.source,
+        "policy_loaded_at": policy.loaded_at,
+        "policy_load_error": policy.load_error,
     }

@@ -56,6 +56,7 @@ ACTION_ROLES: dict[str, tuple[str, ...]] = {
     "task.approve": ("approver", "admin"),
     "policy.read": ("policy_admin", "admin"),
     "policy.write": ("policy_admin", "admin"),
+    "memory.review": ("memory_admin", "admin"),
     "admin.read": ("admin",),
 }
 

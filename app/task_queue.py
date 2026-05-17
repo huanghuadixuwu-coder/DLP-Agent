@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.result import AsyncResult
 from redis import Redis
 
 from app.config import get_settings
@@ -65,6 +66,29 @@ def enqueue_enterprise_ingest(payload: dict) -> str:
 def enqueue_enterprise_benchmark(payload: dict) -> str:
     result = celery_app.send_task("app.task_worker.enterprise_rag_benchmark_task", args=[payload], queue=ENTERPRISE_QUEUE)
     return str(result.id)
+
+
+def get_async_task_status(task_id: str) -> dict:
+    result = AsyncResult(task_id, app=celery_app)
+    payload: dict = {
+        "task_id": task_id,
+        "state": str(result.state or "PENDING"),
+        "ready": bool(result.ready()),
+        "successful": bool(result.successful()) if result.ready() else False,
+        "failed": bool(result.failed()) if result.ready() else False,
+    }
+    if result.ready():
+        try:
+            value = result.get(propagate=False, timeout=0)
+            payload["result"] = value if not isinstance(value, BaseException) else ""
+            payload["error"] = str(value) if isinstance(value, BaseException) else ""
+        except Exception as exc:
+            payload["result"] = ""
+            payload["error"] = str(exc)
+    else:
+        info = result.info
+        payload["info"] = info if isinstance(info, dict) else str(info or "")
+    return payload
 
 
 def get_queue_health() -> dict:

@@ -319,29 +319,30 @@
 - `[x]` 新增 `ActorContext`：tenant_id / user_id / workspace_id / roles / session_id / conversation_id
 - `[x]` `/agent/chat`、EnterpriseRAG、DLP task、memory / workspace retrieval 主链开始传递 actor context
 - `[x]` 无身份时使用 `local-dev / local-user / default` 默认上下文，保持 Docker demo 可用
-- `[-]` conversation / task / memory / debug 写入 actor context；核心写入已接入，仍需 Docker 内隔离回归
+- `[-]` conversation / task / memory / debug 写入 actor context；conversation 读写隔离已 Docker 验证，task / memory 隔离回归待补
 
 ### 14.2 Permission / Data Isolation
 - `[x]` EnterpriseRAG dense / sparse 检索支持 tenant/workspace filter
-- `[x]` conversation list / task list 增加 tenant/user/workspace 过滤边界
+- `[x]` conversation list / detail / turns / summary / delete 与 task list 增加 tenant/user/workspace 过滤边界
 - `[x]` side-effectful mail send、DLP approval、RAG ingest / benchmark 增加 role permission check
 - `[-]` 权限失败已输出结构化 observation / HTTP detail；后续需继续收口为 renderer 生成自然语言说明
 
 ### 14.3 Concurrency / Backpressure
 - `[x]` 新增 Redis-backed rate limit decision：agent_chat / RAG query / ingest / benchmark / mail_send
 - `[x]` EnterpriseRAG ingest / benchmark 支持 Celery async task enqueue
+- `[x]` 新增 Admin async task status 查询，可查看 Celery STARTED / SUCCESS / FAILURE 与错误原因
 - `[x]` Redis/Celery queue health 暴露给 Admin API 与 Prometheus queue backlog metric
 - `[x]` 增加 rate_limited / llm_errors / renderer_fallback / retrieval_expansion / queue_backlog 指标基础
 
 ### 14.4 Product Hardening
 - `[ ]` Mail draft / patch / confirm / approval / send 真实 Docker 回归
-- `[ ]` EnterpriseRAG benchmark 扩大样本并重点跟踪 answer_fact_coverage
-- `[ ]` Memory pending review 后端能力最小落地
+- `[-]` EnterpriseRAG benchmark 扩大样本并重点跟踪 answer_fact_coverage；async benchmark limit=1 Docker smoke 已通过
+- `[x]` Memory pending review 后端能力最小落地：pending candidates list + reflection/user memory review API
 - `[x]` Admin API v1 查看 task stats / policy version / memory candidates / queue health / RAG manifest
 
 ### 14.5 Docker Regression
 - `[x]` Docker 内 compileall
-- `[ ]` Docker 内验证多用户 memory/task 隔离
+- `[-]` Docker 内验证多用户 memory/task 隔离；conversation list/detail 跨用户隔离已通过，memory/task 待补
 - `[ ]` Docker 内验证租户级 RAG 隔离
 - `[x]` Docker 内验证权限失败 observation-first
-- `[-]` Docker 内验证并发 smoke 与 queue health；queue health / enterprise queue listener 已验证，并发压测待补
+- `[-]` Docker 内验证并发 smoke 与 queue health；queue health / enterprise queue listener / async benchmark status 已验证，并发压测待补

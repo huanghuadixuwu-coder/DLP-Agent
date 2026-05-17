@@ -705,6 +705,107 @@ def get_user_memory_context(*, session_id: str, conversation_id: str = "", limit
     }
 
 
+def list_memory_review_candidates(
+    *,
+    session_id: str = "",
+    conversation_id: str = "",
+    status: str = "pending",
+    limit: int = 50,
+) -> dict[str, Any]:
+    init_hermes_dynamic_memory_store()
+    bounded_limit = max(1, min(int(limit or 50), 200))
+    fact_clauses = ["status = ?"]
+    fact_params: list[Any] = [status]
+    reflection_clauses = ["status = ?"]
+    reflection_params: list[Any] = [status]
+    if session_id:
+        fact_clauses.append("session_id = ?")
+        fact_params.append(session_id)
+        reflection_clauses.append("session_id = ?")
+        reflection_params.append(session_id)
+    if conversation_id:
+        fact_clauses.append("conversation_id = ?")
+        fact_params.append(conversation_id)
+        reflection_clauses.append("conversation_id = ?")
+        reflection_params.append(conversation_id)
+    with _connect() as conn:
+        fact_rows = conn.execute(
+            f"""
+            SELECT * FROM hermes_user_memory_facts
+            WHERE {' AND '.join(fact_clauses)}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (*fact_params, bounded_limit),
+        ).fetchall()
+        reflection_rows = conn.execute(
+            f"""
+            SELECT * FROM hermes_reflection_candidates
+            WHERE {' AND '.join(reflection_clauses)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*reflection_params, bounded_limit),
+        ).fetchall()
+    facts = [_row_to_dict(row) for row in fact_rows]
+    reflections = [_row_to_dict(row) for row in reflection_rows]
+    return {
+        "user_memory_facts": facts,
+        "reflection_candidates": reflections,
+        "counts": {
+            "user_memory_facts": len(facts),
+            "reflection_candidates": len(reflections),
+        },
+    }
+
+
+def review_user_memory_fact(*, fact_id: str, status: str, reviewer: str = "", reason: str = "") -> dict[str, Any]:
+    if status not in {"active", "rejected", "pending"}:
+        raise ValueError("status must be one of active, rejected, pending")
+    init_hermes_dynamic_memory_store()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM hermes_user_memory_facts WHERE fact_id = ?", (fact_id,)).fetchone()
+        if not row:
+            return {}
+        conn.execute(
+            """
+            UPDATE hermes_user_memory_facts
+            SET status = ?, updated_at = ?
+            WHERE fact_id = ?
+            """,
+            (status, _now(), fact_id),
+        )
+        updated = conn.execute("SELECT * FROM hermes_user_memory_facts WHERE fact_id = ?", (fact_id,)).fetchone()
+    item = _row_to_dict(updated) if updated else {}
+    item["review"] = {"reviewer": reviewer, "reason": reason}
+    return item
+
+
+def review_reflection_candidate(*, candidate_id: str, status: str, reviewer: str = "", reason: str = "") -> dict[str, Any]:
+    if status not in {"approved", "rejected", "pending"}:
+        raise ValueError("status must be one of approved, rejected, pending")
+    init_hermes_dynamic_memory_store()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM hermes_reflection_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+        if not row:
+            return {}
+        existing_notes = str(row["notes"] or "")
+        review_note = compact_text(f"reviewer={reviewer}; status={status}; reason={reason}", 500)
+        notes = "\n".join(part for part in [existing_notes, review_note] if part).strip()
+        conn.execute(
+            """
+            UPDATE hermes_reflection_candidates
+            SET status = ?, notes = ?
+            WHERE candidate_id = ?
+            """,
+            (status, notes, candidate_id),
+        )
+        updated = conn.execute("SELECT * FROM hermes_reflection_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+    item = _row_to_dict(updated) if updated else {}
+    item["review"] = {"reviewer": reviewer, "reason": reason}
+    return item
+
+
 def get_workspace_memory_context(question: str, *, top_k: int = 6, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
     filters = {}
     if actor_context:
