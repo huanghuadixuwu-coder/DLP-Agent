@@ -25,6 +25,47 @@ IMAP_MAILBOX=INBOX
 
 当前联调环境已切换到腾讯企业邮箱 SMTP/IMAP；未配置 SMTP 时会进入 `send_failed`，不会伪装成功。原稳定项目仍保留在 `E:\数据\leetcode-rag-agent`，本副本路径为 `E:\数据\leetcode-rag-agent-enterprise`。
 
+##5/17 更新
+不是单人 Demo 了，也还不是生产级 SaaS。更准确地说，是“可多人化、可治理、可观测”的基础层已经搭起来，但还没通过足够多的隔离、并发、邮件和 RAG 回归来宣称可稳定给多人真实使用。
+已经可以比较硬地讲：
+项目不再只是单用户 Streamlit demo，已经有 ActorContext，包含 tenant_id / user_id / workspace_id / roles / session_id / conversation_id。
+/agent/chat、EnterpriseRAG、DLP task、memory、workspace retrieval 已开始传递 actor context。
+RAG dense/sparse 检索已经支持 tenant/workspace filter。
+conversation/task list 已经有 tenant/user/workspace 过滤边界。
+side-effectful 能力，比如 mail send、DLP approve、RAG ingest/benchmark，已经有 role permission check。
+已经有 Redis-backed rate limit、Celery async ingest/benchmark、queue health、Prometheus 指标基础。
+Admin API v1 已能查看 queue health、policy version、memory candidates、RAG manifest。
+Docker 内 compileall、权限失败 observation、queue health、enterprise queue listener 已验证。
+但现在还不能说“生产可用”，主要缺这几块：
+
+多用户隔离还没有完整 Docker 回归，比如 user A 的 memory/task 是否绝不被 user B 看到。
+租户级 RAG 隔离还没有端到端验证，比如 tenant A 不能检索 tenant B 的文档。
+权限失败目前能返回结构化 detail，但还没完全走 renderer 生成自然语言说明。
+mail draft / patch / confirm / approval / send 还缺真实 Docker 全链路回归。
+EnterpriseRAG 还需要扩大 benchmark，尤其继续看 answer_fact_coverage 和错误文档混入。
+Memory pending review 还没最小落地，高风险 memory candidate 现在有方向，但缺审核闭环。
+并发只是有 backpressure/queue 基础，还没做压测和降级策略验证。
+下一步优先级
+我建议下一轮不要急着加 PDF、GraphRAG、日历、腾讯会议。现在最值钱的是把 L2 打实，推进到 L3：可控多人内测版。
+
+先做“隔离回归套件”
+目标：证明多用户、多租户不是字段摆设。
+要测：两个 user_id 的 conversation/memory/task 不互相可见；两个 tenant_id 的 EnterpriseRAG query 不能跨租户命中文档；无权限用户不能 send/approve/ingest。
+
+再做“异步任务闭环”
+目标：ingest/benchmark 不只是能入队，还能查状态、看失败原因、在 Admin API 里可追踪。
+要补：task_id 状态查询、queue health 更细、worker failure observation、Prometheus 指标确认。
+
+然后做“产品主链真实回归”
+目标：把面试和演示里最容易被追问的链路跑扎实。
+要跑：mail draft/patch/confirm/approval/send；GCP onboarding RAG case 与同主题不同问法；contextual recall/workspace memory/user_model read；policy hot update；doc-level invalidation。
+
+最后补“Memory pending review”
+目标：让高风险偏好、长期记忆、策略类记忆不会自动污染行为。
+要补：pending candidates 查询、approve/reject 后端接口、ReAct read 展示审核状态。
+
+一句话判断：我们现在已经从“能演示”进入“有企业系统骨架”的阶段；下一步不是继续扩功能面，而是把隔离、权限、任务状态、邮件/RAG/memory 回归做成可信证据。这样面试时就能从“我做了 RAG Agent”升级成“我做了一个具备多租户、权限、队列、审计和回归基线的企业 Agent 后端”。
+
 ## 企业版入口
 
 - Web: `http://localhost:8511`
@@ -119,368 +160,3 @@ docker compose exec api python scripts/enterprise_rag_regression.py --reset --li
 - benchmark 的 `average_doc_recall / average_evidence_fact_coverage / average_answer_fact_coverage`
 - 若干 bad cases 方便排查答案器或 reranker 问题
 
-# 历史基线说明（已非当前主线）
-
-这是一个面向面试准备和 Agent/RAG 学习的工程化 PoC。项目现在已经从“多个独立 Labs 演示页”升级为“一个统一 Agent”，用户通过同一个聊天入口提问，后端用 `LangGraph` 负责意图路由、工具调用、统一 RAG 检索、答案生成和可观测性记录。
-
-## 当前能力
-
-### 2026-05-07 当前主线状态
-
-当前主线已经从早期的“DLP 外发演示 + 若干独立实验页”收口为一个更接近企业落地形态的统一 Agent。  
-当前正式可用并且已经进入 Docker 回归范围的能力主要有：
-
-1. 企业知识问答
-   - `EnterpriseRAG-Bench` 新主链已接入 `/agent/chat`
-   - 检索主链为：
-     - dense retrieval：`Chroma + BAAI/bge-m3`
-     - sparse retrieval：`SQLite FTS5 + BM25`
-     - rerank：`BAAI/bge-reranker-v2-m3`
-   - 已补齐：
-     - sentence-level evidence
-     - canonical facts
-     - answer intent / question focus
-     - recommendation slot assembly
-     - debug / benchmark fields
-
-2. 统一 `/agent/chat`
-   - 当前主路径已经切成：
-     - 安全硬分支
-     - 轻量 Router
-     - Fast Path / Slow Path(ReAct)
-     - observation-first renderer
-   - Fast Path 已覆盖：
-     - enterprise fact
-     - contextual memory
-     - upload analysis
-     - mailbox / task status
-     - persona / capability
-   - 目标是不再让所有请求都先进重型 think。
-
-3. 邮件协作与 DLP 外发
-   - 用户可直接在聊天里生成外发计划，不再依赖手动创建外发任务入口
-   - 已支持真实附件持久化与二进制附件发送
-   - 已支持 DLP 风险判定、审批流、任务台与 SMTP 真实发送
-   - 已支持 pending draft follow-up patch：
-     - 第二轮、第三轮追问会修改上一版待确认草稿，而不是重建新计划
-   - 已补齐正文结构约束：
-     - greeting
-     - sender identity / “我们是谁”
-     - send date / send time
-     - reason / tone / do_not_include
-   - 已加入 `attachment_source / reference_source / body_source` 分离，默认禁止附件全文直接进入收件人正文
-
-4. 上传文档分析
-   - 已支持：
-     - summarize
-     - qa
-     - critique
-     - rewrite
-     - extract_action_items
-   - 文档评价类请求可以直接走 Fast Path，不再强制先进重型 ReAct。
-
-5. Hermes-style Memory（第一版）
-   - 已落地四层 memory：
-     - `session_transcript`
-     - `turn_summary`
-     - `workspace_memory`
-     - `user_model`
-   - 已支持：
-     - `conversation_recent`
-     - `conversation_summary`
-     - `workspace_memory`
-     - `user_model`
-     作为主链中的 first-class read target
-   - 已补上 transcript compaction 与 controlled reflection 的基本策略
-
-6. 当前明确边界
-   - Docker 是唯一有效验收环境；不以本机 Python 作为完成标准
-   - 邮件的 reply / forward 目标绑定仍可继续增强
-   - 日历 / 腾讯会议能力尚未接入当前主链
-   - DLP review content 出于审计目的仍可能包含附件文本，但收件人可见正文已与之分离
-
-7. 推荐回归方式
-   - 启动：
-     - `docker compose up --build -d`
-   - EnterpriseRAG 回归：
-     - `docker compose exec api python scripts/enterprise_rag_regression.py --reset --limit 20`
-   - UI 回归：
-     - Web：`http://localhost:8511`
-     - API docs：`http://localhost:8010/docs`
-
-- `LeetCode RAG`：支持少量算法题的思路解释、复杂度说明、局部代码问答。
-- `统一 Agent`：同一个入口自动处理长文档上下文预算、隐私预警、Apple 歧义消解、框架观点问答、提醒助手。
-- `混合路由`：先走规则，再在模糊场景下调用 `GLM-4.5-Air` 做 LLM routing。
-- `统一 RAG 语料层`：LeetCode、长文档、隐私、歧义消解、框架观点都写入同一个 `Chroma` collection。
-- `过程可见`：前端可看到 intent、routing source、tool calls、retrieved evidence、privacy、context budget。
-- `指标监控`：Prometheus 记录请求数、延迟、token、成本、路由来源、证据命中、反思次数等指标。
-
-## 技术栈
-
-- `LangGraph`：统一 Agent 工作流和 LeetCode Agent 状态图
-- `LangChain`：模型与向量库集成
-- `GLM-4.5-Air`：主模型与 LLM router
-- `Chroma`：统一向量库
-- `FastAPI`：后端 API
-- `Streamlit`：演示前端
-- `Prometheus`：监控与指标查看
-- `Docker Compose`：全容器化运行
-
-## 启动方式
-
-```powershell
-cd E:\数据\leetcode-rag-agent-enterprise
-$env:COMPOSE_BAKE='false'
-$env:DOCKER_BUILDKIT='0'
-docker compose up --build
-```
-
-启动后访问：
-
-- `http://localhost:8501`：统一 Agent 前端
-- `http://localhost:8000/docs`：FastAPI 文档
-- `http://localhost:9090`：Prometheus
-
-## 推荐体验路径
-
-先进入 `http://localhost:8501`，使用同一个聊天框测试下面几类问题：
-
-- `一本1.5M的书要放入10K memory怎么做？`
-- `超大 PDF 怎么放进上下文？`
-- `客户手机号13812345678和api_key=abcdef1234567890外发，怎么预警？`
-- `apple 手机怎么样？`
-- `apple 含糖量高吗？`
-- `apple 怎么样？`
-- `LangChain 是不是没用了？`
-
-这几类问题会分别触发不同 intent、不同工具，以及不同的统一 RAG 检索证据。
-
-## 核心工作流
-
-统一 Agent 的主流程是：
-
-1. `classify_intent`
-2. `plan_tool_use`
-3. `run_tools`
-4. `compose_answer`
-5. `optional_reflection`
-6. `finalize_agent_response`
-
-其中关键升级点有两个：
-
-- `intent 分类` 不再只靠关键词，而是“规则 + LLM 混合路由”。
-- `工具证据` 不再只是 Python 常量返回，而是优先从 `Chroma` 的统一语料层检索。
-
-## 目录说明
-
-- [app/main.py](</E:/数据/leetcode-rag-agent/app/main.py>)：FastAPI 入口与接口编排
-- [app/unified_agent.py](</E:/数据/leetcode-rag-agent/app/unified_agent.py>)：统一 Agent 的 `LangGraph` 工作流
-- [app/hybrid_router.py](</E:/数据/leetcode-rag-agent/app/hybrid_router.py>)：规则 + LLM 混合路由
-- [app/unified_tools.py](</E:/数据/leetcode-rag-agent/app/unified_tools.py>)：统一工具层
-- [app/unified_corpus.py](</E:/数据/leetcode-rag-agent/app/unified_corpus.py>)：统一 RAG 语料构建与检索
-- [app/vectorstore.py](</E:/数据/leetcode-rag-agent/app/vectorstore.py>)：Chroma 接入与批量 upsert
-- [app/metrics.py](</E:/数据/leetcode-rag-agent/app/metrics.py>)：Prometheus 指标
-- [web/streamlit_app.py](</E:/数据/leetcode-rag-agent/web/streamlit_app.py>)：单页聊天前端
-
-## 主要接口
-
-### 统一 Agent
-
-- `POST /agent/chat`
-  - 单入口聊天接口
-  - 返回 `intent`、`routing_source`、`routing_confidence`、`tool_calls`、`retrieved_evidence`、`privacy`、`context_budget`
-
-### LeetCode RAG
-
-- `GET /health`
-- `GET /problems`
-- `POST /ingest`
-- `POST /chat`
-- `POST /plan`
-- `POST /execute`
-- `GET /metrics`
-
-`/plan + /execute` 仍然保留，用来展示显式 `Plan-and-Execute` 过程。
-
-### 调试型 Labs 接口
-
-- `POST /labs/long-doc/query`
-- `POST /labs/privacy/scan`
-- `POST /labs/disambiguation/query`
-- `POST /labs/framework/compare`
-
-这些接口仍然保留，但现在更适合作为调试接口，而不是主体验入口。
-
-## 统一 RAG 语料层
-
-项目当前使用一个 collection：`leetcode_rag_v1`。
-
-其中包含这些 domain：
-
-- `leetcode`
-- `long_doc`
-- `privacy`
-- `disambiguation`
-- `framework`
-- `conversation`
-
-新加入的 `long_doc / privacy / disambiguation / framework` 语料已经和 LeetCode 题库一起写入同一个 Chroma collection，统一由工具层做 filter 检索。
-
-## Prometheus 指标
-
-常用指标包括：
-
-- `agent_unified_requests_total`
-- `agent_intent_runs_total`
-- `agent_tool_calls_total`
-- `agent_router_runs_total`
-- `agent_router_fallbacks_total`
-- `agent_router_llm_confidence`
-- `agent_unified_evidence_hits_total`
-- `agent_request_latency_ms`
-- `agent_tokens_input_total`
-- `agent_tokens_output_total`
-- `agent_estimated_cost_total`
-- `agent_privacy_guardrails_total`
-
-## 多对话记忆与合并
-
-项目现在支持一个更接近真实问答产品的记忆工作区：
-
-- 每个聊天都有独立的 `conversation_id`
-- 原始对话写入本地 `SQLite`，默认文件是 `data/conversations.db`
-- 每轮成功问答会生成 `turn_summary`，写入 `Chroma`
-- 用户可以在左侧选择多个对话并合并
-- 合并后会生成新的 merged conversation，并把 `merged_summary` 写入 `Chroma`
-- 后续提问会同时检索当前对话记忆和相关合并记忆
-- 长回答会默认折叠，完整内容可展开查看
-
-推荐体验：
-
-1. 在左侧点击“新建对话”，讨论一个主题，例如 `worktree 替代方案`
-2. 再新建一个对话，讨论另一个相关主题，例如 `多对话合并记忆`
-3. 在左侧多选两个对话并点击“合并所选对话”
-4. 切换到合并后的对话，提问 `我们之前关于不用 worktree 的方案是什么？`
-
-相关接口：
-
-- `GET /conversations`
-- `POST /conversations`
-- `GET /conversations/{conversation_id}`
-- `GET /conversations/{conversation_id}/turns`
-- `GET /conversations/{conversation_id}/summary`
-- `POST /conversations/merge`
-
-新增记忆指标：
-
-- `agent_conversations_total`
-- `agent_conversation_turns_total`
-- `agent_conversation_merges_total`
-- `agent_turn_summary_writes_total`
-- `agent_merged_summary_writes_total`
-- `agent_memory_retrieval_hits_total`
-- `agent_answer_collapses_total`
-
-## 其他文档
-
-- [技术文档.md](</E:/数据/leetcode-rag-agent/技术文档.md>)
-- [面试开放题知识库.md](</E:/数据/leetcode-rag-agent/面试开放题知识库.md>)
-- [LangChain_vs_RawLLM_观点.md](</E:/数据/leetcode-rag-agent/LangChain_vs_RawLLM_观点.md>)
-- [MCP插件设计说明.md](</E:/数据/leetcode-rag-agent/MCP插件设计说明.md>)
-
-## 当前定位
-
-这个项目是一个学习型、面试型 PoC，不是生产级平台。它的重点不是做出完整业务系统，而是把常见的 Agent/RAG 开放题变成“能运行、能观察、能解释、能继续扩展”的工程实验台。
-# Enterprise Workflow Prototype
-
-This copy is the enterprise-oriented branch of the original LeetCode RAG Agent. The stable baseline remains in `E:\数据\leetcode-rag-agent`; this folder adds a Human-in-the-loop workflow for sensitive outbound messages.
-
-Enterprise ports:
-
-- Web: `http://localhost:8511`
-- API docs: `http://localhost:8010/docs`
-- Chroma: `http://localhost:8011`
-- Prometheus: `http://localhost:9091`
-
-The local embedding model is mounted from `E:\数据\bge-small-zh-v1.5` to `/app/external-models/bge-small-zh-v1.5`.
-
-Sensitive outbound workflow:
-
-1. User submits outbound content.
-2. The workflow detects PII and secrets.
-3. The workflow redacts sensitive fields.
-4. The workflow classifies risk.
-5. Low-risk tasks complete automatically.
-6. Medium/high-risk tasks enter `pending_approval`.
-7. A human reviewer approves or rejects the task.
-8. The system records an audit log.
-
-API endpoints:
-
-- `POST /workflows/sensitive-outbound`
-- `GET /workflows/sensitive-outbound`
-- `GET /workflows/sensitive-outbound/{workflow_id}`
-- `POST /workflows/sensitive-outbound/{workflow_id}/approve`
-- `POST /workflows/sensitive-outbound/{workflow_id}/reject`
-- `POST /mail/inbound/sync`
-- `GET /mail/inbound/summary?since=&until=`
-- `GET /mail/inbound/messages`
-- `POST /mail/inbound/{message_id}/draft-reply`
-- `GET /notifications/outbox`
-
-Prometheus metrics:
-
-- `agent_workflow_created_total`
-- `agent_workflow_pending_approvals_total`
-- `agent_workflow_approved_total`
-- `agent_workflow_rejected_total`
-- `agent_workflow_risk_total`
-
-## Inbound Mail And Notification Outbox
-
-The first inbound-mail version is intentionally narrow:
-
-- 163 IMAP only, read-only, no delete/move/mark-read operations.
-- Disabled by default through `IMAP_ENABLED=false`.
-- `POST /mail/inbound/sync` performs manual sync and writes message metadata/snippets.
-- `POST /mail/inbound/digest` creates a `daily_mail_digest` notification event.
-- `new_mail_received` events are written to `notification_outbox` for future Feishu/WeCom/DingTalk integration.
-- Chat queries such as `今天收了多少邮件` use the inbound summary instead of creating outbound DLP tasks.
-- Draft replies are not sent automatically; sending still requires an explicit user request and the DLP approval state machine.
-
-## Public Office Datasets For Manual Evaluation
-
-Do not import these datasets into a new lab yet. Copy representative snippets manually into the chat or upload area:
-
-- [EnterpriseRAG-Bench](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench): enterprise-like Slack, Gmail, Drive, Confluence and issue data. Best for office Q&A, email-thread understanding, and external-summary prompts.
-- [Enron Email Dataset](https://www.loc.gov/item/2018487913/) / [WAC Enron corpus](https://wacclearinghouse.org/jwa/corpora/enron/): realistic enterprise email threads. Best for inbound-mail summaries, reply drafting, and accidental external-disclosure checks.
-- [QMSum](https://github.com/Yale-LILY/QMSum): query-focused meeting summaries. Best for meeting-note externalization tests.
-- [MeetingBank](https://meetingbank.github.io/): long public meeting transcripts and minutes. Best for long-document compression and external-facing summaries.
-- [Schema-Guided Dialogue](https://www.tensorflow.org/datasets/catalog/schema_guided_dialogue): task-oriented office-like dialogues. Best for clarification and missing-recipient/missing-content behavior.
-- [SMCalFlow](https://microsoft.github.io/task_oriented_dialogue_as_dataflow_synthesis): calendar/person/location workflows. Best for future email-to-task or meeting follow-up expansion.
-- [docx-corpus](https://docxcorp.us/): public document samples. Best for manually copied policy/report/contract-like text.
-
-## DLP Scenario Pack And Fault Injection Lab
-
-The enterprise copy now includes a first-pass DLP scenario replay lab on top of the asynchronous
-task pipeline.
-
-- Scenario catalog API: `GET /labs/dlp/scenarios`
-- Replay a scenario into the real task queue: `POST /labs/dlp/scenarios/{scenario_id}/replay`
-- Scenario runs reuse the same `/tasks`, Celery worker, WebSocket stream, and approval console
-- Task responses now include:
-  - `lab_run`
-  - `scenario_id`
-  - `scenario_name`
-  - `fault_injection`
-  - `expected_outcome`
-  - `status_path`
-  - `scenario_evaluation`
-
-Current built-in injected controls:
-
-- `force_smtp_fail`
-- `force_model_timeout`
-- `force_retrieval_empty`
-- `force_rule_only_mode`
-- `force_queue_delay_seconds`
