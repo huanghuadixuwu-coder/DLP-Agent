@@ -8,17 +8,19 @@ import uuid
 
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time, timezone
 from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from redis import Redis
 
+from app.actor_context import ActorContext, build_actor_context, permission_observation, require_permission
+from app.backpressure import check_rate_limit
 from app.config import get_settings
 from app.conversation_memory import build_memory_context, compact_text, infer_title, write_merged_summary, write_turn_summary
 from app.conversation_store import (
@@ -39,6 +41,7 @@ from app.dlp_scenarios import build_status_path, evaluate_scenario_task, get_dlp
 from app.enterprise_rag.core.service import answer_enterprise_question
 from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
 from app.enterprise_rag.eval.casebook import build_casebook
+from app.enterprise_rag.ingestion.manifest_store import load_manifest
 from app.enterprise_rag.ingestion.indexer import ingest_enterprise_rag_bench
 from app.graph import execute_confirmed_plan, get_llm, preview_plan, run_agent
 from app.hermes_memory import init_workspace_memory_index
@@ -87,6 +90,7 @@ from app.metrics import (
     record_workflow_created,
     record_workflow_email_sent,
     record_workflow_rejected,
+    record_queue_backlog,
     refresh_task_metrics,
     render_metrics,
 )
@@ -153,12 +157,23 @@ from app.orchestration.fast_router import route_agent_request
 from app.orchestration.final_renderer import render_final_answer, render_mail_authoring
 from app.orchestration.registry import build_tool_executor_map
 from app.orchestration.types import OrchestrationContext
-from app.privacy_lab import scan_sensitive_message
+from app.privacy_lab import load_active_privacy_policy, scan_sensitive_message
 from app.raw_vs_langgraph import compare_raw_llm_and_langgraph
 from app.session_store import append_turn, delete_plan, load_plan, save_plan
 from app.sensitive_workflow import run_sensitive_outbound_workflow
 from app.task_events import build_task_event, publish_task_event, task_event_iterator
-from app.task_queue import EMAIL_QUEUE, MAIL_QUEUE, RISK_QUEUE, enqueue_daily_mail_digest, enqueue_dlp_risk_task, enqueue_email_send_task, enqueue_inbound_mail_sync
+from app.task_queue import (
+    EMAIL_QUEUE,
+    MAIL_QUEUE,
+    RISK_QUEUE,
+    enqueue_daily_mail_digest,
+    enqueue_dlp_risk_task,
+    enqueue_email_send_task,
+    enqueue_enterprise_benchmark,
+    enqueue_enterprise_ingest,
+    enqueue_inbound_mail_sync,
+    get_queue_health,
+)
 from app.task_store import (
     add_task_event,
     approve_task,
@@ -192,6 +207,59 @@ from app.workflow_store import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _permission_denied(actor: ActorContext, action: str, resource: str = "") -> HTTPException:
+    decision = require_permission(actor, action, resource)
+    return HTTPException(status_code=403, detail=permission_observation(actor, decision))
+
+
+def _ensure_permission(actor: ActorContext, action: str, resource: str = "") -> dict[str, Any]:
+    decision = require_permission(actor, action, resource)
+    if not decision.allowed:
+        raise _permission_denied(actor, action, resource)
+    return decision.to_dict()
+
+
+def _ensure_rate_limit(actor: ActorContext, resource: str) -> dict[str, Any]:
+    decision = check_rate_limit(actor, resource)
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "observation_type": "rate_limited",
+                "ok": False,
+                "actor_context": actor.to_dict(),
+                "rate_limit_decision": decision.to_dict(),
+            },
+        )
+    return decision.to_dict()
+
+
+def _attach_landing_context(
+    response: UnifiedAgentResponse,
+    *,
+    actor: ActorContext,
+    permission_decision: dict[str, Any],
+    rate_limit_decision: dict[str, Any],
+    queue_status: dict[str, Any] | None = None,
+    task_mode: str = "sync",
+) -> UnifiedAgentResponse:
+    response.actor_context = actor.to_dict()
+    response.permission_decision = dict(permission_decision or {})
+    response.rate_limit_decision = dict(rate_limit_decision or {})
+    response.queue_status = dict(queue_status or {})
+    response.task_mode = task_mode
+    return response
+
+
+def _refresh_queue_metrics() -> dict[str, Any]:
+    health = get_queue_health()
+    try:
+        record_queue_backlog({str(queue): int(count) for queue, count in dict(health.get("queues") or {}).items()})
+    except Exception:
+        logger.debug("Queue metrics refresh failed", exc_info=True)
+    return health
 
 
 @asynccontextmanager
@@ -671,9 +739,19 @@ def _build_mail_plan_observation(
 ) -> dict[str, Any]:
     resolved_body = str(mail_plan.get("resolved_body") or "")
     resolved_subject = str(mail_plan.get("resolved_subject") or "")
+    patch_kind_value = str((extra_payload or {}).get("patch_kind") or mail_plan.get("patch_kind") or "")
+    confirmation_required = bool(
+        mail_plan.get("requires_confirmation")
+        or str(mail_plan.get("status") or "") == "pending_confirmation"
+        or draft_mode == "confirmation_required"
+    )
+    draft_state = "patch" if patch_kind_value else "confirm" if confirmation_required else "pending_draft"
     payload = {
         "draft_id": str(mail_plan.get("draft_id") or ""),
         "draft_status": str(mail_plan.get("status") or ""),
+        "draft_state": draft_state,
+        "patch_kind": patch_kind_value,
+        "confirmation_required": confirmation_required,
         "mail_action_type": str(mail_plan.get("mail_action_type") or ""),
         "recipients": list(mail_plan.get("resolved_recipients") or []),
         "subject": resolved_subject,
@@ -896,7 +974,10 @@ def _should_apply_recoverable_supplement(task: dict[str, Any] | None, payload: U
     return str(task.get("entry_issue_type", "")) == "file_parse_failed"
 
 
-def _create_async_dlp_task(payload: DlpTaskCreateRequest) -> dict:
+def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[str, Any] | None = None) -> dict:
+    actor = build_actor_context(payload=payload, session_id=payload.session_id, conversation_id=payload.conversation_id)
+    if actor_context:
+        actor = ActorContext(**{**actor.to_dict(), **dict(actor_context or {})})
     combined_message = (payload.review_content or "").strip() or (payload.resolved_outbound_content or "").strip() or _task_message(
         payload.message,
         payload.uploaded_text,
@@ -987,6 +1068,9 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest) -> dict:
         scenario_name=payload.scenario_name,
         fault_injection=fault_injection,
         expected_outcome=dict(payload.expected_outcome or {}),
+        tenant_id=actor.tenant_id,
+        user_id=actor.user_id,
+        workspace_id=actor.workspace_id,
     )
     record_task_created()
     if payload.lab_run and payload.scenario_id:
@@ -1897,6 +1981,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "user_model",
             "source": "user_model",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(summary_text or "User preference memory was checked.", 220),
             "payload": {"facts": facts, "summary": summary_text, "reflection_candidates": list(user_memory.get("reflection_candidates") or [])},
             "citations": [],
@@ -1917,6 +2003,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "workspace_memory",
             "source": "workspace_memory",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(summary_text or "Workspace memory was checked.", 220),
             "payload": {"items": items[:4], "summary": summary_text},
             "citations": [],
@@ -1938,6 +2026,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
             "observation_type": "conversation_recent",
             "source": "conversation_recent",
             "grounding_kind": "memory",
+            "memory_boundary": "context_only",
+            "enterprise_citation_required": True,
             "summary": compact_text(recent_summary or "Recent conversation memory was checked.", 220),
             "payload": {"turns": turns},
             "citations": [],
@@ -1967,6 +2057,8 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
                 "observation_type": "conversation_summary",
                 "source": "conversation_summary",
                 "grounding_kind": "memory",
+                "memory_boundary": "context_only",
+                "enterprise_citation_required": True,
                 "summary": compact_text(summary_text or "Conversation summary memory was checked.", 220),
                 "payload": {
                     "summary": summary_text,
@@ -2006,6 +2098,7 @@ def _execute_fast_path(
     display_message: str,
     upload_context: dict[str, Any],
     route_decision: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     started = perf_counter()
     intent = str(route_decision.get("intent") or "mixed")
@@ -2018,6 +2111,7 @@ def _execute_fast_path(
         safe_message=payload.message,
         display_message=display_message or payload.message,
         upload_context=dict(upload_context or {}),
+        actor_context=dict(actor_context or {}),
     )
 
     if intent == "upload_analysis":
@@ -2101,6 +2195,7 @@ def _execute_fast_path(
             top_k=8,
             session_id=payload.session_id,
             conversation_id=conversation_id,
+            actor_context=actor_context,
         )
         observation = {
             "observation_type": "enterprise_rag_result",
@@ -2674,7 +2769,11 @@ def plan_compound_tasks(message: str) -> _CompoundTaskPlan:
     return _CompoundTaskPlan(subtasks=subtasks)
 
 
-def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id: str) -> UnifiedAgentResponse | None:
+def _handle_compound_agent_request(
+    payload: UnifiedAgentRequest,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse | None:
     task_plan = plan_compound_tasks(payload.message)
     if len(task_plan.subtasks) < 2:
         return None
@@ -2712,6 +2811,7 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
             result = answer_enterprise_question(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
+                actor_context=actor_context,
             )
             observations.append(
                 {
@@ -2743,7 +2843,11 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
     )
 
 
-def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id: str) -> UnifiedAgentResponse | None:
+def _handle_compound_agent_request(
+    payload: UnifiedAgentRequest,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse | None:
     task_plan = plan_compound_tasks(payload.message)
     if len(task_plan.subtasks) < 2:
         return None
@@ -2777,6 +2881,7 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
             result = answer_enterprise_question(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
+                actor_context=actor_context,
             )
             observations.append(
                 {
@@ -2833,7 +2938,8 @@ def _handle_async_outbound_agent_request(
     outbound_message: str,
     display_message: str,
     upload_context: dict[str, Any] | None = None,
-    ) -> UnifiedAgentResponse:
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse:
     resolution = _build_outbound_resolution(payload, conversation_id, dict(upload_context or {}))
     if not resolution.get("ok"):
         return _build_rule_clarification_response(
@@ -2873,8 +2979,12 @@ def _handle_async_outbound_agent_request(
         uploaded_file_base64=payload.uploaded_file_base64,
         source_parse_status=payload.source_parse_status,
         source_parse_error=payload.source_parse_error,
+        tenant_id=str((actor_context or {}).get("tenant_id") or ""),
+        user_id=str((actor_context or {}).get("user_id") or ""),
+        workspace_id=str((actor_context or {}).get("workspace_id") or ""),
+        roles=list((actor_context or {}).get("roles") or []),
     )
-    task = _create_async_dlp_task(task_payload)
+    task = _create_async_dlp_task(task_payload, actor_context=actor_context)
     return _build_task_agent_response(
         session_id=payload.session_id,
         conversation_id=conversation_id,
@@ -2891,6 +3001,7 @@ def _create_dlp_task_from_mail_plan(
     conversation_id: str,
     request_message: str,
     mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     attachment = dict((mail_plan.get("resolved_attachments") or [{}])[0] or {}) if mail_plan.get("resolved_attachments") else {}
     selected_candidate = dict(mail_plan.get("selected_candidate") or {})
@@ -2916,7 +3027,12 @@ def _create_dlp_task_from_mail_plan(
             uploaded_content_type=str(selected_candidate.get("content_type") or attachment.get("content_type") or ""),
             uploaded_text=str(selected_candidate.get("content") or ""),
             requested_action=str(mail_plan.get("mail_action_type") or "send_message"),
-        )
+            tenant_id=str((actor_context or {}).get("tenant_id") or ""),
+            user_id=str((actor_context or {}).get("user_id") or ""),
+            workspace_id=str((actor_context or {}).get("workspace_id") or ""),
+            roles=list((actor_context or {}).get("roles") or []),
+        ),
+        actor_context=actor_context,
     )
 
 
@@ -3089,14 +3205,26 @@ def _record_success_metrics(result: dict) -> None:
     )
 
 
-def _ensure_conversation(session_id: str, conversation_id: str | None) -> tuple[dict, bool]:
+def _ensure_conversation(
+    session_id: str,
+    conversation_id: str | None,
+    actor_context: dict[str, Any] | None = None,
+) -> tuple[dict, bool]:
+    actor = ActorContext(**dict(actor_context or {})) if actor_context else ActorContext(session_id=session_id)
     if conversation_id:
         existing = get_conversation(conversation_id)
         if existing:
             if existing["session_id"] != session_id:
                 raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
+            if not actor.is_local_dev:
+                if str(existing.get("tenant_id") or "") != actor.tenant_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this tenant_id")
+                if str(existing.get("user_id") or "") != actor.user_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this user_id")
+                if str(existing.get("workspace_id") or "") != actor.workspace_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this workspace_id")
             return existing, False
-    created = create_conversation(session_id)
+    created = create_conversation(session_id, actor_context=actor.to_dict())
     record_conversation_created()
     return created, True
 
@@ -3143,6 +3271,12 @@ def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
         "final_answer_source": str(result.get("final_answer_source", "")),
         "memory_reads": result.get("memory_reads", []) or [],
         "tool_observations": result.get("tool_observations", []) or [],
+        "actor_context": result.get("actor_context", {}) or {},
+        "permission_decision": result.get("permission_decision", {}) or {},
+        "rate_limit_decision": result.get("rate_limit_decision", {}) or {},
+        "queue_status": result.get("queue_status", {}) or {},
+        "memory_boundary": "context_only",
+        "enterprise_citation_required": True,
         "latency_ms": float(result.get("node_latencies_ms", {}).get("total", 0.0)),
         "token_in": int(result.get("token_in", 0)),
         "token_out": int(result.get("token_out", 0)),
@@ -3151,7 +3285,11 @@ def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
     }
 
 
-def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tuple[str | None, bool]:
+def _write_unified_conversation_memory(
+    result: dict,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> tuple[str | None, bool]:
     answer = str(result.get("answer", "")).strip()
     if not answer:
         return None, False
@@ -3171,6 +3309,7 @@ def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tu
         tool_calls=result.get("tool_calls", []),
         citations=result.get("citations", []),
         debug_payload=debug_payload,
+        actor_context=actor_context or result.get("actor_context") or {},
     )
     record_conversation_turns()
 
@@ -3203,6 +3342,7 @@ def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tu
             intent=str(result.get("intent", "")),
             citations=result.get("citations", []),
             upload_context=result.get("upload_context", {}) or {},
+            actor_context=actor_context or result.get("actor_context") or {},
             dynamic_memory={
                 "user_goal": question,
                 "outcome": answer_summary,
@@ -3309,19 +3449,84 @@ def health() -> HealthResponse:
     )
 
 
+@app.get("/admin/queue-health")
+def admin_queue_health(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "queue_health")
+    queue_status = _refresh_queue_metrics()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "queue_status": queue_status,
+    }
+
+
+@app.get("/admin/policy-version")
+def admin_policy_version(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "policy.read", "privacy_policy")
+    policy = load_active_privacy_policy()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "policy": asdict(policy),
+    }
+
+
+@app.get("/admin/memory-candidates")
+def admin_memory_candidates(
+    request: Request,
+    session_id: str,
+    conversation_id: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
+    permission_decision = _ensure_permission(actor, "admin.read", "memory_candidates")
+    candidates = get_structured_turn_summaries(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        limit=max(1, min(limit, 100)),
+    )
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "candidates": candidates,
+    }
+
+
+@app.get("/admin/rag-manifest")
+def admin_rag_manifest(request: Request, limit: int = 20) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "rag_manifest")
+    manifest = load_manifest()
+    if isinstance(manifest.get("runs"), list):
+        manifest = {**manifest, "runs": list(manifest.get("runs") or [])[-max(1, min(limit, 100)) :]}
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "manifest": manifest,
+    }
+
+
 @app.get("/problems", response_model=list[ProblemSummary])
 def problems() -> list[ProblemSummary]:
     return list_problem_summaries()
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-def conversations(session_id: str) -> list[ConversationSummary]:
-    return [ConversationSummary(**item) for item in list_conversations(session_id)]
+def conversations(request: Request, session_id: str) -> list[ConversationSummary]:
+    actor = build_actor_context(request=request, session_id=session_id)
+    return [ConversationSummary(**item) for item in list_conversations(session_id, actor_context=actor.to_dict())]
 
 
 @app.post("/conversations", response_model=ConversationSummary)
-def create_conversation_api(payload: ConversationCreateRequest) -> ConversationSummary:
-    conversation = create_conversation(payload.session_id, payload.title)
+def create_conversation_api(payload: ConversationCreateRequest, request: Request) -> ConversationSummary:
+    actor = build_actor_context(request=request, payload=payload, session_id=payload.session_id)
+    conversation = create_conversation(payload.session_id, payload.title, actor_context=actor.to_dict())
     record_conversation_created()
     return ConversationSummary(**conversation)
 
@@ -3435,11 +3640,24 @@ def get_conversation_summary_api(conversation_id: str) -> dict:
 
 @app.get("/tasks", response_model=list[DlpTaskResponse])
 def list_dlp_tasks_api(
+    request: Request,
     session_id: str | None = None,
     status: str | None = None,
     risk_level: str | None = None,
 ) -> list[DlpTaskResponse]:
-    return [_task_response(item) for item in list_dlp_tasks(session_id=session_id, status=status, risk_level=risk_level)]
+    actor = build_actor_context(request=request, session_id=session_id or "")
+    _ensure_permission(actor, "task.read", "dlp_tasks")
+    return [
+        _task_response(item)
+        for item in list_dlp_tasks(
+            session_id=session_id,
+            status=status,
+            risk_level=risk_level,
+            tenant_id=None if actor.is_local_dev else actor.tenant_id,
+            user_id=None if actor.is_local_dev else actor.user_id,
+            workspace_id=None if actor.is_local_dev else actor.workspace_id,
+        )
+    ]
 
 
 @app.post("/mail/inbound/sync", response_model=InboundMailSyncResponse)
@@ -3484,30 +3702,76 @@ def outbound_mail_summary_api(
 
 
 @app.post("/enterprise-rag/query", response_model=EnterpriseRagQueryResponse)
-def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest) -> EnterpriseRagQueryResponse:
-    return EnterpriseRagQueryResponse(
-        **answer_enterprise_question(
-            payload.question,
-            source_types=payload.source_types,
-            top_k=payload.top_k,
-            session_id=payload.session_id,
-            conversation_id=payload.conversation_id,
-        )
+def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest, request: Request) -> EnterpriseRagQueryResponse:
+    actor = build_actor_context(
+        request=request,
+        payload=payload,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id,
     )
+    permission_decision = _ensure_permission(actor, "rag.query", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_query")
+    queue_status = _refresh_queue_metrics()
+    result = answer_enterprise_question(
+        payload.question,
+        source_types=payload.source_types,
+        top_k=payload.top_k,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id,
+        actor_context=actor.to_dict(),
+    )
+    result.update(
+        {
+            "actor_context": actor.to_dict(),
+            "permission_decision": permission_decision,
+            "rate_limit_decision": rate_limit_decision,
+            "queue_status": queue_status,
+            "task_mode": "sync",
+        }
+    )
+    return EnterpriseRagQueryResponse(**result)
 
 
 @app.post("/enterprise-rag/ingest", response_model=EnterpriseRagIngestResponse)
-def enterprise_rag_ingest_api(payload: EnterpriseRagIngestRequest) -> EnterpriseRagIngestResponse:
-    try:
+def enterprise_rag_ingest_api(payload: EnterpriseRagIngestRequest, request: Request) -> EnterpriseRagIngestResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    permission_decision = _ensure_permission(actor, "rag.ingest", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_ingest")
+    queue_status = _refresh_queue_metrics()
+    if payload.async_mode:
+        task_id = enqueue_enterprise_ingest({**payload.dict(), "actor_context": actor.to_dict()})
         return EnterpriseRagIngestResponse(
-            **ingest_enterprise_rag_bench(
-                mode=payload.mode,
-                documents_path=payload.documents_path,
-                questions_path=payload.questions_path,
-                limit=payload.limit,
-                reset=payload.reset,
-            )
+            dataset="enterprise_rag_bench",
+            mode=payload.mode,
+            documents_path=payload.documents_path or "",
+            questions_path=payload.questions_path or "",
+            reset=payload.reset,
+            actor_context=actor.to_dict(),
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode="async",
+            task_id=task_id,
         )
+    try:
+        result = ingest_enterprise_rag_bench(
+            mode=payload.mode,
+            documents_path=payload.documents_path,
+            questions_path=payload.questions_path,
+            limit=payload.limit,
+            reset=payload.reset,
+            actor_context=actor.to_dict(),
+        )
+        result.update(
+            {
+                "actor_context": actor.to_dict(),
+                "permission_decision": permission_decision,
+                "rate_limit_decision": rate_limit_decision,
+                "queue_status": queue_status,
+                "task_mode": "sync",
+            }
+        )
+        return EnterpriseRagIngestResponse(**result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3522,18 +3786,49 @@ def enterprise_rag_casebook_api(questions_path: str | None = None, limit: int = 
 
 @app.get("/enterprise-rag/benchmark", response_model=EnterpriseRagBenchmarkResponse)
 def enterprise_rag_benchmark_api(
+    request: Request,
     questions_path: str | None = None,
     limit: int = 20,
     top_k: int = 8,
+    async_mode: bool = False,
 ) -> EnterpriseRagBenchmarkResponse:
-    try:
-        return EnterpriseRagBenchmarkResponse(
-            **run_benchmark_sample(
-                questions_path=questions_path,
-                limit=max(1, min(limit, 100)),
-                top_k=max(1, min(top_k, 30)),
-            )
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "rag.benchmark", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_benchmark")
+    queue_status = _refresh_queue_metrics()
+    if async_mode:
+        task_id = enqueue_enterprise_benchmark(
+            {
+                "questions_path": questions_path,
+                "limit": max(1, min(limit, 100)),
+                "top_k": max(1, min(top_k, 30)),
+                "actor_context": actor.to_dict(),
+            }
         )
+        return EnterpriseRagBenchmarkResponse(
+            actor_context=actor.to_dict(),
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode="async",
+            task_id=task_id,
+        )
+    try:
+        result = run_benchmark_sample(
+            questions_path=questions_path,
+            limit=max(1, min(limit, 100)),
+            top_k=max(1, min(top_k, 30)),
+        )
+        result.update(
+            {
+                "actor_context": actor.to_dict(),
+                "permission_decision": permission_decision,
+                "rate_limit_decision": rate_limit_decision,
+                "queue_status": queue_status,
+                "task_mode": "sync",
+            }
+        )
+        return EnterpriseRagBenchmarkResponse(**result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3620,7 +3915,17 @@ def get_dlp_task_api(task_id: str) -> DlpTaskResponse:
 
 
 @app.post("/tasks/{task_id}/approve", response_model=DlpTaskResponse)
-def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTaskResponse:
+def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    _ensure_permission(actor, "task.approve", task_id)
+    existing_task = get_dlp_task(task_id)
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    if not actor.is_local_dev and (
+        str(existing_task.get("tenant_id") or "") != actor.tenant_id
+        or str(existing_task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     task = approve_task(task_id, payload.actor)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
@@ -3640,7 +3945,17 @@ def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTa
 
 
 @app.post("/tasks/{task_id}/reject", response_model=DlpTaskResponse)
-def reject_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTaskResponse:
+def reject_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    _ensure_permission(actor, "task.approve", task_id)
+    existing_task = get_dlp_task(task_id)
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    if not actor.is_local_dev and (
+        str(existing_task.get("tenant_id") or "") != actor.tenant_id
+        or str(existing_task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     task = reject_task(task_id, payload.actor, payload.reason)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
@@ -3720,7 +4035,10 @@ def get_sensitive_workflow_api(workflow_id: str) -> SensitiveWorkflowResponse:
 def approve_sensitive_workflow_api(
     workflow_id: str,
     payload: SensitiveWorkflowApprovalRequest,
+    request: Request,
 ) -> SensitiveWorkflowResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.approve", workflow_id)
     workflow = approve_sensitive_workflow(workflow_id, payload.actor)
     if not workflow:
         raise HTTPException(status_code=404, detail="Unknown workflow_id")
@@ -3733,7 +4051,10 @@ def approve_sensitive_workflow_api(
 def reject_sensitive_workflow_api(
     workflow_id: str,
     payload: SensitiveWorkflowApprovalRequest,
+    request: Request,
 ) -> SensitiveWorkflowResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.approve", workflow_id)
     workflow = reject_sensitive_workflow(workflow_id, payload.actor, payload.reason)
     if not workflow:
         raise HTTPException(status_code=404, detail="Unknown workflow_id")
@@ -3742,7 +4063,9 @@ def reject_sensitive_workflow_api(
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(force: bool = False) -> IngestResponse:
+def ingest(request: Request, force: bool = False) -> IngestResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "rag.ingest", "leetcode_corpus")
     written = ingest_if_needed(force=force)
     settings = get_settings()
     return IngestResponse(documents_written=written, collection_name=settings.chroma_collection)
@@ -3837,12 +4160,34 @@ def chat(payload: ChatRequest) -> ChatResponse:
 
 
 @app.post("/agent/chat", response_model=UnifiedAgentResponse)
-def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
+def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentResponse:
     if payload.problem_id:
         _validate_problem(payload.problem_id)
 
-    conversation, _ = _ensure_conversation(payload.session_id, payload.conversation_id)
+    actor = build_actor_context(
+        request=request,
+        payload=payload,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id or "",
+    )
+    permission_decision = _ensure_permission(actor, "agent.chat", "agent_chat")
+    rate_limit_decision = _ensure_rate_limit(actor, "agent_chat")
+    queue_status = _refresh_queue_metrics()
+
+    conversation, _ = _ensure_conversation(payload.session_id, payload.conversation_id, actor.to_dict())
     conversation_id = str(conversation["conversation_id"])
+    actor = replace(actor, conversation_id=conversation_id)
+    actor_context = actor.to_dict()
+
+    def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
+        return _attach_landing_context(
+            response,
+            actor=actor,
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode=task_mode,
+        )
 
     outbound_message = _build_outbound_message(payload.message, payload.uploaded_text, payload.uploaded_filename)
     display_message = _build_display_message(payload.message, payload.uploaded_filename, payload.source_parse_status)
@@ -3857,20 +4202,22 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
         pending_confirmation = _get_latest_pending_mail_confirmation(conversation_id)
         pending_mail_plan = dict(pending_confirmation.get("mail_plan") or {})
         if pending_mail_plan:
+            _ensure_permission(actor, "mail.send", "pending_mail_confirmation")
             task = _create_dlp_task_from_mail_plan(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 request_message=str(pending_mail_plan.get("request_message") or payload.message),
                 mail_plan=pending_mail_plan,
+                actor_context=actor_context,
             )
-            return _build_task_agent_response(
+            return finalize(_build_task_agent_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 outbound_message=str(pending_mail_plan.get("resolved_body") or payload.message),
                 display_message=display_message,
                 task=task,
                 routing_reason="Confirmed a pending mail plan and created a governed DLP task.",
-            )
+            ))
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
     if _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
         supplemented = _supplement_dlp_task(
@@ -3887,14 +4234,14 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                 source_parse_error=payload.source_parse_error,
             ),
         )
-        return _build_task_agent_response(
+        return finalize(_build_task_agent_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             outbound_message=outbound_message or str(supplemented.get("message_raw", "")),
             display_message=display_message,
             task=supplemented,
             routing_reason="Applied supplemental information to a governed DLP task.",
-        )
+        ))
     if looks_like_pending_draft_edit_request(payload.message):
         pending_mail_plan = _get_latest_pending_mail_draft(conversation_id)
         if pending_mail_plan:
@@ -3904,81 +4251,101 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                 mail_plan=pending_mail_plan,
             )
             if patched_mail_plan.get("needs_clarification"):
-                return _build_mail_clarification_response(
+                return finalize(_build_mail_clarification_response(
                     session_id=payload.session_id,
                     conversation_id=conversation_id,
                     message=payload.message,
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     candidates=[],
-                )
+                ))
             if patched_mail_plan.get("ok"):
-                return _build_mail_patch_response(
+                return finalize(_build_mail_patch_response(
                     session_id=payload.session_id,
                     conversation_id=conversation_id,
                     message=payload.message,
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
-                )
-        return _build_mail_clarification_response(
+                ))
+        return finalize(_build_mail_clarification_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             message=payload.message,
             display_message=display_message,
             mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
             candidates=[],
-        )
+        ))
     if looks_like_mail_action_request(payload.message) and not (
         _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
     ):
         mail_action_plan = _build_mail_action_plan(payload, conversation_id, dict(upload_context or {}))
         if mail_action_plan.get("needs_clarification"):
-            return _build_mail_clarification_response(
+            return finalize(_build_mail_clarification_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
                 candidates=list(mail_action_plan.get("candidates") or []),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "unsupported":
-            return _build_mail_unsupported_response(
+            return finalize(_build_mail_unsupported_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "draft_only":
-            return _build_mail_draft_response(
+            return finalize(_build_mail_draft_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "confirmation_required":
-            return _build_mail_confirmation_response(
+            return finalize(_build_mail_confirmation_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
     upload_decision = classify_upload_request(message=payload.message, upload_context=upload_context)
     if upload_decision.route == "outbound":
-        return _handle_async_outbound_agent_request(payload, conversation_id, outbound_message, display_message, upload_context)
+        _ensure_permission(actor, "mail.send", "outbound_mail")
+        return finalize(
+            _handle_async_outbound_agent_request(
+                payload,
+                conversation_id,
+                outbound_message,
+                display_message,
+                upload_context,
+                actor_context=actor_context,
+            )
+        )
     if (
         upload_decision.route in {"none", "analyze"}
         and not (_looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message))
         and (_looks_like_outbound_action(payload.message) or _looks_like_contextual_outbound_request(payload.message))
     ):
-        return _handle_async_outbound_agent_request(payload, conversation_id, outbound_message, display_message, upload_context)
+        _ensure_permission(actor, "mail.send", "outbound_mail")
+        return finalize(
+            _handle_async_outbound_agent_request(
+                payload,
+                conversation_id,
+                outbound_message,
+                display_message,
+                upload_context,
+                actor_context=actor_context,
+            )
+        )
 
-    compound_response = _handle_compound_agent_request(payload, conversation_id)
+    compound_response = _handle_compound_agent_request(payload, conversation_id, actor_context=actor_context)
     if compound_response is not None:
-        return compound_response
+        return finalize(compound_response)
 
     route_decision = route_agent_request(
         message=payload.message,
@@ -3987,13 +4354,14 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
     )
     if str(route_decision.get("route_mode") or "slow") == "fast":
         try:
-            return _execute_fast_path(
+            return finalize(_execute_fast_path(
                 payload=payload,
                 conversation_id=conversation_id,
                 display_message=display_message,
                 upload_context=upload_context,
                 route_decision=route_decision,
-            )
+                actor_context=actor_context,
+            ))
         except Exception:
             logger.exception("Fast path execution failed; degrading to slow path")
             route_decision = {**route_decision, "route_mode": "slow", "degraded_from": "router"}
@@ -4013,6 +4381,7 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
             recommended_tool=str(route_decision.get("recommended_tool") or ""),
             router_reason=str(route_decision.get("router_reason") or ""),
             degraded_from=str(route_decision.get("degraded_from") or "none"),
+            actor_context=actor_context,
         )
     except Exception:
         logger.exception("Orchestration request failed; falling back to unified agent")
@@ -4025,25 +4394,30 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                     "route_mode": "fast",
                     "degraded_from": "react_think",
                 }
-                return _execute_fast_path(
+                return finalize(_execute_fast_path(
                     payload=payload,
                     conversation_id=conversation_id,
                     display_message=display_message,
                     upload_context=upload_context,
                     route_decision=fallback_route_decision,
-                )
+                    actor_context=actor_context,
+                ))
             except Exception:
                 logger.exception("Safe fast fallback failed after orchestration failure")
-        return _build_rule_clarification_response(
+        return finalize(_build_rule_clarification_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             message=payload.message,
             display_message=display_message,
-            clarification_question="当前规划阶段失败了。为了避免直接返回错误，你可以把问题再聚焦一点，或让我先基于当前内容给出保守回答。",
+            clarification_question="The planning stage failed before a grounded answer could be produced. Please narrow the question and try again.",
             routing_reason="The orchestration path failed before a grounded answer could be safely produced.",
-        )
+        ))
 
-    turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id)
+    result["actor_context"] = actor_context
+    result["permission_decision"] = permission_decision
+    result["rate_limit_decision"] = rate_limit_decision
+    result["queue_status"] = queue_status
+    turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id, actor_context=actor_context)
     latency_ms = float(result["node_latencies_ms"]["total"])
     context_budget = result.get("context_budget", {}) or {}
     used_budget = context_budget.get("used") or context_budget.get("packed_tokens")
@@ -4133,6 +4507,11 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
         token_in=int(result.get("token_in", 0)),
         token_out=int(result.get("token_out", 0)),
         estimated_cost=float(result.get("estimated_cost", 0.0)),
+        actor_context=actor_context,
+        permission_decision=permission_decision,
+        rate_limit_decision=rate_limit_decision,
+        queue_status=queue_status,
+        task_mode="sync",
     )
 
 

@@ -71,6 +71,7 @@ class OrchestrationContext:
     safe_message: str
     display_message: str = ""
     upload_context: dict[str, Any] = field(default_factory=dict)
+    actor_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

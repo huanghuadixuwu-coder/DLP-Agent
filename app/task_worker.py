@@ -663,3 +663,30 @@ def sync_inbound_mail_task() -> dict[str, Any]:
 @celery_app.task(name="app.task_worker.generate_daily_mail_digest_task")
 def generate_daily_mail_digest_task() -> dict[str, Any]:
     return generate_daily_mail_digest()
+
+
+@celery_app.task(name="app.task_worker.enterprise_rag_ingest_task")
+def enterprise_rag_ingest_task(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.enterprise_rag.ingestion.indexer import ingest_enterprise_rag_bench
+
+    payload = dict(payload or {})
+    return ingest_enterprise_rag_bench(
+        mode=str(payload.get("mode") or "sample"),
+        documents_path=payload.get("documents_path"),
+        questions_path=payload.get("questions_path"),
+        limit=int(payload.get("limit") or 200),
+        reset=bool(payload.get("reset", False)),
+        actor_context=dict(payload.get("actor_context") or {}),
+    )
+
+
+@celery_app.task(name="app.task_worker.enterprise_rag_benchmark_task")
+def enterprise_rag_benchmark_task(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
+
+    payload = dict(payload or {})
+    return run_benchmark_sample(
+        questions_path=payload.get("questions_path"),
+        limit=max(1, min(int(payload.get("limit") or 20), 100)),
+        top_k=max(1, min(int(payload.get("top_k") or 8), 30)),
+    )

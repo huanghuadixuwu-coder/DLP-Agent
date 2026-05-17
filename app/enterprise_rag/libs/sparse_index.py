@@ -38,7 +38,9 @@ def init_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
                 business_domain TEXT NOT NULL DEFAULT '',
                 thread_id TEXT NOT NULL DEFAULT '',
                 timestamp TEXT NOT NULL DEFAULT '',
-                collection_version TEXT NOT NULL DEFAULT ''
+                collection_version TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT ''
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS enterprise_chunks_fts USING fts5(
@@ -53,8 +55,14 @@ def init_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_chunks_doc
                 ON enterprise_chunks(doc_id, source_type);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chunks_tenant_workspace
+                ON enterprise_chunks(tenant_id, workspace_id);
             """
         )
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(enterprise_chunks)").fetchall()}
+        for column_name in ("tenant_id", "workspace_id"):
+            if column_name not in columns:
+                conn.execute(f"ALTER TABLE enterprise_chunks ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''")
 
 
 def reset_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
@@ -68,6 +76,29 @@ def reset_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
     init_enterprise_sparse_index(db_path)
 
 
+def delete_enterprise_sparse_documents_by_doc_ids(
+    doc_ids: list[str] | tuple[str, ...] | set[str],
+    db_path: str | Path | None = None,
+) -> dict[str, int]:
+    normalized = sorted({str(doc_id).strip() for doc_id in doc_ids if str(doc_id or "").strip()})
+    if not normalized:
+        return {"documents_requested": 0, "chunks_deleted": 0}
+    init_enterprise_sparse_index(db_path)
+    with _connect(db_path) as conn:
+        placeholders = ",".join("?" for _ in normalized)
+        chunk_rows = conn.execute(
+            f"SELECT chunk_id FROM enterprise_chunks WHERE doc_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        chunk_ids = [str(row["chunk_id"]) for row in chunk_rows if row["chunk_id"]]
+        for chunk_id in chunk_ids:
+            conn.execute("DELETE FROM enterprise_chunks_fts WHERE chunk_id = ?", (chunk_id,))
+        conn.execute(f"DELETE FROM enterprise_chunks WHERE doc_id IN ({placeholders})", normalized)
+        # Defensive cleanup for legacy rows that might exist without a matching dense row.
+        conn.execute(f"DELETE FROM enterprise_chunks_fts WHERE doc_id IN ({placeholders})", normalized)
+    return {"documents_requested": len(normalized), "chunks_deleted": len(chunk_ids)}
+
+
 def upsert_enterprise_sparse_chunks(rows: list[dict[str, Any]], db_path: str | Path | None = None) -> int:
     if not rows:
         return 0
@@ -78,8 +109,9 @@ def upsert_enterprise_sparse_chunks(rows: list[dict[str, Any]], db_path: str | P
                 """
                 INSERT OR REPLACE INTO enterprise_chunks (
                     chunk_id, doc_id, source_type, title, content, chunk_index,
-                    chunk_strategy, business_domain, thread_id, timestamp, collection_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    chunk_strategy, business_domain, thread_id, timestamp, collection_version,
+                    tenant_id, workspace_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["chunk_id"],
@@ -93,6 +125,8 @@ def upsert_enterprise_sparse_chunks(rows: list[dict[str, Any]], db_path: str | P
                     row.get("thread_id", ""),
                     row.get("timestamp", ""),
                     row.get("collection_version", ""),
+                    row.get("tenant_id", ""),
+                    row.get("workspace_id", ""),
                 ),
             )
             conn.execute("DELETE FROM enterprise_chunks_fts WHERE chunk_id = ?", (row["chunk_id"],))
@@ -117,6 +151,8 @@ def search_enterprise_sparse(
     query: str,
     *,
     source_types: list[str] | None = None,
+    tenant_id: str = "",
+    workspace_id: str = "",
     limit: int = 20,
     db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
@@ -132,6 +168,12 @@ def search_enterprise_sparse(
             placeholders = ",".join("?" for _ in source_types)
             where_sql = f"AND c.source_type IN ({placeholders})"
             params.extend(source_types)
+        if tenant_id:
+            where_sql += " AND c.tenant_id = ?"
+            params.append(tenant_id)
+        if workspace_id:
+            where_sql += " AND c.workspace_id = ?"
+            params.append(workspace_id)
         params.append(limit)
         rows = conn.execute(
             f"""
@@ -147,6 +189,8 @@ def search_enterprise_sparse(
                 c.thread_id,
                 c.timestamp,
                 c.collection_version,
+                c.tenant_id,
+                c.workspace_id,
                 bm25(enterprise_chunks_fts, 1.0, 4.0, 1.0, 2.5, 0.8) AS bm25_score
             FROM enterprise_chunks_fts
             JOIN enterprise_chunks c ON c.chunk_id = enterprise_chunks_fts.chunk_id

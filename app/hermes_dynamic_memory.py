@@ -11,7 +11,7 @@ from typing import Any
 from app.config import DATA_DIR, get_settings
 from app.conversation_memory import compact_text
 from app.conversation_store import get_turns, update_conversation_summary
-from app.hermes_memory import search_workspace_memory
+from app.hermes_memory import search_workspace_memory_with_plan
 
 
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -69,6 +69,11 @@ def init_hermes_dynamic_memory_store() -> None:
                 conversation_id TEXT NOT NULL,
                 user_turn_id TEXT NOT NULL,
                 assistant_turn_id TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                intent TEXT NOT NULL DEFAULT '',
+                entities TEXT NOT NULL DEFAULT '[]',
+                files_uploaded TEXT NOT NULL DEFAULT '[]',
+                risk_level TEXT NOT NULL DEFAULT 'low',
                 user_goal TEXT NOT NULL DEFAULT '',
                 outcome TEXT NOT NULL DEFAULT '',
                 key_files TEXT NOT NULL DEFAULT '[]',
@@ -130,6 +135,24 @@ def init_hermes_dynamic_memory_store() -> None:
                 ON hermes_transcript_compactions(session_id, conversation_id, created_at);
             """
         )
+        _ensure_columns(
+            conn,
+            "hermes_turn_summaries",
+            {
+                "summary": "TEXT NOT NULL DEFAULT ''",
+                "intent": "TEXT NOT NULL DEFAULT ''",
+                "entities": "TEXT NOT NULL DEFAULT '[]'",
+                "files_uploaded": "TEXT NOT NULL DEFAULT '[]'",
+                "risk_level": "TEXT NOT NULL DEFAULT 'low'",
+            },
+        )
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def extract_memory_identifiers(text: str, upload_context: dict[str, Any] | None = None) -> dict[str, list[str]]:
@@ -160,7 +183,19 @@ def _json_dumps(value: Any) -> str:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
-    for key in ("key_files", "recipients", "task_ids", "provenance", "source_turn_ids", "durable_facts", "user_preferences", "process_improvements", "preserved_identifiers"):
+    for key in (
+        "key_files",
+        "recipients",
+        "task_ids",
+        "provenance",
+        "source_turn_ids",
+        "durable_facts",
+        "user_preferences",
+        "process_improvements",
+        "preserved_identifiers",
+        "entities",
+        "files_uploaded",
+    ):
         if key in item:
             try:
                 default = "{}" if key in {"provenance", "preserved_identifiers"} else "[]"
@@ -168,6 +203,59 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             except json.JSONDecodeError:
                 item[key] = {} if key in {"provenance", "preserved_identifiers"} else []
     return item
+
+
+def _infer_memory_intent(result: dict[str, Any], question: str, answer: str) -> str:
+    explicit = str(result.get("intent") or "").strip()
+    if explicit:
+        return explicit
+    text = f"{question}\n{answer}".lower()
+    if any(marker in text for marker in ("enterprise", "rag", "knowledge base", "企业知识库")):
+        return "enterprise_rag_query"
+    if any(marker in text for marker in ("email", "mail", "smtp", "发邮件", "外发")):
+        return "outbound_mail"
+    if any(marker in text for marker in ("dlp", "privacy", "sensitive", "敏感", "隐私", "合规")):
+        return "dlp_policy_query"
+    if any(marker in text for marker in ("remember", "preference", "默认", "记住", "偏好")):
+        return "memory_preference"
+    return "general_qa"
+
+
+def _extract_memory_entities(identifiers: dict[str, list[str]], text: str) -> list[str]:
+    entities: list[str] = []
+    for key, prefix in (("emails", "email"), ("files", "file"), ("task_ids", "task"), ("urls", "url")):
+        entities.extend(f"{prefix}:{value}" for value in identifiers.get(key, [])[:8])
+    for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})?\b", text or ""):
+        if token.lower() not in {"the", "and", "api", "url"}:
+            entities.append(f"name:{compact_text(token, 80)}")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for entity in entities:
+        if entity not in seen:
+            deduped.append(entity)
+            seen.add(entity)
+    return deduped[:20]
+
+
+def _build_structured_summary(question: str, answer: str, *, intent: str, risk_level: str) -> str:
+    question_part = compact_text(question, 220)
+    answer_part = compact_text(answer, 260)
+    pieces = [f"intent={intent}", f"risk={risk_level}"]
+    if question_part:
+        pieces.append(f"user asked: {question_part}")
+    if answer_part:
+        pieces.append(f"assistant answered: {answer_part}")
+    return compact_text("; ".join(pieces), 700)
+
+
+def _validate_turn_memory_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": compact_text(str(schema.get("summary") or ""), 900),
+        "intent": compact_text(str(schema.get("intent") or "general_qa"), 120),
+        "entities": [str(item) for item in list(schema.get("entities") or [])[:20] if str(item).strip()],
+        "files_uploaded": [str(item) for item in list(schema.get("files_uploaded") or [])[:12] if str(item).strip()],
+        "risk_level": str(schema.get("risk_level") or "low") if str(schema.get("risk_level") or "low") in {"low", "medium", "high", "critical"} else "low",
+    }
 
 
 def _extract_preference_candidates(question: str, answer: str) -> list[str]:
@@ -222,9 +310,23 @@ def write_dynamic_turn_memory(
     failure_reason = _summarize_failure(result)
     user_goal = compact_text(question, 360)
     outcome = compact_text(answer, 520)
+    risk_level = classify_memory_risk(combined_text)
+    intent = _infer_memory_intent(result, question, answer)
+    files_uploaded = identifiers["files"]
+    structured_memory = _validate_turn_memory_schema(
+        {
+            "summary": _build_structured_summary(question, answer, intent=intent, risk_level=risk_level),
+            "intent": intent,
+            "entities": _extract_memory_entities(identifiers, combined_text),
+            "files_uploaded": files_uploaded,
+            "risk_level": risk_level,
+        }
+    )
     memory_scope = "session"
     if any(term in question for term in ("记住", "以后", "默认", "约定", "规则")) or any(term in question.lower() for term in ("remember", "preference", "default")):
         memory_scope = "candidate_long_term"
+    if memory_scope == "candidate_long_term" and structured_memory["risk_level"] in {"medium", "high", "critical"}:
+        memory_scope = "pending_long_term"
 
     summary_id = _new_id("memsum")
     now = _now()
@@ -241,9 +343,10 @@ def write_dynamic_turn_memory(
             """
             INSERT INTO hermes_turn_summaries (
                 summary_id, session_id, conversation_id, user_turn_id, assistant_turn_id,
+                summary, intent, entities, files_uploaded, risk_level,
                 user_goal, outcome, key_files, recipients, task_ids, failure_reason,
                 memory_scope, provenance, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary_id,
@@ -251,6 +354,11 @@ def write_dynamic_turn_memory(
                 conversation_id,
                 user_turn_id,
                 assistant_turn_id,
+                structured_memory["summary"],
+                structured_memory["intent"],
+                _json_dumps(structured_memory["entities"]),
+                _json_dumps(structured_memory["files_uploaded"]),
+                structured_memory["risk_level"],
                 user_goal,
                 outcome,
                 _json_dumps(identifiers["files"]),
@@ -283,6 +391,11 @@ def write_dynamic_turn_memory(
     return {
         "summary_id": summary_id,
         "memory_scope": memory_scope,
+        "summary": structured_memory["summary"],
+        "intent": structured_memory["intent"],
+        "entities": structured_memory["entities"],
+        "files_uploaded": structured_memory["files_uploaded"],
+        "risk_level": structured_memory["risk_level"],
         "identifiers": identifiers,
         "preference_records": preference_records,
         "reflection_candidate": reflection,
@@ -592,8 +705,12 @@ def get_user_memory_context(*, session_id: str, conversation_id: str = "", limit
     }
 
 
-def get_workspace_memory_context(question: str, *, top_k: int = 6) -> dict[str, Any]:
-    hits = search_workspace_memory(question, top_k=top_k)
+def get_workspace_memory_context(question: str, *, top_k: int = 6, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    filters = {}
+    if actor_context:
+        filters["actor_context"] = dict(actor_context)
+    result = search_workspace_memory_with_plan(question, top_k=top_k, filters=filters)
+    hits = list(result.get("hits") or [])
     summary = "\n".join(
         f"- {item.get('file_path', '')} :: {item.get('title', '')}: {item.get('snippet', '')}"
         for item in hits
@@ -602,5 +719,11 @@ def get_workspace_memory_context(question: str, *, top_k: int = 6) -> dict[str, 
         "summary": compact_text(summary, 900),
         "hits": len(hits),
         "items": hits,
-        "provenance": {"source": "workspace_memory", "top_k": top_k},
+        "provenance": {
+            "source": "workspace_memory",
+            "top_k": top_k,
+            "retrieval_plan": result.get("retrieval_plan") or {},
+            "diagnostics": result.get("diagnostics") or {},
+            "actor_context": dict(actor_context or {}),
+        },
     }

@@ -57,11 +57,15 @@ class RetrievalPlan:
     query: str
     source_types: list[str] = field(default_factory=list)
     question_type: str = "basic"
+    budget_profile: str = "medium"
     dense_top_k: int = 40
     sparse_top_k: int = 20
     rerank_top_k: int = 8
     evidence_top_k: int = 5
     require_evidence: bool = True
+    expansion_enabled: bool = True
+    tenant_id: str = ""
+    workspace_id: str = ""
 
 
 @dataclass(slots=True)

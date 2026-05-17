@@ -31,6 +31,7 @@ def orchestrate_agent_request(
     recommended_tool: str = "",
     router_reason: str = "",
     degraded_from: str = "none",
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         return run_react_agent_request(
@@ -45,6 +46,7 @@ def orchestrate_agent_request(
             recommended_tool=recommended_tool,
             router_reason=router_reason,
             degraded_from=degraded_from,
+            actor_context=actor_context,
         )
     except Exception:
         logger.exception("ReAct controller failed; evaluating legacy fallback")
@@ -58,6 +60,7 @@ def orchestrate_agent_request(
             safe_message=safe_message,
             display_message=display_message,
             upload_context=upload_context,
+            actor_context=actor_context,
         )
 
 
@@ -69,6 +72,7 @@ def _legacy_orchestrate_agent_request(
     safe_message: str,
     display_message: str = "",
     upload_context: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     plan = plan_message(message, upload_context or {})
@@ -79,6 +83,7 @@ def _legacy_orchestrate_agent_request(
         safe_message=safe_message,
         display_message=display_message or message,
         upload_context=dict(upload_context or {}),
+        actor_context=dict(actor_context or {}),
     )
     results = execute_task_plan(plan, context)
     aggregated = aggregate_results(plan, results)
@@ -123,6 +128,7 @@ def _legacy_orchestrate_agent_request(
         "user_model_used": bool(aggregated.get("user_model_used", False)),
         "reflection_notes": None,
         "upload_context": aggregated.get("upload_context") or dict(upload_context or {}),
+        "actor_context": dict(actor_context or {}),
         "route_mode": "slow",
         "router_intent": "",
         "router_reason": "",

@@ -6,7 +6,10 @@ from typing import Any
 from langchain_core.documents import Document
 
 from app.enterprise_rag.core.evidence_pack import build_evidence_pack
+from app.enterprise_rag.core.query_planner import expand_retrieval_plan
+from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID
 from app.enterprise_rag.core.types import ENTERPRISE_DOMAIN, EnterpriseCitation, EvidencePack, RetrievalPlan
+from app.metrics import record_retrieval_expansion
 from app.enterprise_rag.libs.metadata import normalize_source_type
 from app.enterprise_rag.libs.reranker import rerank_pairs
 from app.enterprise_rag.libs.scoring import build_rerank_debug_rows, heuristic_candidate_score
@@ -15,19 +18,49 @@ from app.enterprise_rag.libs.text_cleaning import query_focused_snippet
 from app.vectorstore import get_enterprise_collection, get_enterprise_vectorstore
 
 
-def _build_filter(source_types: list[str]) -> dict[str, Any]:
-    source_types = [normalize_source_type(item) for item in source_types if item]
-    if not source_types:
-        return {"domain": {"$eq": ENTERPRISE_DOMAIN}}
-    return {
-        "$and": [
-            {"domain": {"$eq": ENTERPRISE_DOMAIN}},
-            {"source_type": {"$in": source_types}},
-        ]
-    }
+def _build_filter(plan: RetrievalPlan) -> dict[str, Any]:
+    source_types = [normalize_source_type(item) for item in plan.source_types if item]
+    clauses: list[dict[str, Any]] = [{"domain": {"$eq": ENTERPRISE_DOMAIN}}]
+    if source_types:
+        clauses.append({"source_type": {"$in": source_types}})
+    if plan.tenant_id and plan.tenant_id != DEFAULT_TENANT_ID:
+        clauses.append({"tenant_id": {"$eq": plan.tenant_id}})
+    if plan.workspace_id and plan.workspace_id != DEFAULT_WORKSPACE_ID:
+        clauses.append({"workspace_id": {"$eq": plan.workspace_id}})
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
+    evidence = _retrieve_evidence_once(plan, expansion_triggered=False, expansion_reason="none", first_pass_counts={})
+    should_expand, expansion_reason = _should_expand_retrieval(plan, evidence)
+    if not should_expand:
+        return evidence
+    first_pass_counts = {
+        "dense_hits": int(evidence.retrieval_stage_debug.get("dense_hits", 0)),
+        "sparse_hits": int(evidence.retrieval_stage_debug.get("sparse_hits", 0)),
+        "merged_hits": int(evidence.retrieval_stage_debug.get("merged_hits", 0)),
+        "rerank_hits": int(evidence.retrieval_stage_debug.get("rerank_hits", 0)),
+        "citations": len(evidence.citations),
+    }
+    expanded = _retrieve_evidence_once(
+        expand_retrieval_plan(plan),
+        expansion_triggered=True,
+        expansion_reason=expansion_reason,
+        first_pass_counts=first_pass_counts,
+    )
+    record_retrieval_expansion("enterprise_rag", expansion_reason)
+    return expanded
+
+
+def _retrieve_evidence_once(
+    plan: RetrievalPlan,
+    *,
+    expansion_triggered: bool,
+    expansion_reason: str,
+    first_pass_counts: dict[str, int],
+) -> EvidencePack:
     if not _has_enterprise_documents():
         return build_evidence_pack(
             plan.query,
@@ -38,6 +71,12 @@ def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
                 "merged_hits": 0,
                 "rerank_hits": 0,
                 "rerank_backend": "none",
+                "no_enterprise_documents": True,
+                "budget_profile": plan.budget_profile,
+                "expansion_triggered": expansion_triggered,
+                "expansion_reason": expansion_reason,
+                "first_pass_counts": first_pass_counts,
+                "second_pass_counts": {},
             },
         )
 
@@ -67,6 +106,8 @@ def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
                 "turn_end": str(doc.metadata.get("turn_end") or ""),
                 "section_path": str(doc.metadata.get("section_path") or ""),
                 "message_id": str(doc.metadata.get("message_id") or ""),
+                "tenant_id": str(doc.metadata.get("tenant_id") or ""),
+                "workspace_id": str(doc.metadata.get("workspace_id") or ""),
                 "bm25_score": float(doc.metadata.get("bm25_score") or 0.0),
                 "full_content": doc.page_content,
             },
@@ -88,13 +129,56 @@ def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
             "merged_hits": len(merged_docs),
             "rerank_hits": len(reranked_docs),
             "question_type": plan.question_type,
+            "budget_profile": plan.budget_profile,
             "source_types": list(plan.source_types),
+            "tenant_id": plan.tenant_id,
+            "workspace_id": plan.workspace_id,
             "dense_candidate_doc_ids": len({str(doc.metadata.get("doc_id") or "") for doc in dense_docs}),
             "sparse_candidate_doc_ids": len({str(doc.metadata.get("doc_id") or "") for doc in sparse_docs}),
+            "expansion_triggered": expansion_triggered,
+            "expansion_reason": expansion_reason,
+            "first_pass_counts": first_pass_counts,
+            "second_pass_counts": {
+                "dense_hits": len(dense_docs),
+                "sparse_hits": len(sparse_docs),
+                "merged_hits": len(merged_docs),
+                "rerank_hits": len(reranked_docs),
+                "citations": len(citations),
+            }
+            if expansion_triggered
+            else {},
             **rerank_meta,
         },
         rerank_debug=rerank_debug[: plan.rerank_top_k],
     )
+
+
+def _should_expand_retrieval(plan: RetrievalPlan, evidence: EvidencePack) -> tuple[bool, str]:
+    if not plan.expansion_enabled or plan.budget_profile == "expanded":
+        return False, "none"
+    debug = evidence.retrieval_stage_debug
+    if bool(debug.get("no_enterprise_documents")):
+        return False, "none"
+    dense_hits = int(debug.get("dense_hits", 0))
+    sparse_hits = int(debug.get("sparse_hits", 0))
+    merged_hits = int(debug.get("merged_hits", 0))
+    rerank_hits = int(debug.get("rerank_hits", 0))
+    if dense_hits == 0 and sparse_hits == 0:
+        return True, "both_dense_and_sparse_empty"
+    single_side_evidence_low = merged_hits < plan.rerank_top_k or len(evidence.citations) < min(3, plan.evidence_top_k)
+    if dense_hits == 0 and plan.question_type in {"semantic", "constrained", "conflicting"} and single_side_evidence_low:
+        return True, "dense_empty_for_high_recall_question"
+    if sparse_hits == 0 and plan.question_type in {"constrained", "conflicting"} and single_side_evidence_low:
+        return True, "sparse_empty_for_constrained_question"
+    if merged_hits < max(8, plan.rerank_top_k):
+        return True, "merged_candidates_below_rerank_budget"
+    if rerank_hits < min(plan.rerank_top_k, 6):
+        return True, "rerank_hits_too_low"
+    if len(evidence.citations) < min(3, plan.evidence_top_k):
+        return True, "selected_evidence_too_low"
+    if evidence.missing_evidence and evidence.confidence < 0.35:
+        return True, "answerability_confidence_low"
+    return False, "none"
 
 
 def _dense_recall(plan: RetrievalPlan) -> list[Document]:
@@ -103,7 +187,7 @@ def _dense_recall(plan: RetrievalPlan) -> list[Document]:
         return vectorstore.similarity_search(
             plan.query,
             k=plan.dense_top_k,
-            filter=_build_filter(plan.source_types),
+            filter=_build_filter(plan),
         )
     except Exception:
         return []
@@ -111,7 +195,13 @@ def _dense_recall(plan: RetrievalPlan) -> list[Document]:
 
 def _sparse_recall(plan: RetrievalPlan) -> list[Document]:
     try:
-        rows = search_enterprise_sparse(plan.query, source_types=plan.source_types, limit=plan.sparse_top_k)
+        rows = search_enterprise_sparse(
+            plan.query,
+            source_types=plan.source_types,
+            tenant_id="" if plan.tenant_id == DEFAULT_TENANT_ID else plan.tenant_id,
+            workspace_id="" if plan.workspace_id == DEFAULT_WORKSPACE_ID else plan.workspace_id,
+            limit=plan.sparse_top_k,
+        )
     except Exception:
         return []
     return [
@@ -127,6 +217,8 @@ def _sparse_recall(plan: RetrievalPlan) -> list[Document]:
                 "thread_id": str(row.get("thread_id") or ""),
                 "timestamp": str(row.get("timestamp") or ""),
                 "collection_version": str(row.get("collection_version") or ""),
+                "tenant_id": str(row.get("tenant_id") or ""),
+                "workspace_id": str(row.get("workspace_id") or ""),
                 "bm25_score": float(row.get("bm25_score") or 0.0),
             },
         )

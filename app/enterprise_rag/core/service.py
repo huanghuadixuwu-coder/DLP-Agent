@@ -15,10 +15,14 @@ def answer_enterprise_question(
     top_k: int = 8,
     session_id: str = "",
     conversation_id: str = "",
+    actor_context: dict | None = None,
 ) -> dict:
     plan = build_retrieval_plan(question, source_types=source_types, top_k=top_k)
+    if actor_context:
+        plan.tenant_id = str(actor_context.get("tenant_id") or "")
+        plan.workspace_id = str(actor_context.get("workspace_id") or "")
     context_bundle = (
-        build_runtime_context_bundle(session_id=session_id, conversation_id=conversation_id, question=question)
+        build_runtime_context_bundle(session_id=session_id, conversation_id=conversation_id, question=question, actor_context=actor_context)
         if session_id and conversation_id
         else {
             "context_text": "",
@@ -30,6 +34,7 @@ def answer_enterprise_question(
             "workspace_memory": [],
             "transcript_entries": [],
             "legacy_memory": {},
+            "actor_context": dict(actor_context or {}),
         }
     )
     evidence = retrieve_evidence(plan)
@@ -62,4 +67,5 @@ def answer_enterprise_question(
         "user_model_used": answer.user_model_used,
         "memory_context": context_bundle,
         "retrieval_plan": asdict(plan),
+        "actor_context": dict(actor_context or {}),
     }
