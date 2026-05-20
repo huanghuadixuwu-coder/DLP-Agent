@@ -72,8 +72,16 @@ def upsert_enterprise_documents_hybrid(
     dense_delete = {"documents_requested": 0, "chunks_deleted": 0}
     sparse_delete = {"documents_requested": 0, "chunks_deleted": 0}
     if replace_existing and doc_ids:
-        dense_delete = delete_enterprise_documents_by_doc_ids(doc_ids)
-        sparse_delete = delete_enterprise_sparse_documents_by_doc_ids(doc_ids)
+        dense_delete = delete_enterprise_documents_by_doc_ids(
+            doc_ids,
+            tenant_id=actor.tenant_id,
+            workspace_id=actor.workspace_id,
+        )
+        sparse_delete = delete_enterprise_sparse_documents_by_doc_ids(
+            doc_ids,
+            tenant_id=actor.tenant_id,
+            workspace_id=actor.workspace_id,
+        )
 
     chunks = []
     for document in documents:

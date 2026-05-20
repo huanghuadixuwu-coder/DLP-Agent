@@ -19,7 +19,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from redis import Redis
 
-from app.actor_context import ActorContext, build_actor_context, permission_observation, require_permission
+from app.actor_context import ActorContext, build_actor_context as _fallback_build_actor_context, permission_observation, require_permission
+from app.auth_identity import (
+    build_actor_from_auth_session,
+    get_authenticated_session,
+    init_auth_store,
+    request_exmail_login_code,
+    revoke_auth_session,
+    verify_exmail_login_code,
+)
 from app.backpressure import check_rate_limit
 from app.config import get_settings
 from app.conversation_memory import build_memory_context, compact_text, infer_title, write_merged_summary, write_turn_summary
@@ -51,6 +59,7 @@ from app.hermes_dynamic_memory import (
     get_user_memory_context,
     get_workspace_memory_context,
     init_hermes_dynamic_memory_store,
+    list_memory_review_audit,
     list_memory_review_candidates,
     review_reflection_candidate,
     review_user_memory_fact,
@@ -129,6 +138,10 @@ from app.models import (
     EnterpriseRagQueryRequest,
     EnterpriseRagQueryResponse,
     ExecuteRequest,
+    ExmailLoginCodeRequest,
+    ExmailLoginCodeResponse,
+    ExmailLoginVerifyRequest,
+    ExmailLoginVerifyResponse,
     FrameworkCompareRequest,
     FrameworkCompareResponse,
     HealthResponse,
@@ -219,6 +232,47 @@ def _permission_denied(actor: ActorContext, action: str, resource: str = "") -> 
     return HTTPException(status_code=403, detail=permission_observation(actor, decision))
 
 
+def _auth_error_detail(reason: str) -> dict[str, Any]:
+    return {
+        "observation_type": "auth_required",
+        "ok": False,
+        "reason": reason,
+    }
+
+
+def _extract_auth_session_token(request: Request | None) -> str:
+    if request is None:
+        return ""
+    header_name = str(get_settings().auth_session_header_name or "X-Auth-Session")
+    return str(
+        request.headers.get(header_name)
+        or request.headers.get(header_name.lower())
+        or request.cookies.get("auth_session_token")
+        or ""
+    ).strip()
+
+
+def build_actor_context(
+    *,
+    request: Request | None = None,
+    payload: Any | None = None,
+    session_id: str = "",
+    conversation_id: str = "",
+) -> ActorContext:
+    token = _extract_auth_session_token(request)
+    if token:
+        actor = build_actor_from_auth_session(token, session_id=session_id, conversation_id=conversation_id)
+        if not actor:
+            raise HTTPException(status_code=401, detail=_auth_error_detail("invalid_or_expired_auth_session"))
+        return actor
+    return _fallback_build_actor_context(
+        request=request,
+        payload=payload,
+        session_id=session_id,
+        conversation_id=conversation_id,
+    )
+
+
 def _ensure_permission(actor: ActorContext, action: str, resource: str = "") -> dict[str, Any]:
     decision = require_permission(actor, action, resource)
     if not decision.allowed:
@@ -270,6 +324,7 @@ def _refresh_queue_metrics() -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_observability()
+    init_auth_store()
     init_conversation_store()
     init_workflow_store()
     init_task_store()
@@ -666,29 +721,29 @@ def _build_outbound_resolution(
 def _task_answer_text(task: dict[str, Any]) -> str:
     status = str(task.get("status", ""))
     task_id = str(task.get("task_id", ""))
+    machine_parts = [
+        f"task_id={task_id}",
+        f"status={status}",
+        f"risk_level={task.get('risk_level', '')}",
+        f"delivery_status={task.get('delivery_status', '')}",
+        f"approval_required={task.get('approval_required', False)}",
+    ]
+    missing_fields = [str(item) for item in (task.get("missing_fields") or []) if str(item).strip()]
+    if missing_fields:
+        machine_parts.append("missing_fields=" + ",".join(missing_fields))
+    if str(task.get("entry_issue_type") or "").strip():
+        machine_parts.append(f"entry_issue_type={task.get('entry_issue_type')}")
+    if str(task.get("attachment_strategy", "")) == "attach_original_upload":
+        machine_parts.append(f"attachment_filename={task.get('attachment_filename') or ''}")
     if status in {"needs_clarification", "input_invalid"}:
-        return str(task.get("clarification_question") or "我已保留你的外发请求，但还需要补充信息后才能继续处理。")
-    if status == "queued":
-        attachment_note = ""
-        if str(task.get("attachment_strategy", "")) == "attach_original_upload":
-            attachment_name = str(task.get("attachment_filename") or "原始内容")
-            attachment_note = f" 邮件正文会按你的要求生成，原始上传内容会作为附件（{attachment_name}）一起发送。"
-        return (
-            f"已创建 DLP 外发任务 `{task_id}`，系统正在异步执行风险判断。"
-            " 你可以在左侧任务台查看状态；如果命中敏感信息，任务会自动转入待审批。"
-            f"{attachment_note}"
-        )
-    if status == "pending_approval":
-        return f"检测到敏感外发风险，任务 `{task_id}` 已挂起，等待审批通过后再继续发送。"
-    if status == "delivery_deferred":
-        return f"任务 `{task_id}` 的邮件发送遇到临时问题，系统已延后重试。请在任务台查看错误与建议动作。"
-    if status == "send_failed":
-        return f"任务 `{task_id}` 的邮件发送失败。请在任务台查看错误详情与下一步建议。"
+        machine_parts.append("requires_user_input=true")
+        if str(task.get("clarification_question") or "").strip():
+            machine_parts.append("clarification_hint=" + compact_text(str(task.get("clarification_question")), 160))
     if status == "sent":
-        return str(task.get("final_result") or task.get("delivery_result") or "外发已完成。")
-    return str(task.get("final_result") or f"任务 `{task_id}` 已创建。")
-
-    return str(task.get("final_result") or f"任务 `{task_id}` 已创建。")
+        machine_parts.append("delivery_result=" + compact_text(str(task.get("final_result") or task.get("delivery_result") or ""), 160))
+    if status in {"send_failed", "delivery_deferred"}:
+        machine_parts.append("delivery_error=" + compact_text(str(task.get("delivery_error") or ""), 160))
+    return "; ".join(part for part in machine_parts if part)
 
 
 def _mail_provider_capabilities() -> dict[str, bool]:
@@ -714,7 +769,11 @@ def _build_task_status_observation(task: dict[str, Any]) -> dict[str, Any]:
         "delivery_result": str(task.get("delivery_result") or ""),
         "delivery_error": str(task.get("delivery_error") or ""),
         "clarification_question": str(task.get("clarification_question") or ""),
-        "next_step": compact_text(answer_hint, 240),
+        "state_summary": compact_text(answer_hint, 240),
+        "missing_fields": list(task.get("missing_fields") or []),
+        "entry_issue_type": str(task.get("entry_issue_type") or ""),
+        "approval_required": bool(task.get("approval_required", False)),
+        "risk_reasons": list(task.get("risk_reasons") or []),
         "delivery_preview": {
             "subject": str(task.get("delivery_subject") or ""),
             "body": str(task.get("delivery_body") or ""),
@@ -845,15 +904,14 @@ def _build_task_agent_response(
     answer_text = _task_answer_text(task)
     needs_clarification = status in {"needs_clarification", "input_invalid"}
     task_observation = _build_task_status_observation(task)
-    renderer = {"answer": answer_text, "token_in": 0, "token_out": 0, "estimated_cost": 0.0, "used_fallback": False}
-    if not needs_clarification:
-        renderer = render_final_answer(
-            question=outbound_message,
-            current_goal="privacy_alert",
-            observations=[task_observation],
-            working_memory=[str(task_observation["summary"])],
-            conservative=status not in {"sent", "delivery_deferred"},
-        )
+    renderer = render_final_answer(
+        question=outbound_message,
+        current_goal="privacy_alert",
+        observations=[task_observation],
+        working_memory=[str(task_observation["summary"])],
+        conservative=status not in {"sent", "delivery_deferred"},
+    )
+    rendered_answer = str(renderer.get("answer") or answer_text)
     synthetic_result = {
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -861,7 +919,7 @@ def _build_task_agent_response(
         "message": outbound_message,
         "safe_message": str(task.get("message_redacted") or outbound_message),
         "display_message": display_message,
-        "answer": str(renderer.get("answer") or answer_text),
+        "answer": rendered_answer,
         "intent": "privacy_alert",
         "routing_source": "rule",
         "routing_confidence": 0.99,
@@ -878,7 +936,7 @@ def _build_task_agent_response(
         ],
         "retrieved_evidence": list(task.get("retrieved_evidence", [])),
         "needs_clarification": needs_clarification,
-        "clarification_question": task.get("clarification_question") or None,
+        "clarification_question": rendered_answer if needs_clarification else None,
         "privacy": {
             "redacted": bool(task.get("redactions")),
             "risk_level": str(task.get("risk_level", "")),
@@ -938,7 +996,15 @@ def _build_task_agent_response(
         answer_collapsed=False,
         reflection_notes=None,
         upload_context={},
-        final_answer_source="task_queue_clarification" if needs_clarification else ("task_queue_renderer_fallback" if renderer.get("used_fallback") else "task_queue_renderer"),
+        final_answer_source=(
+            "task_queue_clarification_renderer_fallback"
+            if needs_clarification and renderer.get("used_fallback")
+            else "task_queue_clarification_renderer"
+            if needs_clarification
+            else "task_queue_renderer_fallback"
+            if renderer.get("used_fallback")
+            else "task_queue_renderer"
+        ),
         tool_observations=[task_observation],
         workflow_id=None,
         workflow_status=None,
@@ -1314,6 +1380,7 @@ def _build_mail_clarification_response(
         answer_collapsed=False,
         reflection_notes=None,
         task_plan=synthetic_result["task_plan"],
+        final_answer_source="mail_clarification_renderer_fallback" if render_result.get("used_fallback") else "mail_clarification_renderer",
         workflow_id=None,
         workflow_status=None,
         workflow_risk_level=None,
@@ -1799,7 +1866,7 @@ def _build_fast_path_response(
 ) -> UnifiedAgentResponse:
     observations = list(result.get("observations") or result.get("tool_observations") or [])
     renderer = {"answer": str(result.get("answer") or ""), "token_in": 0, "token_out": 0, "estimated_cost": 0.0, "used_fallback": False}
-    if not bool(result.get("needs_clarification", False)) and not bool(result.get("skip_renderer", False)):
+    if not bool(result.get("skip_renderer", False)):
         renderer = render_final_answer(
             question=message,
             current_goal=str(result.get("intent") or route_decision.get("intent") or "fast_path"),
@@ -1824,7 +1891,7 @@ def _build_fast_path_response(
         "tool_calls": list(result.get("tool_calls") or []),
         "retrieved_evidence": list(result.get("retrieved_evidence") or []),
         "needs_clarification": bool(result.get("needs_clarification", False)),
-        "clarification_question": result.get("clarification_question"),
+        "clarification_question": str(renderer.get("answer") or result.get("clarification_question") or "") if bool(result.get("needs_clarification", False)) else result.get("clarification_question"),
         "privacy": dict(result.get("privacy") or {}),
         "context_budget": {},
         "citations": list(result.get("citations") or []),
@@ -1962,7 +2029,14 @@ def _fast_memory_scope(message: str, route_decision: dict[str, Any]) -> str:
     return "conversation_recent"
 
 
-def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, message: str, route_decision: dict[str, Any]) -> dict[str, Any]:
+def _fast_contextual_memory_result(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    route_decision: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     scope = _fast_memory_scope(message, route_decision)
     memory_reads: list[dict[str, Any]] = []
     memory_context: dict[str, Any] = {}
@@ -1976,7 +2050,7 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
     context_sources: list[str] = []
 
     if scope == "user_model":
-        user_memory = get_user_memory_context(session_id=session_id, conversation_id=conversation_id, limit=8)
+        user_memory = get_user_memory_context(session_id=session_id, conversation_id=conversation_id, limit=8, actor_context=actor_context)
         summary_text = str(user_memory.get("summary") or "")
         facts = [str(item).strip() for item in user_memory.get("facts") or [] if str(item).strip()]
         memory_reads.append({"kind": "user_model", "hits": int(user_memory.get("hits", 0)), "summary": summary_text})
@@ -1997,7 +2071,7 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
         if observation["summary"]:
             working_memory.append(str(observation["summary"]))
     elif scope == "workspace_memory":
-        workspace = get_workspace_memory_context(message, top_k=6)
+        workspace = get_workspace_memory_context(message, top_k=6, actor_context=actor_context)
         items = list(workspace.get("items") or [])
         summary_text = str(workspace.get("summary") or "")
         memory_reads.append({"kind": "workspace_memory", "hits": int(workspace.get("hits", 0)), "summary": summary_text})
@@ -2042,9 +2116,9 @@ def _fast_contextual_memory_result(*, session_id: str, conversation_id: str, mes
         if recent_observation["summary"]:
             working_memory.append(str(recent_observation["summary"]))
         if scope == "conversation_summary":
-            summary_memory = build_memory_context(session_id=session_id, conversation_id=conversation_id, question=message)
-            compactions = get_recent_compactions(session_id=session_id, conversation_id=conversation_id, limit=3)
-            structured = get_structured_turn_summaries(session_id=session_id, conversation_id=conversation_id, limit=6)
+            summary_memory = build_memory_context(session_id=session_id, conversation_id=conversation_id, question=message, actor_context=actor_context)
+            compactions = get_recent_compactions(session_id=session_id, conversation_id=conversation_id, limit=3, actor_context=actor_context)
+            structured = get_structured_turn_summaries(session_id=session_id, conversation_id=conversation_id, limit=6, actor_context=actor_context)
             summary_text = str(summary_memory.get("memory_context") or "")
             memory_context["conversation_summary"] = summary_memory
             memory_context["compactions"] = compactions
@@ -2139,7 +2213,7 @@ def _execute_fast_path(
             "observation_type": "upload_analysis_result",
             "source": "uploaded_content_analyze",
             "grounding_kind": "none",
-            "summary": compact_text(str(payload_dict.get("answer") or ""), 220),
+            "summary": compact_text(str(payload_dict.get("observation_summary") or payload_dict.get("answer") or ""), 220),
             "payload": payload_dict,
             "citations": [],
             "confidence": 0.9,
@@ -2170,7 +2244,7 @@ def _execute_fast_path(
             "observation_type": "persona_result",
             "source": "persona_or_chitchat",
             "grounding_kind": "none",
-            "summary": compact_text(str(payload_dict.get("answer") or ""), 220),
+            "summary": compact_text(str(payload_dict.get("observation_summary") or payload_dict.get("answer") or ""), 220),
             "payload": payload_dict,
             "citations": [],
             "confidence": 0.86,
@@ -2341,6 +2415,7 @@ def _execute_fast_path(
             conversation_id=conversation_id,
             message=payload.message,
             route_decision=route_decision,
+            actor_context=actor_context,
         )
         return _build_fast_path_response(
             session_id=payload.session_id,
@@ -3044,6 +3119,7 @@ def _create_dlp_task_from_mail_plan(
 def _build_scenario_task_payload(
     scenario: dict,
     payload: DlpScenarioReplayRequest,
+    actor_context: dict[str, Any] | None = None,
 ) -> DlpTaskCreateRequest:
     chosen_faults = normalize_fault_injection(payload.fault_injection or scenario.get("fault_injection"))
     destination_email = payload.destination_email or str(scenario.get("destination_email") or DEFAULT_DLP_EMAIL)
@@ -3061,6 +3137,10 @@ def _build_scenario_task_payload(
         scenario_name=str(scenario.get("name", "")),
         fault_injection=chosen_faults,
         expected_outcome=dict(scenario.get("expected_outcome") or {}),
+        tenant_id=str((actor_context or {}).get("tenant_id") or ""),
+        user_id=str((actor_context or {}).get("user_id") or ""),
+        workspace_id=str((actor_context or {}).get("workspace_id") or ""),
+        roles=list((actor_context or {}).get("roles") or []),
     )
 
 
@@ -3343,6 +3423,7 @@ def _write_unified_conversation_memory(
             assistant_turn_id=str(assistant_turn["turn_id"]),
             question=question,
             answer=answer,
+            actor_context=actor_context or result.get("actor_context") or {},
         )
     except Exception as exc:  # pragma: no cover - best effort dynamic memory write
         logger.warning("Hermes dynamic memory write skipped: %s", exc)
@@ -3467,6 +3548,64 @@ def health() -> HealthResponse:
     )
 
 
+@app.post("/auth/exmail/request-code", response_model=ExmailLoginCodeResponse)
+def auth_request_exmail_code(payload: ExmailLoginCodeRequest) -> ExmailLoginCodeResponse:
+    try:
+        result = request_exmail_login_code(payload.email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"observation_type": "auth_request_invalid", "ok": False, "reason": str(exc)}) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail={"observation_type": "auth_delivery_failed", "ok": False, "reason": str(exc)}) from exc
+    return ExmailLoginCodeResponse(**result)
+
+
+@app.post("/auth/exmail/verify-code", response_model=ExmailLoginVerifyResponse)
+def auth_verify_exmail_code(payload: ExmailLoginVerifyRequest) -> ExmailLoginVerifyResponse:
+    try:
+        result = verify_exmail_login_code(payload.email, payload.code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"observation_type": "auth_verify_invalid", "ok": False, "reason": str(exc)}) from exc
+    return ExmailLoginVerifyResponse(**result)
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    token = _extract_auth_session_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail=_auth_error_detail("missing_auth_session"))
+    session = get_authenticated_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail=_auth_error_detail("invalid_or_expired_auth_session"))
+    actor = build_actor_context(request=request)
+    return {
+        "ok": True,
+        "session": {
+            "session_token": token,
+            "expires_at": str(session.get("expires_at") or ""),
+        },
+        "user": {
+            "user_id": str(session.get("user_id") or ""),
+            "tenant_id": str(session.get("tenant_id") or ""),
+            "workspace_id": str(session.get("workspace_id") or ""),
+            "email": str(session.get("email") or ""),
+            "display_name": str(session.get("display_name") or ""),
+            "roles": list(session.get("roles") or []),
+            "email_verified": bool(session.get("email_verified")),
+        },
+        "actor_context": actor.to_dict(),
+    }
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request) -> dict[str, Any]:
+    token = _extract_auth_session_token(request)
+    result = revoke_auth_session(token)
+    return {
+        "ok": True,
+        "revoked": bool(result.get("revoked")),
+    }
+
+
 @app.get("/admin/queue-health")
 def admin_queue_health(request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
@@ -3502,13 +3641,42 @@ def admin_memory_candidates(
     limit: int = 20,
 ) -> dict[str, Any]:
     actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
-    permission_decision = _ensure_permission(actor, "admin.read", "memory_candidates")
-    candidates = list_memory_review_candidates(session_id=session_id, conversation_id=conversation_id, status=status, limit=limit)
+    permission_decision = _ensure_permission(actor, "memory.review", "memory_candidates")
+    candidates = list_memory_review_candidates(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        status=status,
+        limit=limit,
+        actor_context=actor.to_dict(),
+    )
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
         "permission_decision": permission_decision,
         "candidates": candidates,
+    }
+
+
+@app.get("/admin/memory-review-audit")
+def admin_memory_review_audit(
+    request: Request,
+    target_type: str = "",
+    target_id: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "memory.review", "memory_review_audit")
+    audit = list_memory_review_audit(
+        target_type=target_type,
+        target_id=target_id,
+        limit=limit,
+        actor_context=actor.to_dict(),
+    )
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "audit": audit,
     }
 
 
@@ -3522,6 +3690,7 @@ def admin_review_user_memory_fact(fact_id: str, payload: MemoryReviewRequest, re
             status="active" if payload.status == "approved" else payload.status,
             reviewer=payload.reviewer,
             reason=payload.reason,
+            actor_context=actor.to_dict(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3545,6 +3714,7 @@ def admin_review_reflection_candidate(candidate_id: str, payload: MemoryReviewRe
             status=payload.status,
             reviewer=payload.reviewer,
             reason=payload.reason,
+            actor_context=actor.to_dict(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3946,33 +4116,45 @@ def list_dlp_scenarios_api() -> list[DlpScenarioDefinition]:
 
 
 @app.post("/labs/dlp/scenarios/{scenario_id}/replay", response_model=DlpTaskResponse)
-def replay_dlp_scenario_api(scenario_id: str, payload: DlpScenarioReplayRequest) -> DlpTaskResponse:
+def replay_dlp_scenario_api(scenario_id: str, payload: DlpScenarioReplayRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload, session_id=payload.session_id, conversation_id=payload.conversation_id)
+    _ensure_permission(actor, "mail.send", f"dlp_scenario:{scenario_id}")
     conversation = get_conversation(payload.conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Unknown conversation_id")
     if conversation["session_id"] != payload.session_id:
         raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
+    _ensure_conversation_read_access(conversation, actor)
 
     scenario = get_dlp_scenario(scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Unknown scenario_id")
 
-    task = _create_async_dlp_task(_build_scenario_task_payload(scenario, payload))
+    task = _create_async_dlp_task(_build_scenario_task_payload(scenario, payload, actor.to_dict()), actor_context=actor.to_dict())
     return _task_response(task)
 
 
 @app.post("/tasks/{task_id}/supplement", response_model=DlpTaskResponse)
-def supplement_dlp_task_api(task_id: str, payload: DlpTaskSupplementRequest) -> DlpTaskResponse:
+def supplement_dlp_task_api(task_id: str, payload: DlpTaskSupplementRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload, session_id=payload.session_id, conversation_id=payload.conversation_id)
+    _ensure_permission(actor, "task.read", task_id)
     conversation = get_conversation(payload.conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Unknown conversation_id")
     if conversation["session_id"] != payload.session_id:
         raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
+    _ensure_conversation_read_access(conversation, actor)
     task = get_dlp_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
     if str(task.get("conversation_id", "")) != payload.conversation_id:
         raise HTTPException(status_code=403, detail="task_id does not belong to this conversation_id")
+    if not actor.is_local_dev and (
+        str(task.get("tenant_id") or "") != actor.tenant_id
+        or str(task.get("user_id") or "") != actor.user_id
+        or str(task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     if str(task.get("status", "")) not in {"needs_clarification", "input_invalid"}:
         raise HTTPException(status_code=409, detail="Only governance tasks can be supplemented")
     task = _supplement_dlp_task(task, payload)
@@ -3980,10 +4162,18 @@ def supplement_dlp_task_api(task_id: str, payload: DlpTaskSupplementRequest) -> 
 
 
 @app.get("/tasks/{task_id}", response_model=DlpTaskResponse)
-def get_dlp_task_api(task_id: str) -> DlpTaskResponse:
+def get_dlp_task_api(task_id: str, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.read", task_id)
     task = get_dlp_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
+    if not actor.is_local_dev and (
+        str(task.get("tenant_id") or "") != actor.tenant_id
+        or str(task.get("user_id") or "") != actor.user_id
+        or str(task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     return _task_response(task)
 
 
@@ -4341,14 +4531,15 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
                 ))
-        return finalize(_build_mail_clarification_response(
-            session_id=payload.session_id,
-            conversation_id=conversation_id,
-            message=payload.message,
-            display_message=display_message,
-            mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
-            candidates=[],
-        ))
+        if not looks_like_mail_action_request(payload.message):
+            return finalize(_build_mail_clarification_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                display_message=display_message,
+                mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
+                candidates=[],
+            ))
     if looks_like_mail_action_request(payload.message) and not (
         _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
     ):
@@ -4598,6 +4789,41 @@ def _build_rule_clarification_response(
     routing_reason: str,
     candidates: list[dict[str, Any]] | None = None,
 ) -> UnifiedAgentResponse:
+    clarification_observation = {
+        "observation_type": "clarification_required",
+        "source": "outbound_resolution",
+        "grounding_kind": "state",
+        "summary": compact_text(
+            "; ".join(
+                [
+                    "outbound_intent_detected=true",
+                    "safe_target_resolution=false",
+                    f"candidate_count={len(list(candidates or []))}",
+                    f"clarification_hint={clarification_question}",
+                ]
+            ),
+            240,
+        ),
+        "payload": {
+            "missing_fields": ["target_content"],
+            "clarification_hint": clarification_question,
+            "candidates": list(candidates or []),
+            "source_policy": {
+                "requires_explicit_body_source": True,
+                "attachment_text_default": "attachment_only",
+            },
+        },
+        "citations": [],
+        "confidence": 0.9,
+    }
+    renderer = render_final_answer(
+        question=message,
+        current_goal="action_or_draft",
+        observations=[clarification_observation],
+        working_memory=[str(clarification_observation["summary"])],
+        conservative=True,
+    )
+    rendered_question = str(renderer.get("answer") or clarification_question)
     synthetic_result = {
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -4605,7 +4831,7 @@ def _build_rule_clarification_response(
         "message": message,
         "safe_message": message,
         "display_message": display_message or message,
-        "answer": clarification_question,
+        "answer": rendered_question,
         "intent": "action_or_draft",
         "routing_source": "rule",
         "routing_confidence": 0.97,
@@ -4623,7 +4849,7 @@ def _build_rule_clarification_response(
         ],
         "retrieved_evidence": [],
         "needs_clarification": True,
-        "clarification_question": clarification_question,
+        "clarification_question": rendered_question,
         "privacy": {},
         "context_budget": {},
         "citations": [],
@@ -4636,14 +4862,15 @@ def _build_rule_clarification_response(
         "token_out": 0,
         "estimated_cost": 0.0,
         "task_plan": {"outbound_resolution_candidates": list(candidates or [])},
+        "tool_observations": [clarification_observation],
     }
     turn_id, memory_written = _write_unified_conversation_memory(synthetic_result, conversation_id)
     record_request(
         mode="outbound_resolution",
         latency_ms=0.0,
-        token_in=0,
-        token_out=0,
-        estimated_cost=0.0,
+        token_in=int(renderer.get("token_in", 0)),
+        token_out=int(renderer.get("token_out", 0)),
+        estimated_cost=float(renderer.get("estimated_cost", 0.0)),
         retrieval_hits=0,
     )
     record_unified_agent(
@@ -4658,7 +4885,7 @@ def _build_rule_clarification_response(
         session_id=session_id,
         conversation_id=conversation_id,
         turn_id=turn_id,
-        answer=clarification_question,
+        answer=rendered_question,
         intent="action_or_draft",
         routing_source="rule",
         routing_confidence=0.97,
@@ -4668,7 +4895,7 @@ def _build_rule_clarification_response(
         tool_calls=synthetic_result["tool_calls"],
         retrieved_evidence=[],
         needs_clarification=True,
-        clarification_question=clarification_question,
+        clarification_question=rendered_question,
         privacy={},
         context_budget={},
         citations=[],
@@ -4679,6 +4906,7 @@ def _build_rule_clarification_response(
         answer_collapsed=False,
         reflection_notes=None,
         task_plan=synthetic_result["task_plan"],
+        tool_observations=[clarification_observation],
         workflow_id=None,
         workflow_status=None,
         workflow_risk_level=None,
@@ -4690,9 +4918,9 @@ def _build_rule_clarification_response(
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
         latency_ms=0.0,
-        token_in=0,
-        token_out=0,
-        estimated_cost=0.0,
+        token_in=int(renderer.get("token_in", 0)),
+        token_out=int(renderer.get("token_out", 0)),
+        estimated_cost=float(renderer.get("estimated_cost", 0.0)),
     )
 
 

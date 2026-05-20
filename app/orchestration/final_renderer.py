@@ -22,6 +22,9 @@ Rules:
 - For contextual_qa, prefer a natural recap instead of replaying every turn unless the user explicitly asks for exact wording.
 - For enterprise facts, stay grounded in the evidence and citations.
 - For mail and task results, explain the current state and next step naturally instead of dumping raw payload fields.
+- For clarification_required observations, ask only for the missing information described in payload; do not reuse controller_hint verbatim.
+- For confirmation_required observations, explain what action needs confirmation and what will happen after confirmation; do not expose raw internal guardrail codes.
+- For permission_denied, rate_limited, controller_abort, and tool failure observations, explain the failure from the observation payload and suggest the safest next step.
 """
 
 MAIL_AUTHORING_PROMPT = """You are the mail authoring renderer for an enterprise agent.

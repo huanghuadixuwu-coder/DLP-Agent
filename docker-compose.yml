@@ -19,7 +19,6 @@ services:
       - chroma
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
 
   worker:
     build:
@@ -44,7 +43,6 @@ services:
       - chroma
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
 
   web:
     build:
@@ -61,7 +59,6 @@ services:
       - api
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
 
   postgres:
     image: postgres:16-alpine

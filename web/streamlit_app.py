@@ -57,10 +57,17 @@ def friendly_api_error(exc: Exception) -> str:
     return str(exc)
 
 
+def auth_headers() -> dict[str, str]:
+    token = str(st.session_state.get("auth_session_token") or "").strip()
+    if not token:
+        return {}
+    return {"X-Auth-Session": token}
+
+
 def api_get(path: str, params: dict | None = None, timeout: float = 10.0):
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.get(f"{API_BASE_URL}{path}", params=params)
+            response = client.get(f"{API_BASE_URL}{path}", params=params, headers=auth_headers())
             response.raise_for_status()
             return response.json()
     except Exception as exc:
@@ -70,7 +77,7 @@ def api_get(path: str, params: dict | None = None, timeout: float = 10.0):
 def api_post(path: str, payload: dict | None = None, params: dict | None = None, timeout: float = 120.0):
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(f"{API_BASE_URL}{path}", json=payload, params=params)
+            response = client.post(f"{API_BASE_URL}{path}", json=payload, params=params, headers=auth_headers())
             response.raise_for_status()
             return response.json()
     except Exception as exc:
@@ -80,15 +87,31 @@ def api_post(path: str, payload: dict | None = None, params: dict | None = None,
 def api_delete(path: str, params: dict | None = None, timeout: float = 30.0):
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.delete(f"{API_BASE_URL}{path}", params=params)
+            response = client.delete(f"{API_BASE_URL}{path}", params=params, headers=auth_headers())
             response.raise_for_status()
             return response.json()
     except Exception as exc:
         raise RuntimeError(friendly_api_error(exc)) from exc
 
 
+def request_exmail_login_code(email: str) -> dict:
+    return api_post("/auth/exmail/request-code", {"email": email}, timeout=60.0)
+
+
+def verify_exmail_login_code(email: str, code: str) -> dict:
+    return api_post("/auth/exmail/verify-code", {"email": email, "code": code}, timeout=60.0)
+
+
+def load_auth_me() -> dict:
+    return api_get("/auth/me", timeout=30.0)
+
+
+def logout_auth_session() -> dict:
+    return api_post("/auth/logout", {}, timeout=30.0)
+
+
 @st.cache_data(ttl=10, show_spinner=False)
-def load_conversations(session_id: str) -> list[dict]:
+def load_conversations(session_id: str, auth_token: str = "") -> list[dict]:
     try:
         return api_get("/conversations", params={"session_id": session_id})
     except Exception:
@@ -96,7 +119,7 @@ def load_conversations(session_id: str) -> list[dict]:
 
 
 @st.cache_data(ttl=2, show_spinner=False)
-def load_turns(conversation_id: str | None) -> list[dict]:
+def load_turns(conversation_id: str | None, auth_token: str = "") -> list[dict]:
     if not conversation_id:
         return []
     try:
@@ -106,7 +129,7 @@ def load_turns(conversation_id: str | None) -> list[dict]:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def load_summary(conversation_id: str | None) -> dict:
+def load_summary(conversation_id: str | None, auth_token: str = "") -> dict:
     if not conversation_id:
         return {}
     try:
@@ -132,7 +155,7 @@ def delete_conversation(session_id: str, conversation_id: str) -> dict:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def list_sensitive_workflows(session_id: str) -> list[dict]:
+def list_sensitive_workflows(session_id: str, auth_token: str = "") -> list[dict]:
     try:
         return api_get("/tasks", params={"session_id": session_id})
     except Exception:
@@ -212,17 +235,17 @@ def generate_daily_mail_digest() -> dict:
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def load_inbound_mail_summary() -> dict:
+def load_inbound_mail_summary(auth_token: str = "") -> dict:
     return api_get("/mail/inbound/summary", timeout=30.0)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def load_inbound_mail_messages(limit: int = 5) -> list[dict]:
+def load_inbound_mail_messages(limit: int = 5, auth_token: str = "") -> list[dict]:
     return api_get("/mail/inbound/messages", params={"limit": limit}, timeout=30.0)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def load_notification_outbox(limit: int = 5) -> list[dict]:
+def load_notification_outbox(limit: int = 5, auth_token: str = "") -> list[dict]:
     return api_get("/notifications/outbox", params={"limit": limit}, timeout=30.0)
 
 
@@ -846,6 +869,7 @@ def render_realtime_task_panel_v2(
     api_url: str,
     height: int = 820,
     *,
+    auth_token: str = "",
     preferred_task_id: str | None = None,
     preferred_filter: str = "all",
     focus_nonce: str = "",
@@ -854,6 +878,7 @@ def render_realtime_task_panel_v2(
         "sessionId": session_id,
         "conversationId": conversation_id or "",
         "apiBase": api_url,
+        "authToken": auth_token,
         "preferredTaskId": preferred_task_id,
         "preferredFilter": preferred_filter,
         "focusNonce": focus_nonce,
@@ -1037,8 +1062,12 @@ def render_realtime_task_panel_v2(
     }
 
     async function fetchJson(path, options = undefined) {
+      const headers = { "Content-Type": "application/json" };
+      if (cfg.authToken) {
+        headers["X-Auth-Session"] = cfg.authToken;
+      }
       const response = await fetch(cfg.apiBase + path, {
-        headers: { "Content-Type": "application/json" },
+        headers,
         ...(options || {})
       });
       if (!response.ok) {
@@ -1440,6 +1469,14 @@ def render_legacy_task_inspector(workflows: list[dict]) -> None:
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = get_query_param("session_id") or str(uuid.uuid4())
+if "auth_session_token" not in st.session_state:
+    st.session_state.auth_session_token = ""
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = {}
+if "login_email" not in st.session_state:
+    st.session_state.login_email = ""
+if "login_code_sent" not in st.session_state:
+    st.session_state.login_code_sent = False
 if "current_conversation_id" not in st.session_state:
     st.session_state.current_conversation_id = get_query_param("conversation_id")
 if "last_debug" not in st.session_state:
@@ -1460,12 +1497,61 @@ if "visible_turn_limit" not in st.session_state:
     st.session_state.visible_turn_limit = 30
 
 
-conversations = load_conversations(st.session_state.session_id)
+if st.session_state.auth_session_token:
+    try:
+        auth_payload = load_auth_me()
+        st.session_state.auth_user = dict(auth_payload.get("user") or {})
+        if not get_query_param("session_id") and not str(st.session_state.session_id).startswith("exmail-"):
+            email = str(st.session_state.auth_user.get("email") or "")
+            stable = email.replace("@", "_at_").replace(".", "_")
+            st.session_state.session_id = f"exmail-{stable}" if stable else st.session_state.session_id
+    except Exception:
+        st.session_state.auth_session_token = ""
+        st.session_state.auth_user = {}
+        st.cache_data.clear()
+
+if not st.session_state.auth_session_token:
+    st.subheader("腾讯企业邮箱登录")
+    st.caption("使用腾讯企业邮箱验证码绑定身份。登录后，系统会从服务端会话生成 tenant / user / workspace / roles。")
+    email_value = st.text_input("企业邮箱", value=st.session_state.login_email, placeholder="name@company.com")
+    col_send, col_verify = st.columns([1, 1])
+    with col_send:
+        if st.button("发送验证码", type="primary"):
+            try:
+                result = request_exmail_login_code(email_value)
+                st.session_state.login_email = email_value.strip()
+                st.session_state.login_code_sent = True
+                st.success(f"验证码已发送到 {result.get('email_masked', '')}")
+            except Exception as exc:
+                st.error(f"发送失败: {exc}")
+    with col_verify:
+        code_value = st.text_input("验证码", value="", max_chars=12)
+        if st.button("登录"):
+            try:
+                result = verify_exmail_login_code(email_value or st.session_state.login_email, code_value)
+                st.session_state.auth_session_token = str(result.get("session_token") or "")
+                st.session_state.auth_user = dict(result.get("user") or {})
+                email = str(st.session_state.auth_user.get("email") or "")
+                stable = email.replace("@", "_at_").replace(".", "_")
+                st.session_state.session_id = f"exmail-{stable}" if stable else str(uuid.uuid4())
+                st.session_state.current_conversation_id = None
+                st.session_state.last_debug = None
+                st.session_state.last_debug_conversation_id = None
+                st.cache_data.clear()
+                sync_url_state(st.session_state.session_id, None)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"登录失败: {exc}")
+    st.stop()
+
+
+auth_token = str(st.session_state.auth_session_token or "")
+conversations = load_conversations(st.session_state.session_id, auth_token)
 if not conversations:
     try:
         created = create_conversation(st.session_state.session_id)
         st.session_state.current_conversation_id = created["conversation_id"]
-        conversations = load_conversations(st.session_state.session_id)
+        conversations = load_conversations(st.session_state.session_id, auth_token)
     except Exception:
         conversations = []
 
@@ -1481,6 +1567,26 @@ sync_url_state(st.session_state.session_id, st.session_state.current_conversatio
 
 
 with st.sidebar:
+    gradient_header("企业身份", "settings-gradient")
+    user = dict(st.session_state.auth_user or {})
+    st.caption(str(user.get("email") or ""))
+    st.caption(f"tenant: {user.get('tenant_id', '')}")
+    st.caption(f"workspace: {user.get('workspace_id', '')}")
+    roles_text = ", ".join(str(role) for role in user.get("roles", []))
+    st.caption(f"roles: {roles_text}")
+    if st.button("退出登录", type="secondary"):
+        try:
+            logout_auth_session()
+        except Exception:
+            pass
+        st.session_state.auth_session_token = ""
+        st.session_state.auth_user = {}
+        st.session_state.current_conversation_id = None
+        st.session_state.last_debug = None
+        st.session_state.last_debug_conversation_id = None
+        st.cache_data.clear()
+        st.rerun()
+
     gradient_header("对话工作区", "conversation-gradient")
     st.caption("当前 session")
     st.code(st.session_state.session_id, language=None)
@@ -1503,7 +1609,7 @@ with st.sidebar:
                 st.cache_data.clear()
                 st.session_state.last_debug = None
                 st.session_state.last_debug_conversation_id = None
-                remaining = load_conversations(st.session_state.session_id)
+                remaining = load_conversations(st.session_state.session_id, auth_token)
                 if remaining:
                     st.session_state.current_conversation_id = remaining[0]["conversation_id"]
                 else:
@@ -1553,7 +1659,7 @@ with st.sidebar:
         except Exception as exc:
             st.error(f"合并失败: {exc}")
 
-    summary_payload = load_summary(st.session_state.current_conversation_id)
+    summary_payload = load_summary(st.session_state.current_conversation_id, auth_token)
     conversation_summary = (summary_payload.get("conversation") or {}).get("summary", "")
     merge_summary = summary_payload.get("merge") or {}
     if conversation_summary:
@@ -1564,7 +1670,7 @@ with st.sidebar:
             st.json(merge_summary)
 
     gradient_header("安全外发治理台", "dlp-gradient")
-    workflows = sorted(list_sensitive_workflows(st.session_state.session_id), key=workflow_sort_key)
+    workflows = sorted(list_sensitive_workflows(st.session_state.session_id, auth_token), key=workflow_sort_key)
     pending_count = len([item for item in workflows if item.get("status") == "pending_approval"])
     failed_count = len([item for item in workflows if item.get("status") == "send_failed"])
     count_cols = st.columns(3)
@@ -1587,6 +1693,7 @@ with st.sidebar:
         st.session_state.session_id,
         st.session_state.current_conversation_id,
         EXTERNAL_API_URL,
+        auth_token=auth_token,
         preferred_task_id=st.session_state.task_panel_preferred_task_id,
         preferred_filter=st.session_state.task_panel_filter,
         focus_nonce=st.session_state.task_panel_focus_nonce,
@@ -1617,7 +1724,7 @@ left, right = st.columns([2, 1])
 
 with left:
     st.subheader("对话")
-    turns = load_turns(st.session_state.current_conversation_id)
+    turns = load_turns(st.session_state.current_conversation_id, auth_token)
     current_turn_debug = latest_debug_from_turns(turns)
     if current_turn_debug and (
         not st.session_state.last_debug
@@ -1715,7 +1822,7 @@ with right:
                 except Exception as exc:
                     st.error(f"生成失败: {exc}")
         try:
-            mail_summary = load_inbound_mail_summary()
+            mail_summary = load_inbound_mail_summary(auth_token)
             state = mail_summary.get("sync_state") or {}
             metric_cols = st.columns(3)
             metric_cols[0].metric("时间窗邮件", mail_summary.get("total", 0))
@@ -1725,7 +1832,7 @@ with right:
                 st.caption(f"最近同步: {state.get('last_sync_at')}")
             if state.get("last_error"):
                 st.warning(state.get("last_error"))
-            recent_messages = load_inbound_mail_messages(limit=5)
+            recent_messages = load_inbound_mail_messages(limit=5, auth_token=auth_token)
             if recent_messages:
                 st.write("最近邮件")
                 for message in recent_messages:
@@ -1736,7 +1843,7 @@ with right:
                     )
             else:
                 st.caption("暂无已同步邮件。开启 `IMAP_ENABLED=true` 并配置当前邮箱的 IMAP 凭证后可同步。")
-            notifications = load_notification_outbox(limit=5)
+            notifications = load_notification_outbox(limit=5, auth_token=auth_token)
             if notifications:
                 with st.expander("最近通知事件", expanded=False):
                     for item in notifications:

@@ -151,21 +151,26 @@ def run_react_agent_request(
                 if _is_timeout_like_error(exc):
                     state["degraded_from"] = "react_think"
                     if state.get("upload_context", {}).get("content_available") or state.get("memory_reads") or state.get("observations"):
-                        state["answer"] = fallback_final_answer(
-                            question=str(state.get("safe_message") or state.get("message") or ""),
-                            current_goal=str(state.get("current_goal") or ""),
-                            observations=list(state.get("observations", [])),
-                            working_memory=list(state.get("working_memory", [])),
-                            conservative=True,
-                        )
+                        state["answer"] = _compose_final_answer(state, conservative=True)
                         state["termination_reason"] = "direct_answer"
                         state["final_answer_source"] = "react_timeout_degraded_answer"
                         break
                     state["needs_clarification"] = True
-                    state["clarification_question"] = "当前规划阶段超时了。为了避免空想回答，我需要你把问题再聚焦一点，或让我直接基于现有上传内容继续。"
-                    state["answer"] = state["clarification_question"]
+                    timeout_observation = _control_observation(
+                        "clarification_required",
+                        "react_timeout",
+                        {
+                            "reason": "planning_timeout",
+                            "safe_to_answer": False,
+                            "available_observation_count": len(list(state.get("observations", []))),
+                            "uploaded_content_available": bool(state.get("upload_context", {}).get("content_available")),
+                        },
+                    )
+                    state.setdefault("observations", []).append(timeout_observation)
+                    state["answer"] = _compose_final_answer(state, conservative=True)
+                    state["clarification_question"] = state["answer"]
                     state["termination_reason"] = "needs_clarification"
-                    state["final_answer_source"] = "react_timeout_clarification"
+                    state["final_answer_source"] = "react_timeout_clarification_renderer"
                     break
                 raise
             trace = ReactTraceStep(
@@ -205,10 +210,20 @@ def run_react_agent_request(
 
             if action_type == "ask_clarification":
                 state["needs_clarification"] = True
-                state["clarification_question"] = str(decision.get("response_text") or "为了继续处理，我需要你补充更具体的信息。")
-                state["answer"] = state["clarification_question"]
+                clarification_observation = _control_observation(
+                    "clarification_required",
+                    "react_controller",
+                    {
+                        "reason": "insufficient_or_ambiguous_input",
+                        "controller_hint": str(decision.get("response_text") or ""),
+                        "current_goal": str(state.get("current_goal") or decision.get("current_goal") or ""),
+                    },
+                )
+                state.setdefault("observations", []).append(clarification_observation)
+                state["answer"] = _compose_final_answer(state, conservative=True)
+                state["clarification_question"] = state["answer"]
                 state["termination_reason"] = "needs_clarification"
-                state["final_answer_source"] = "clarification"
+                state["final_answer_source"] = "clarification_renderer"
                 trace.observation_summary = "Asked a clarification question."
                 trace.status = "completed"
                 _append_trace(state, trace)
@@ -217,16 +232,28 @@ def run_react_agent_request(
             if action_type == "request_confirmation":
                 pending = PendingConfirmation(
                     action_name="guarded_action",
-                    title=str(decision.get("confirmation_title") or "需要确认后继续"),
-                    message=str(decision.get("confirmation_message") or "这个动作会产生外部状态变更，请先确认。"),
+                    title=str(decision.get("confirmation_title") or "confirmation_required"),
+                    message=str(decision.get("confirmation_message") or "side_effectful_action_requires_confirmation"),
                     tool_name=str(decision.get("tool_name") or ""),
                     tool_input=dict(decision.get("tool_input") or {}),
                 )
                 state["pending_confirmation"] = asdict(pending)
                 state["confirmation_payload"] = asdict(pending)
-                state["answer"] = _render_confirmation_message(pending)
+                confirmation_observation = _control_observation(
+                    "confirmation_required",
+                    "react_controller",
+                    {
+                        "tool_name": pending.tool_name,
+                        "tool_input": pending.tool_input,
+                        "requires_confirmation": True,
+                        "confirmation_title": pending.title,
+                        "confirmation_message": pending.message,
+                    },
+                )
+                state.setdefault("observations", []).append(confirmation_observation)
+                state["answer"] = _compose_final_answer(state, conservative=True)
                 state["termination_reason"] = "needs_confirmation"
-                state["final_answer_source"] = "confirmation_request"
+                state["final_answer_source"] = "confirmation_request_renderer"
                 trace.observation_summary = "Prepared a guarded confirmation request."
                 trace.status = "completed"
                 _append_trace(state, trace)
@@ -253,9 +280,18 @@ def run_react_agent_request(
                 _append_trace(state, trace)
                 break
 
-            state["answer"] = str(decision.get("response_text") or "当前无法继续推进这个请求。")
+            abort_observation = _control_observation(
+                "controller_abort",
+                "react_controller",
+                {
+                    "reason": str(decision.get("response_text") or "controller_aborted_without_user_visible_reason"),
+                    "current_goal": str(state.get("current_goal") or decision.get("current_goal") or ""),
+                },
+            )
+            state.setdefault("observations", []).append(abort_observation)
+            state["answer"] = _compose_final_answer(state, conservative=True)
             state["termination_reason"] = "abort_with_reason"
-            state["final_answer_source"] = "controller_abort"
+            state["final_answer_source"] = "controller_abort_renderer"
             trace.observation_summary = "Aborted with an explicit reason."
             trace.status = "completed"
             _append_trace(state, trace)
@@ -286,6 +322,19 @@ def run_react_agent_request(
 
 def _append_trace(state: dict[str, Any], trace: ReactTraceStep) -> None:
     state.setdefault("react_trace", []).append(asdict(trace))
+
+
+def _control_observation(observation_type: str, source: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "observation_type": observation_type,
+        "kind": observation_type,
+        "source": source,
+        "grounding_kind": "state",
+        "summary": compact_text(json.dumps(payload, ensure_ascii=False, default=str), 220),
+        "payload": payload,
+        "citations": [],
+        "confidence": 0.85,
+    }
 
 
 def _record_usage(state: dict[str, Any], payload: Any) -> None:
@@ -555,8 +604,18 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
             question=context.message,
             actor_context=context.actor_context,
         )
-        compactions = get_recent_compactions(session_id=context.session_id, conversation_id=context.conversation_id, limit=3)
-        structured = get_structured_turn_summaries(session_id=context.session_id, conversation_id=context.conversation_id, limit=6)
+        compactions = get_recent_compactions(
+            session_id=context.session_id,
+            conversation_id=context.conversation_id,
+            limit=3,
+            actor_context=context.actor_context,
+        )
+        structured = get_structured_turn_summaries(
+            session_id=context.session_id,
+            conversation_id=context.conversation_id,
+            limit=6,
+            actor_context=context.actor_context,
+        )
         summary_parts = [str(memory.get("memory_context") or "")]
         if compactions:
             summary_parts.append("Compacted transcript memory:\n" + "\n".join(str(item.get("summary") or "") for item in compactions))
@@ -588,7 +647,12 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
         state.setdefault("memory_context", {})["workspace_memory"] = workspace
         state["workspace_memory_hits"] = int(workspace.get("hits", 0))
     elif memory_kind == "user_model":
-        user_memory = get_user_memory_context(session_id=context.session_id, conversation_id=context.conversation_id, limit=8)
+        user_memory = get_user_memory_context(
+            session_id=context.session_id,
+            conversation_id=context.conversation_id,
+            limit=8,
+            actor_context=context.actor_context,
+        )
         observation = {
             "kind": "user_model",
             "hits": int(user_memory.get("hits", 0)),
@@ -715,18 +779,28 @@ def _call_tool(
     if definition.side_effectful or definition.requires_confirmation:
         pending = PendingConfirmation(
             action_name=tool_name,
-            title=f"需要确认后执行 {tool_name}",
-            message=f"{tool_name} 会产生外部状态变更，请先确认再继续。",
+            title="confirmation_required",
+            message="side_effectful_action_requires_confirmation",
             tool_name=tool_name,
             tool_input=tool_input,
         )
         state["pending_confirmation"] = asdict(pending)
         state["confirmation_payload"] = asdict(pending)
-        state["answer"] = _render_confirmation_message(pending)
+        confirmation_observation = _control_observation(
+            "confirmation_required",
+            "tool_guardrail",
+            {
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "side_effectful": bool(definition.side_effectful),
+                "requires_confirmation": bool(definition.requires_confirmation),
+            },
+        )
+        state.setdefault("observations", []).append(confirmation_observation)
+        state["answer"] = _compose_final_answer(state, conservative=True)
         state["termination_reason"] = "needs_confirmation"
-        state["final_answer_source"] = "tool_confirmation_guardrail"
-        observation = {"summary": f"Guardrailed side-effectful tool: {tool_name}", "success": True, "terminate": True}
-        state.setdefault("observations", []).append({"kind": "confirmation", **observation})
+        state["final_answer_source"] = "tool_confirmation_guardrail_renderer"
+        observation = {"summary": str(confirmation_observation["summary"]), "success": True, "terminate": True}
         _accumulate_latency(state, "react_act", started)
         return observation
 
@@ -850,7 +924,7 @@ def _summarize_tool_observation(tool_name: str, payload: dict[str, Any], success
     if tool_name == "inbound_reply_draft":
         return compact_text(str(payload.get("draft_reply") or ""), 220)
     if tool_name in {"uploaded_content_analyze", "persona_or_chitchat", "unsupported_capability", "enterprise_answer"}:
-        return compact_text(str(payload.get("answer") or ""), 220)
+        return compact_text(str(payload.get("observation_summary") or payload.get("answer") or ""), 220)
     return compact_text(json.dumps(payload, ensure_ascii=False, default=str), 220)
 
 

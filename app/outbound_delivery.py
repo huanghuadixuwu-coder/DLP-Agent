@@ -61,6 +61,17 @@ EDIT_DRAFT_MARKERS = (
     "去掉",
     "主题改成",
     "收件人改成",
+    "change",
+    "edit",
+    "update",
+    "revise",
+    "replace body",
+    "body:",
+    "write in the body",
+    "subject:",
+    "recipient",
+    "remove attachment",
+    "without attachment",
 )
 BODY_REWRITE_PREFIXES = ("正文改成", "正文改为", "正文写成", "正文写为", "正文内容")
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Iterable
+from typing import Any, Iterable
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -12,6 +12,7 @@ from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from app.config import get_settings
+from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID
 
 
 _EMBEDDING_INIT_LOCK = Lock()
@@ -128,7 +129,44 @@ def reset_named_collection(collection_name: str) -> None:
     reset_caches()
 
 
-def delete_enterprise_documents_by_doc_ids(doc_ids: Iterable[str]) -> dict[str, int]:
+def _enterprise_doc_delete_filter(
+    doc_ids: list[str],
+    *,
+    tenant_id: str = "",
+    workspace_id: str = "",
+) -> dict[str, Any]:
+    clauses: list[dict[str, Any]] = [{"doc_id": {"$in": doc_ids}}]
+    if tenant_id and tenant_id != DEFAULT_TENANT_ID:
+        clauses.append({"tenant_id": {"$eq": tenant_id}})
+    if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+        clauses.append({"workspace_id": {"$eq": workspace_id}})
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def _enterprise_single_doc_delete_filter(
+    doc_id: str,
+    *,
+    tenant_id: str = "",
+    workspace_id: str = "",
+) -> dict[str, Any]:
+    clauses: list[dict[str, Any]] = [{"doc_id": {"$eq": doc_id}}]
+    if tenant_id and tenant_id != DEFAULT_TENANT_ID:
+        clauses.append({"tenant_id": {"$eq": tenant_id}})
+    if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+        clauses.append({"workspace_id": {"$eq": workspace_id}})
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def delete_enterprise_documents_by_doc_ids(
+    doc_ids: Iterable[str],
+    *,
+    tenant_id: str = "",
+    workspace_id: str = "",
+) -> dict[str, int]:
     """Hard-delete existing enterprise chunks for the provided document ids."""
     normalized = sorted({str(doc_id).strip() for doc_id in doc_ids if str(doc_id or "").strip()})
     if not normalized:
@@ -138,12 +176,18 @@ def delete_enterprise_documents_by_doc_ids(doc_ids: Iterable[str]) -> dict[str, 
     chunk_ids: list[str] = []
     for batch in _batched(normalized):
         try:
-            result = collection.get(where={"doc_id": {"$in": batch}}, include=[])
+            result = collection.get(
+                where=_enterprise_doc_delete_filter(batch, tenant_id=tenant_id, workspace_id=workspace_id),
+                include=[],
+            )
             chunk_ids.extend(str(item) for item in result.get("ids", []) if item)
         except Exception:
             # Older Chroma builds can be picky about $in; fall back to one doc_id at a time.
             for doc_id in batch:
-                result = collection.get(where={"doc_id": {"$eq": doc_id}}, include=[])
+                result = collection.get(
+                    where=_enterprise_single_doc_delete_filter(doc_id, tenant_id=tenant_id, workspace_id=workspace_id),
+                    include=[],
+                )
                 chunk_ids.extend(str(item) for item in result.get("ids", []) if item)
 
     unique_chunk_ids = sorted(set(chunk_ids))

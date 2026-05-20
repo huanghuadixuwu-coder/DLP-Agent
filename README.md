@@ -26,39 +26,43 @@ IMAP_MAILBOX=INBOX
 当前联调环境已切换到腾讯企业邮箱 SMTP/IMAP；未配置 SMTP 时会进入 `send_failed`，不会伪装成功。原稳定项目仍保留在 `E:\数据\leetcode-rag-agent`，本副本路径为 `E:\数据\leetcode-rag-agent-enterprise`。
 
 ##5/17 更新
-不是单人 Demo 了，也还不是生产级 SaaS。更准确地说，是“可多人化、可治理、可观测”的基础层已经搭起来，但还没通过足够多的隔离、并发、邮件和 RAG 回归来宣称可稳定给多人真实使用。
+不是单人本地形态了，也还不是生产级 SaaS。更准确地说，项目已经从 L3 初级多人内测版推进到更稳定的多人试用版：可多人化、可治理、可观测的基础层已经搭起来，并且关键的多租户隔离、邮件/DLP 主链、权限拒绝、RAG scoped retrieval、并发 smoke、queue health 和 Prometheus 指标都有 Docker 回归证据。
 已经可以比较硬地讲：
-项目不再只是单用户 Streamlit demo，已经有 ActorContext，包含 tenant_id / user_id / workspace_id / roles / session_id / conversation_id。
+项目不再只是单用户 Streamlit 入口，已经有 ActorContext，包含 tenant_id / user_id / workspace_id / roles / session_id / conversation_id。
 /agent/chat、EnterpriseRAG、DLP task、memory、workspace retrieval 已开始传递 actor context。
 RAG dense/sparse 检索已经支持 tenant/workspace filter。
 conversation/task list 已经有 tenant/user/workspace 过滤边界。
 side-effectful 能力，比如 mail send、DLP approve、RAG ingest/benchmark，已经有 role permission check。
 已经有 Redis-backed rate limit、Celery async ingest/benchmark、queue health、Prometheus 指标基础。
 Admin API v1 已能查看 queue health、policy version、memory candidates、RAG manifest。
-Docker 内 compileall、权限失败 observation、queue health、enterprise queue listener 已验证。
+Docker 内 compileall、权限失败 observation、queue health、enterprise queue listener、mail draft/patch/confirm/approval/send、多租户隔离回归、真实 `/agent/chat` / EnterpriseRAG / mail 并发 smoke 已验证。
 但现在还不能说“生产可用”，主要缺这几块：
 
-多用户隔离还没有完整 Docker 回归，比如 user A 的 memory/task 是否绝不被 user B 看到。
-租户级 RAG 隔离还没有端到端验证，比如 tenant A 不能检索 tenant B 的文档。
+多用户隔离已有完整 Docker 回归：user/tenant/workspace 不同的 conversation、task、memory 不互相可见。
+租户级 RAG 隔离已有端到端验证：tenant A seeded doc 不会被 tenant B 检索到。
 权限失败目前能返回结构化 detail，但还没完全走 renderer 生成自然语言说明。
-mail draft / patch / confirm / approval / send 还缺真实 Docker 全链路回归。
+mail draft / patch / confirm / approval / send 已通过真实 Docker 全链路回归；DLP policy evidence 与通用 workspace embedding 已统一改为 `/app/external-models/bge-m3`，通用 Chroma collection 切到 `leetcode_rag_bge_m3_v1`，避免复用旧 512 维 collection 导致 `rule_only` 降级。DLP model risk scorer 已加入升级 gate，仅“无法独立确认 / 外部收件人”等保守理由不能把规则 low 提升到 medium。
 EnterpriseRAG 还需要扩大 benchmark，尤其继续看 answer_fact_coverage 和错误文档混入。
 Memory pending review 还没最小落地，高风险 memory candidate 现在有方向，但缺审核闭环。
-并发只是有 backpressure/queue 基础，还没做压测和降级策略验证。
+并发已经有 backpressure/queue 基础和真实 smoke 回归；下一步仍需要更大样本压测、限流降级和失败恢复策略验证。
 下一步优先级
-我建议下一轮不要急着加 PDF、GraphRAG、日历、腾讯会议。现在最值钱的是把 L2 打实，推进到 L3：可控多人内测版。
+我建议下一轮不要急着加 PDF、GraphRAG、日历、腾讯会议。现在最值钱的是继续把多人试用版打实：扩大 RAG benchmark、收口 observation-first、补齐更多失败恢复与降级证据。
 
-先做“隔离回归套件”
+已完成“隔离回归套件”
 目标：证明多用户、多租户不是字段摆设。
-要测：两个 user_id 的 conversation/memory/task 不互相可见；两个 tenant_id 的 EnterpriseRAG query 不能跨租户命中文档；无权限用户不能 send/approve/ingest。
+已测：两个 user_id 的 conversation/memory/task 不互相可见；两个 tenant_id 的 EnterpriseRAG query 不能跨租户命中文档；无权限用户不能 approve/ingest/benchmark。
 
-再做“异步任务闭环”
+已完成“并发与异步任务 smoke”
 目标：ingest/benchmark 不只是能入队，还能查状态、看失败原因、在 Admin API 里可追踪。
-要补：task_id 状态查询、queue health 更细、worker failure observation、Prometheus 指标确认。
+已测：并发请求 `/agent/chat`、`/enterprise-rag/query`、mail draft / confirm、`/admin/queue-health` 和 `/metrics`；邮件任务可被 worker 消费到 `sent/send_failed/pending_approval` 等治理终态；Prometheus 输出 `agent_queue_backlog / agent_requests_total / agent_tasks_created_total / agent_task_status_total / agent_request_latency_ms_count`。
+
+已完成一轮“/agent/chat observation-first 收口”
+目标：减少规则层直接生成用户可见 answer / clarification / draft，避免系统变成模板机。
+已改：task status、rule clarification、mail clarification final source、ReAct confirmation / abort guardrail、legacy planner fallback 均改为优先构造 structured observations，再由 final renderer 组织自然语言。仍保留 LLM 失败兜底与少量工具内部 summary，后续继续收口。
 
 然后做“产品主链真实回归”
 目标：把面试和演示里最容易被追问的链路跑扎实。
-要跑：mail draft/patch/confirm/approval/send；GCP onboarding RAG case 与同主题不同问法；contextual recall/workspace memory/user_model read；policy hot update；doc-level invalidation。
+已跑通：mail draft/patch/confirm/approval/send。继续要跑：GCP onboarding RAG case 与同主题不同问法；contextual recall/workspace memory/user_model read；policy hot update；doc-level invalidation。
 
 最后补“Memory pending review”
 目标：让高风险偏好、长期记忆、策略类记忆不会自动污染行为。
@@ -72,6 +76,30 @@ Memory pending review 还没最小落地，高风险 memory candidate 现在有�
 - API docs: `http://localhost:8010/docs`
 - Chroma: `http://localhost:8011`
 - Prometheus: `http://localhost:9091`
+
+## 腾讯企业邮箱登录
+
+当前多人入口已经从手动 actor 字段推进到腾讯企业邮箱验证码登录。用户在 `http://localhost:8511` 输入企业邮箱后，系统通过已配置的腾讯企业邮箱 SMTP 发送验证码；验证成功后后端签发 auth session，前端通过 `X-Auth-Session` 调用 `/agent/chat`、conversation、task、mail 等接口。后端从 session 解析 `tenant_id / user_id / workspace_id / roles`，再构造 `ActorContext`。
+
+角色由服务端环境变量配置，不由前端提交：
+
+```env
+AUTH_ENABLED=true
+AUTH_ALLOWED_EMAIL_DOMAINS=example.com
+AUTH_DEFAULT_WORKSPACE_ID=default
+AUTH_DEFAULT_ROLES=user,viewer
+AUTH_ADMIN_EMAILS=admin@example.com
+AUTH_MAIL_SENDER_EMAILS=sender@example.com
+AUTH_APPROVER_EMAILS=approver@example.com
+AUTH_MEMORY_ADMIN_EMAILS=memory-admin@example.com
+AUTH_INGEST_ADMIN_EMAILS=ingest-admin@example.com
+```
+
+认证回归入口：
+
+```powershell
+docker compose exec -T api python scripts/exmail_auth_regression.py
+```
 
 ## 核心闭环
 
@@ -147,7 +175,63 @@ docker compose up --build -d
 docker compose exec api python scripts/enterprise_rag_regression.py --reset --limit 20
 ```
 
-这个回归脚本会在容器内依次执行：
+### Mail / DLP Docker-first 回归
+
+邮件与 DLP 主链真实回归同样只以容器内结果为准：
+
+```powershell
+docker compose exec -T api python scripts/mail_dlp_full_regression.py
+```
+
+这个脚本会覆盖：
+
+- IMAP inbound sync / digest / summary
+- `/agent/chat` 邮件 draft-only
+- pending mail plan 的 patch / confirm
+- DLP task 创建、审批、真实 SMTP send
+- DLP reject
+- 强制 SMTP failure 的 `send_failed` 路径
+
+兼容旧入口：
+
+```powershell
+docker compose exec -T api python scripts/tencent_enterprise_mail_regression.py
+```
+
+### Multi-Tenant Isolation Docker 回归
+
+L3 多人试用版的隔离回归入口：
+
+```powershell
+docker compose exec -T api python scripts/multi_tenant_isolation_regression.py
+```
+
+这个脚本会验证：
+
+- 两个 tenant/user/workspace 的 conversation list 与 direct read 不串数据
+- DLP task list 与 direct read 按 actor context 隔离
+- readonly 用户不能 approve，缺少权限不能执行副作用审批
+- Hermes memory candidates 按 actor context 隔离
+- EnterpriseRAG seeded docs 按 tenant/workspace filter 隔离
+- readonly 用户不能 ingest / benchmark
+
+### Concurrency / Queue Health Docker 回归
+
+多人试用版的并发 smoke 回归入口：
+
+```powershell
+docker compose exec -T api python scripts/concurrency_regression.py
+```
+
+这个脚本会验证：
+
+- 并发请求 `/agent/chat`、`/enterprise-rag/query`、mail draft / confirm
+- Admin API `/admin/queue-health` 在并发期间可读取 Redis/Celery queue depth
+- `/metrics` 输出 Prometheus 指标快照，包含 queue backlog、request/task count、task status 与 latency count
+- mail confirm 创建 DLP task 后，worker 能消费到 `sent / send_failed / pending_approval` 等治理状态
+- readonly 用户触发 RAG ingest 时返回结构化 `permission_denied` observation
+
+EnterpriseRAG 回归脚本会在容器内依次执行：
 
 1. `POST /enterprise-rag/ingest`
 2. `POST /enterprise-rag/query`

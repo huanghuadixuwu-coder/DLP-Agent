@@ -11,6 +11,7 @@ from typing import Any
 from app.config import DATA_DIR, get_settings
 from app.conversation_memory import compact_text
 from app.conversation_store import get_turns, update_conversation_summary
+from app.actor_context import ActorContext, actor_from_mapping
 from app.hermes_memory import search_workspace_memory_with_plan
 
 
@@ -37,6 +38,8 @@ HIGH_RISK_TERMS = (
     "外发策略",
 )
 PREFERENCE_TERMS = ("prefer", "preference", "remember", "以后", "记住", "偏好", "我希望", "我不希望", "不要", "别再", "默认")
+USER_MEMORY_REVIEW_STATUSES = {"active", "rejected", "pending", "expired"}
+REFLECTION_REVIEW_STATUSES = {"approved", "rejected", "pending", "expired"}
 
 
 def _now() -> str:
@@ -67,6 +70,9 @@ def init_hermes_dynamic_memory_store() -> None:
                 summary_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 user_turn_id TEXT NOT NULL,
                 assistant_turn_id TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
@@ -89,11 +95,18 @@ def init_hermes_dynamic_memory_store() -> None:
                 fact_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL,
                 content TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 risk_level TEXT NOT NULL DEFAULT 'low',
                 source_turn_ids TEXT NOT NULL DEFAULT '[]',
+                reviewed_by TEXT NOT NULL DEFAULT '',
+                review_reason TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -102,6 +115,9 @@ def init_hermes_dynamic_memory_store() -> None:
                 candidate_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 trigger_reason TEXT NOT NULL,
                 durable_facts TEXT NOT NULL DEFAULT '[]',
                 user_preferences TEXT NOT NULL DEFAULT '[]',
@@ -109,7 +125,25 @@ def init_hermes_dynamic_memory_store() -> None:
                 risk_level TEXT NOT NULL DEFAULT 'low',
                 status TEXT NOT NULL DEFAULT 'pending',
                 source_turn_ids TEXT NOT NULL DEFAULT '[]',
+                reviewed_by TEXT NOT NULL DEFAULT '',
+                review_reason TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hermes_memory_review_audit (
+                audit_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                previous_status TEXT NOT NULL DEFAULT '',
+                new_status TEXT NOT NULL DEFAULT '',
+                reviewer TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
 
@@ -117,6 +151,9 @@ def init_hermes_dynamic_memory_store() -> None:
                 compaction_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 first_kept_turn_id TEXT NOT NULL DEFAULT '',
                 source_turn_ids TEXT NOT NULL DEFAULT '[]',
                 summary TEXT NOT NULL,
@@ -133,18 +170,51 @@ def init_hermes_dynamic_memory_store() -> None:
                 ON hermes_reflection_candidates(session_id, conversation_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_hermes_compactions_conversation
                 ON hermes_transcript_compactions(session_id, conversation_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_hermes_memory_review_audit_target
+                ON hermes_memory_review_audit(target_type, target_id, created_at);
             """
         )
+        actor_columns = {
+            "tenant_id": "TEXT NOT NULL DEFAULT ''",
+            "user_id": "TEXT NOT NULL DEFAULT ''",
+            "workspace_id": "TEXT NOT NULL DEFAULT ''",
+        }
         _ensure_columns(
             conn,
             "hermes_turn_summaries",
             {
+                **actor_columns,
                 "summary": "TEXT NOT NULL DEFAULT ''",
                 "intent": "TEXT NOT NULL DEFAULT ''",
                 "entities": "TEXT NOT NULL DEFAULT '[]'",
                 "files_uploaded": "TEXT NOT NULL DEFAULT '[]'",
                 "risk_level": "TEXT NOT NULL DEFAULT 'low'",
             },
+        )
+        for table in ("hermes_user_memory_facts", "hermes_reflection_candidates", "hermes_transcript_compactions"):
+            _ensure_columns(conn, table, actor_columns)
+        review_columns = {
+            "reviewed_by": "TEXT NOT NULL DEFAULT ''",
+            "review_reason": "TEXT NOT NULL DEFAULT ''",
+            "reviewed_at": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        _ensure_columns(conn, "hermes_user_memory_facts", review_columns)
+        _ensure_columns(conn, "hermes_reflection_candidates", review_columns)
+        _ensure_columns(conn, "hermes_memory_review_audit", actor_columns)
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_hermes_turn_summaries_actor
+                ON hermes_turn_summaries(tenant_id, user_id, workspace_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_hermes_user_memory_actor
+                ON hermes_user_memory_facts(tenant_id, user_id, workspace_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_hermes_reflection_actor
+                ON hermes_reflection_candidates(tenant_id, user_id, workspace_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_hermes_compactions_actor
+                ON hermes_transcript_compactions(tenant_id, user_id, workspace_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_hermes_memory_review_audit_actor
+                ON hermes_memory_review_audit(tenant_id, user_id, workspace_id, created_at);
+            """
         )
 
 
@@ -203,6 +273,77 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             except json.JSONDecodeError:
                 item[key] = {} if key in {"provenance", "preserved_identifiers"} else []
     return item
+
+
+def _actor_filter(actor_context: dict[str, Any] | None, *, session_id: str = "", conversation_id: str = "") -> tuple[ActorContext, list[str], list[Any]]:
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
+    if actor.is_local_dev:
+        return actor, [], []
+    return actor, ["tenant_id = ?", "user_id = ?", "workspace_id = ?"], [actor.tenant_id, actor.user_id, actor.workspace_id]
+
+
+def _row_matches_actor(row: sqlite3.Row | dict[str, Any], actor_context: dict[str, Any] | None) -> bool:
+    actor, _, _ = _actor_filter(actor_context)
+    if actor.is_local_dev:
+        return True
+    item = dict(row)
+    return (
+        str(item.get("tenant_id") or "") == actor.tenant_id
+        and str(item.get("user_id") or "") == actor.user_id
+        and str(item.get("workspace_id") or "") == actor.workspace_id
+    )
+
+
+def _write_memory_review_audit(
+    conn: sqlite3.Connection,
+    *,
+    target_type: str,
+    target_id: str,
+    previous_status: str,
+    new_status: str,
+    reviewer: str,
+    reason: str,
+    actor_context: dict[str, Any] | None,
+    session_id: str = "",
+    conversation_id: str = "",
+) -> dict[str, Any]:
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
+    audit_id = _new_id("memaudit")
+    created_at = _now()
+    conn.execute(
+        """
+        INSERT INTO hermes_memory_review_audit (
+            audit_id, target_type, target_id, previous_status, new_status,
+            reviewer, reason, tenant_id, user_id, workspace_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            audit_id,
+            target_type,
+            target_id,
+            previous_status,
+            new_status,
+            reviewer,
+            reason,
+            actor.tenant_id,
+            actor.user_id,
+            actor.workspace_id,
+            created_at,
+        ),
+    )
+    return {
+        "audit_id": audit_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "reviewer": reviewer,
+        "reason": reason,
+        "tenant_id": actor.tenant_id,
+        "user_id": actor.user_id,
+        "workspace_id": actor.workspace_id,
+        "created_at": created_at,
+    }
 
 
 def _infer_memory_intent(result: dict[str, Any], question: str, answer: str) -> str:
@@ -294,9 +435,11 @@ def write_dynamic_turn_memory(
     assistant_turn_id: str,
     question: str,
     answer: str,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     init_hermes_dynamic_memory_store()
     session_id = str(result.get("session_id") or "")
+    actor = actor_from_mapping(actor_context or result.get("actor_context") or {}, session_id=session_id, conversation_id=conversation_id)
     upload_context = dict(result.get("upload_context") or {})
     combined_text = "\n".join(
         [
@@ -342,16 +485,20 @@ def write_dynamic_turn_memory(
         conn.execute(
             """
             INSERT INTO hermes_turn_summaries (
-                summary_id, session_id, conversation_id, user_turn_id, assistant_turn_id,
+                summary_id, session_id, conversation_id, tenant_id, user_id, workspace_id,
+                user_turn_id, assistant_turn_id,
                 summary, intent, entities, files_uploaded, risk_level,
                 user_goal, outcome, key_files, recipients, task_ids, failure_reason,
                 memory_scope, provenance, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary_id,
                 session_id,
                 conversation_id,
+                actor.tenant_id,
+                actor.user_id,
+                actor.workspace_id,
                 user_turn_id,
                 assistant_turn_id,
                 structured_memory["summary"],
@@ -375,19 +522,21 @@ def write_dynamic_turn_memory(
     preference_records = _write_user_preference_candidates(
         session_id=session_id,
         conversation_id=conversation_id,
+        actor_context=actor.to_dict(),
         source_turn_ids=[user_turn_id, assistant_turn_id],
         preferences=preferences,
     )
     reflection = maybe_write_reflection_candidate(
         session_id=session_id,
         conversation_id=conversation_id,
+        actor_context=actor.to_dict(),
         result=result,
         source_turn_ids=[user_turn_id, assistant_turn_id],
         durable_facts=_durable_fact_candidates(identifiers, question, answer),
         user_preferences=preferences,
         process_improvements=_extract_process_improvements(result),
     )
-    compaction = maybe_compact_conversation(session_id=session_id, conversation_id=conversation_id)
+    compaction = maybe_compact_conversation(session_id=session_id, conversation_id=conversation_id, actor_context=actor.to_dict())
     return {
         "summary_id": summary_id,
         "memory_scope": memory_scope,
@@ -429,11 +578,13 @@ def _write_user_preference_candidates(
     *,
     session_id: str,
     conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
     source_turn_ids: list[str],
     preferences: list[str],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     now = _now()
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
     with _connect() as conn:
         for preference in preferences:
             risk = classify_memory_risk(preference)
@@ -442,14 +593,18 @@ def _write_user_preference_candidates(
             conn.execute(
                 """
                 INSERT INTO hermes_user_memory_facts (
-                    fact_id, session_id, conversation_id, category, content, status,
+                    fact_id, session_id, conversation_id, tenant_id, user_id, workspace_id,
+                    category, content, status,
                     risk_level, source_turn_ids, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fact_id,
                     session_id,
                     conversation_id,
+                    actor.tenant_id,
+                    actor.user_id,
+                    actor.workspace_id,
                     "user_preference",
                     preference,
                     status,
@@ -467,6 +622,7 @@ def maybe_write_reflection_candidate(
     *,
     session_id: str,
     conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
     result: dict[str, Any],
     source_turn_ids: list[str],
     durable_facts: list[str],
@@ -488,19 +644,24 @@ def maybe_write_reflection_candidate(
     combined = "\n".join([*durable_facts, *user_preferences, *process_improvements])
     risk = classify_memory_risk(combined)
     candidate_id = _new_id("refl")
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO hermes_reflection_candidates (
-                candidate_id, session_id, conversation_id, trigger_reason,
+                candidate_id, session_id, conversation_id, tenant_id, user_id, workspace_id,
+                trigger_reason,
                 durable_facts, user_preferences, process_improvements, risk_level,
                 status, source_turn_ids, notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
             (
                 candidate_id,
                 session_id,
                 conversation_id,
+                actor.tenant_id,
+                actor.user_id,
+                actor.workspace_id,
                 _reflection_trigger_reason(result, tool_count),
                 _json_dumps(durable_facts),
                 _json_dumps(user_preferences),
@@ -532,8 +693,14 @@ def _reflection_trigger_reason(result: dict[str, Any], tool_count: int) -> str:
     return "turn_end_candidate"
 
 
-def maybe_compact_conversation(*, session_id: str, conversation_id: str) -> dict[str, Any]:
+def maybe_compact_conversation(
+    *,
+    session_id: str,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     init_hermes_dynamic_memory_store()
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
     turns = get_turns(conversation_id)
     threshold = int(getattr(get_settings(), "hermes_compaction_turn_threshold", 80))
     keep_turns = int(getattr(get_settings(), "hermes_compaction_keep_turns", 16))
@@ -568,14 +735,18 @@ def maybe_compact_conversation(*, session_id: str, conversation_id: str) -> dict
         conn.execute(
             """
             INSERT INTO hermes_transcript_compactions (
-                compaction_id, session_id, conversation_id, first_kept_turn_id,
+                compaction_id, session_id, conversation_id, tenant_id, user_id, workspace_id,
+                first_kept_turn_id,
                 source_turn_ids, summary, preserved_identifiers, token_estimate, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 compaction_id,
                 session_id,
                 conversation_id,
+                actor.tenant_id,
+                actor.user_id,
+                actor.workspace_id,
                 first_kept_turn_id,
                 _json_dumps(source_turn_ids),
                 summary,
@@ -621,74 +792,109 @@ def _compact_turns_deterministically(turns: list[dict[str, Any]], preserved: dic
     return "\n".join(part for part in pieces if part).strip()
 
 
-def get_recent_compactions(*, session_id: str, conversation_id: str, limit: int = 3) -> list[dict[str, Any]]:
+def get_recent_compactions(
+    *,
+    session_id: str,
+    conversation_id: str,
+    limit: int = 3,
+    actor_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     init_hermes_dynamic_memory_store()
+    _, actor_clauses, actor_params = _actor_filter(actor_context, session_id=session_id, conversation_id=conversation_id)
+    clauses = ["session_id = ?", "conversation_id = ?", *actor_clauses]
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM hermes_transcript_compactions
-            WHERE session_id = ? AND conversation_id = ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (session_id, conversation_id, limit),
+            (session_id, conversation_id, *actor_params, limit),
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
 
 
-def get_structured_turn_summaries(*, session_id: str, conversation_id: str, limit: int = 6) -> list[dict[str, Any]]:
+def get_structured_turn_summaries(
+    *,
+    session_id: str,
+    conversation_id: str,
+    limit: int = 6,
+    actor_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     init_hermes_dynamic_memory_store()
+    _, actor_clauses, actor_params = _actor_filter(actor_context, session_id=session_id, conversation_id=conversation_id)
+    clauses = ["session_id = ?", "conversation_id = ?", *actor_clauses]
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM hermes_turn_summaries
-            WHERE session_id = ? AND conversation_id = ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (session_id, conversation_id, limit),
+            (session_id, conversation_id, *actor_params, limit),
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
 
 
-def get_user_memory_context(*, session_id: str, conversation_id: str = "", limit: int = 8) -> dict[str, Any]:
+def get_user_memory_context(
+    *,
+    session_id: str,
+    conversation_id: str = "",
+    limit: int = 8,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     init_hermes_dynamic_memory_store()
+    actor, actor_clauses, actor_params = _actor_filter(actor_context, session_id=session_id, conversation_id=conversation_id)
+    fact_clauses = ["session_id = ?", "status = 'active'", *actor_clauses]
+    pending_fact_clauses = ["session_id = ?", "status = 'pending'", *actor_clauses]
+    reflection_clauses = ["session_id = ?", "conversation_id = ?", "status = 'approved'", *actor_clauses]
+    pending_reflection_clauses = ["session_id = ?", "conversation_id = ?", "status = 'pending'", *actor_clauses]
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM hermes_user_memory_facts
-            WHERE session_id = ? AND status IN ('active', 'pending')
+            WHERE {' AND '.join(fact_clauses)}
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            (session_id, limit),
+            (session_id, *actor_params, limit),
         ).fetchall()
+        pending_fact_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS count FROM hermes_user_memory_facts WHERE {' AND '.join(pending_fact_clauses)}",
+                (session_id, *actor_params),
+            ).fetchone()["count"]
+        )
         reflection_rows = conn.execute(
-            """
+            f"""
             SELECT * FROM hermes_reflection_candidates
-            WHERE session_id = ? AND conversation_id = ? AND status = 'pending'
+            WHERE {' AND '.join(reflection_clauses)}
             ORDER BY created_at DESC
             LIMIT 4
             """,
-            (session_id, conversation_id),
+            (session_id, conversation_id, *actor_params),
         ).fetchall()
+        pending_reflection_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS count FROM hermes_reflection_candidates WHERE {' AND '.join(pending_reflection_clauses)}",
+                (session_id, conversation_id, *actor_params),
+            ).fetchone()["count"]
+        )
     facts = [_row_to_dict(row) for row in rows]
     reflections = [_row_to_dict(row) for row in reflection_rows]
-    active = [item for item in facts if item.get("status") == "active"]
-    pending = [item for item in facts if item.get("status") == "pending"]
     summary_lines: list[str] = []
-    if active:
+    if facts:
         summary_lines.append("Active user memory:")
-        summary_lines.extend(f"- {item['content']}" for item in active[:5])
-    if pending:
-        summary_lines.append("Pending user memory candidates:")
-        summary_lines.extend(f"- {item['content']} (risk={item['risk_level']})" for item in pending[:5])
+        summary_lines.extend(f"- {item['content']}" for item in facts[:5])
     if reflections:
-        summary_lines.append("Pending reflection candidates:")
+        summary_lines.append("Approved reflection notes:")
         for item in reflections[:3]:
+            durable = item.get("durable_facts") or []
             prefs = item.get("user_preferences") or []
             improvements = item.get("process_improvements") or []
-            preview = compact_text("; ".join([*prefs, *improvements]), 220)
+            preview = compact_text("; ".join([*durable, *prefs, *improvements]), 220)
             if preview:
                 summary_lines.append(f"- {preview} (risk={item.get('risk_level', 'low')})")
     return {
@@ -696,11 +902,19 @@ def get_user_memory_context(*, session_id: str, conversation_id: str = "", limit
         "facts": facts,
         "reflection_candidates": reflections,
         "hits": len(facts) + len(reflections),
+        "review_queue": {
+            "pending_facts": pending_fact_count,
+            "pending_reflections": pending_reflection_count,
+            "policy": "pending candidates are review-only and are not exposed as behavioral memory",
+        },
         "provenance": {
             "source": "hermes_dynamic_memory",
-            "active_facts": len(active),
-            "pending_facts": len(pending),
-            "pending_reflections": len(reflections),
+            "active_facts": len(facts),
+            "approved_reflections": len(reflections),
+            "pending_facts": pending_fact_count,
+            "pending_reflections": pending_reflection_count,
+            "memory_boundary": "review_pending_excluded_from_behavior",
+            "actor_context": actor.to_dict(),
         },
     }
 
@@ -711,9 +925,11 @@ def list_memory_review_candidates(
     conversation_id: str = "",
     status: str = "pending",
     limit: int = 50,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     init_hermes_dynamic_memory_store()
     bounded_limit = max(1, min(int(limit or 50), 200))
+    actor, actor_clauses, actor_params = _actor_filter(actor_context, session_id=session_id, conversation_id=conversation_id)
     fact_clauses = ["status = ?"]
     fact_params: list[Any] = [status]
     reflection_clauses = ["status = ?"]
@@ -728,6 +944,10 @@ def list_memory_review_candidates(
         fact_params.append(conversation_id)
         reflection_clauses.append("conversation_id = ?")
         reflection_params.append(conversation_id)
+    fact_clauses.extend(actor_clauses)
+    fact_params.extend(actor_params)
+    reflection_clauses.extend(actor_clauses)
+    reflection_params.extend(actor_params)
     with _connect() as conn:
         fact_rows = conn.execute(
             f"""
@@ -756,54 +976,137 @@ def list_memory_review_candidates(
             "user_memory_facts": len(facts),
             "reflection_candidates": len(reflections),
         },
+        "actor_context": actor.to_dict(),
     }
 
 
-def review_user_memory_fact(*, fact_id: str, status: str, reviewer: str = "", reason: str = "") -> dict[str, Any]:
-    if status not in {"active", "rejected", "pending"}:
-        raise ValueError("status must be one of active, rejected, pending")
+def review_user_memory_fact(
+    *,
+    fact_id: str,
+    status: str,
+    reviewer: str = "",
+    reason: str = "",
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if status not in USER_MEMORY_REVIEW_STATUSES:
+        raise ValueError("status must be one of active, rejected, pending, expired")
     init_hermes_dynamic_memory_store()
     with _connect() as conn:
         row = conn.execute("SELECT * FROM hermes_user_memory_facts WHERE fact_id = ?", (fact_id,)).fetchone()
         if not row:
             return {}
+        if not _row_matches_actor(row, actor_context):
+            return {}
+        previous_status = str(row["status"] or "")
+        reviewed_at = _now()
         conn.execute(
             """
             UPDATE hermes_user_memory_facts
-            SET status = ?, updated_at = ?
+            SET status = ?, reviewed_by = ?, review_reason = ?, reviewed_at = ?, updated_at = ?
             WHERE fact_id = ?
             """,
-            (status, _now(), fact_id),
+            (status, reviewer, reason, reviewed_at, reviewed_at, fact_id),
+        )
+        audit = _write_memory_review_audit(
+            conn,
+            target_type="user_memory_fact",
+            target_id=fact_id,
+            previous_status=previous_status,
+            new_status=status,
+            reviewer=reviewer,
+            reason=reason,
+            actor_context=actor_context,
+            session_id=str(row["session_id"] or ""),
+            conversation_id=str(row["conversation_id"] or ""),
         )
         updated = conn.execute("SELECT * FROM hermes_user_memory_facts WHERE fact_id = ?", (fact_id,)).fetchone()
     item = _row_to_dict(updated) if updated else {}
-    item["review"] = {"reviewer": reviewer, "reason": reason}
+    item["review"] = {"reviewer": reviewer, "reason": reason, "audit": audit}
     return item
 
 
-def review_reflection_candidate(*, candidate_id: str, status: str, reviewer: str = "", reason: str = "") -> dict[str, Any]:
-    if status not in {"approved", "rejected", "pending"}:
-        raise ValueError("status must be one of approved, rejected, pending")
+def review_reflection_candidate(
+    *,
+    candidate_id: str,
+    status: str,
+    reviewer: str = "",
+    reason: str = "",
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if status not in REFLECTION_REVIEW_STATUSES:
+        raise ValueError("status must be one of approved, rejected, pending, expired")
     init_hermes_dynamic_memory_store()
     with _connect() as conn:
         row = conn.execute("SELECT * FROM hermes_reflection_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
         if not row:
             return {}
+        if not _row_matches_actor(row, actor_context):
+            return {}
+        previous_status = str(row["status"] or "")
         existing_notes = str(row["notes"] or "")
         review_note = compact_text(f"reviewer={reviewer}; status={status}; reason={reason}", 500)
         notes = "\n".join(part for part in [existing_notes, review_note] if part).strip()
+        reviewed_at = _now()
         conn.execute(
             """
             UPDATE hermes_reflection_candidates
-            SET status = ?, notes = ?
+            SET status = ?, notes = ?, reviewed_by = ?, review_reason = ?, reviewed_at = ?
             WHERE candidate_id = ?
             """,
-            (status, notes, candidate_id),
+            (status, notes, reviewer, reason, reviewed_at, candidate_id),
+        )
+        audit = _write_memory_review_audit(
+            conn,
+            target_type="reflection_candidate",
+            target_id=candidate_id,
+            previous_status=previous_status,
+            new_status=status,
+            reviewer=reviewer,
+            reason=reason,
+            actor_context=actor_context,
+            session_id=str(row["session_id"] or ""),
+            conversation_id=str(row["conversation_id"] or ""),
         )
         updated = conn.execute("SELECT * FROM hermes_reflection_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
     item = _row_to_dict(updated) if updated else {}
-    item["review"] = {"reviewer": reviewer, "reason": reason}
+    item["review"] = {"reviewer": reviewer, "reason": reason, "audit": audit}
     return item
+
+
+def list_memory_review_audit(
+    *,
+    target_type: str = "",
+    target_id: str = "",
+    limit: int = 50,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    init_hermes_dynamic_memory_store()
+    bounded_limit = max(1, min(int(limit or 50), 200))
+    actor, actor_clauses, actor_params = _actor_filter(actor_context)
+    clauses: list[str] = [*actor_clauses]
+    params: list[Any] = [*actor_params]
+    if target_type:
+        clauses.append("target_type = ?")
+        params.append(target_type)
+    if target_id:
+        clauses.append("target_id = ?")
+        params.append(target_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM hermes_memory_review_audit
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*params, bounded_limit),
+        ).fetchall()
+    return {
+        "audit_events": [_row_to_dict(row) for row in rows],
+        "counts": {"audit_events": len(rows)},
+        "actor_context": actor.to_dict(),
+    }
 
 
 def get_workspace_memory_context(question: str, *, top_k: int = 6, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:

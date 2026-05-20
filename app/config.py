@@ -24,10 +24,10 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
 
     embedding_base_url: str = Field(default="https://open.bigmodel.cn/api/paas/v4", alias="EMBEDDING_BASE_URL")
-    embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5", alias="EMBEDDING_MODEL")
+    embedding_model: str = Field(default="BAAI/bge-m3", alias="EMBEDDING_MODEL")
     embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
     embedding_device: str = Field(default="cpu", alias="EMBEDDING_DEVICE")
-    embedding_local_dir: str = Field(default=str(DATA_DIR / "models" / "bge-small-zh-v1.5"), alias="EMBEDDING_LOCAL_DIR")
+    embedding_local_dir: str = Field(default="/app/external-models/bge-m3", alias="EMBEDDING_LOCAL_DIR")
     enterprise_embedding_model: str = Field(default="BAAI/bge-m3", alias="ENTERPRISE_EMBEDDING_MODEL")
     enterprise_embedding_local_dir: str = Field(default="/app/external-models/bge-m3", alias="ENTERPRISE_EMBEDDING_LOCAL_DIR")
     enterprise_reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3", alias="ENTERPRISE_RERANKER_MODEL")
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     chroma_host: str = Field(default="localhost", alias="CHROMA_HOST")
     chroma_port: int = Field(default=8000, alias="CHROMA_PORT")
-    chroma_collection: str = Field(default="leetcode_rag_v1", alias="CHROMA_COLLECTION")
+    chroma_collection: str = Field(default="leetcode_rag_bge_m3_v1", alias="CHROMA_COLLECTION")
     enterprise_chroma_collection: str = Field(default="enterprise_rag_bench_v2", alias="ENTERPRISE_CHROMA_COLLECTION")
     workspace_memory_chroma_collection: str = Field(default="workspace_memory_v1", alias="WORKSPACE_MEMORY_CHROMA_COLLECTION")
     enterprise_collection_version: str = Field(default="enterprise_rag_bench_v2", alias="ENTERPRISE_COLLECTION_VERSION")
@@ -94,6 +94,21 @@ class Settings(BaseSettings):
     celery_result_backend: str = Field(default="redis://redis:6379/1", alias="CELERY_RESULT_BACKEND")
     risk_worker_concurrency: int = Field(default=4, alias="RISK_WORKER_CONCURRENCY")
     email_worker_concurrency: int = Field(default=2, alias="EMAIL_WORKER_CONCURRENCY")
+    auth_enabled: bool = Field(default=True, alias="AUTH_ENABLED")
+    auth_db_path: str = Field(default=str(DATA_DIR / "auth.db"), alias="AUTH_DB_PATH")
+    auth_allowed_email_domains: str = Field(default="", alias="AUTH_ALLOWED_EMAIL_DOMAINS")
+    auth_login_code_ttl_seconds: int = Field(default=600, alias="AUTH_LOGIN_CODE_TTL_SECONDS")
+    auth_login_code_resend_cooldown_seconds: int = Field(default=60, alias="AUTH_LOGIN_CODE_RESEND_COOLDOWN_SECONDS")
+    auth_session_ttl_hours: int = Field(default=12, alias="AUTH_SESSION_TTL_HOURS")
+    auth_default_tenant_id: str = Field(default="", alias="AUTH_DEFAULT_TENANT_ID")
+    auth_default_workspace_id: str = Field(default="default", alias="AUTH_DEFAULT_WORKSPACE_ID")
+    auth_default_roles: str = Field(default="user,viewer", alias="AUTH_DEFAULT_ROLES")
+    auth_admin_emails: str = Field(default="", alias="AUTH_ADMIN_EMAILS")
+    auth_mail_sender_emails: str = Field(default="", alias="AUTH_MAIL_SENDER_EMAILS")
+    auth_approver_emails: str = Field(default="", alias="AUTH_APPROVER_EMAILS")
+    auth_memory_admin_emails: str = Field(default="", alias="AUTH_MEMORY_ADMIN_EMAILS")
+    auth_ingest_admin_emails: str = Field(default="", alias="AUTH_INGEST_ADMIN_EMAILS")
+    auth_session_header_name: str = Field(default="X-Auth-Session", alias="AUTH_SESSION_HEADER_NAME")
 
     @property
     def langsmith_enabled(self) -> bool:

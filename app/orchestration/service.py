@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.conversation_memory import is_memory_follow_up
 from app.orchestration.aggregator import aggregate_results
 from app.orchestration.executor import execute_task_plan
+from app.orchestration.final_renderer import render_final_answer
 from app.orchestration.planner import plan_message
 from app.orchestration.react_controller import run_react_agent_request
 from app.orchestration.tracing import render_task_plan
@@ -87,6 +88,27 @@ def _legacy_orchestrate_agent_request(
     )
     results = execute_task_plan(plan, context)
     aggregated = aggregate_results(plan, results)
+    observations = [
+        {
+            "observation_type": item.capability,
+            "source": item.capability,
+            "grounding_kind": "tool",
+            "summary": str(item.payload.get("observation_summary") or item.payload.get("summary") or item.payload.get("answer") or item.error or item.status or ""),
+            "payload": item.payload,
+            "citations": list(item.payload.get("citations") or []),
+            "confidence": 0.75 if item.success else 0.2,
+            "success": item.success,
+            "error": item.error,
+        }
+        for item in results
+    ]
+    renderer = render_final_answer(
+        question=safe_message or message,
+        current_goal=_derive_intent(plan),
+        observations=observations,
+        working_memory=[str(item.get("summary") or "") for item in observations if str(item.get("summary") or "").strip()][:4],
+        conservative=bool(aggregated.get("partial_failures")),
+    )
     latency_ms = (perf_counter() - started) * 1000.0
     intent = _derive_intent(plan)
     return {
@@ -96,7 +118,7 @@ def _legacy_orchestrate_agent_request(
         "message": message,
         "safe_message": safe_message,
         "display_message": display_message or message,
-        "answer": aggregated["answer"],
+        "answer": str(renderer.get("answer") or aggregated["answer"]),
         "intent": intent,
         "routing_source": "planner",
         "routing_confidence": float(plan.confidence),
@@ -145,13 +167,13 @@ def _legacy_orchestrate_agent_request(
         "termination_reason": "",
         "pending_confirmation": {},
         "confirmation_payload": {},
-        "final_answer_source": "legacy_aggregator",
+        "final_answer_source": "legacy_renderer_fallback" if renderer.get("used_fallback") else "legacy_renderer",
         "memory_reads": [],
-        "tool_observations": [],
+        "tool_observations": observations,
         "node_latencies_ms": {"total": latency_ms},
-        "token_in": 0,
-        "token_out": 0,
-        "estimated_cost": 0.0,
+        "token_in": int(renderer.get("token_in", 0)),
+        "token_out": int(renderer.get("token_out", 0)),
+        "estimated_cost": float(renderer.get("estimated_cost", 0.0)),
     }
 
 

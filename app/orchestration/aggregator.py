@@ -83,7 +83,7 @@ def _section_for_result(result: ToolResult) -> str:
     if result.capability == "inbound_reply_draft":
         return _reply_draft_answer(result.payload)
     if result.capability in {"uploaded_content_analyze", "unsupported_capability", "persona_or_chitchat"}:
-        return str(result.payload.get("answer") or "")
+        return str(result.payload.get("answer") or result.payload.get("observation_summary") or "")
     if result.capability == "inbound_message_read":
         message = result.payload.get("message") or {}
         if not isinstance(message, dict):

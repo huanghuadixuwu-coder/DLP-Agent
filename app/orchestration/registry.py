@@ -270,16 +270,20 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
     uploaded_text = str(payload.get("uploaded_text") or upload_context.get("uploaded_text") or "")
 
     if parse_error or parse_status in {"parse_failed", "invalid", "empty"}:
-        answer = "当前无法解析上传文件，请重新上传可解析的文本文件，或直接粘贴正文后再让我继续分析。"
+        summary = "Uploaded content is unavailable because parsing failed or produced no usable text."
         return {
-            "answer": answer,
+            "answer": "",
+            "observation_summary": summary,
+            "analysis_status": "source_unavailable",
+            "missing_fields": ["uploaded_text"],
+            "constraints": {"requires_user_supplied_content": True},
             "upload_context": {
                 "kind": content_kind,
                 "filename": filename,
                 "content_type": content_type,
                 "parse_status": parse_status,
                 "content_available": False,
-                "summary": answer,
+                "summary": summary,
                 "key_snippets": [],
             },
         }
@@ -290,16 +294,20 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
         snippets = [str(item).strip() for item in upload_context.get("key_snippets") or [] if str(item).strip()]
         analysis_source = "\n".join([part for part in [recalled_summary, *snippets] if part]).strip()
     if not analysis_source:
-        answer = "当前没有可用的上传内容可供分析。请重新上传文件，或直接粘贴正文。"
+        summary = "No uploaded content text is available for analysis."
         return {
-            "answer": answer,
+            "answer": "",
+            "observation_summary": summary,
+            "analysis_status": "source_missing",
+            "missing_fields": ["uploaded_text"],
+            "constraints": {"requires_user_supplied_content": True},
             "upload_context": {
                 "kind": content_kind,
                 "filename": filename,
                 "content_type": content_type,
                 "parse_status": parse_status,
                 "content_available": False,
-                "summary": answer,
+                "summary": summary,
                 "key_snippets": [],
             },
         }
@@ -331,26 +339,30 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
             ]
         )
         answer = str(getattr(response, "content", response)).strip()
+        analysis_status = "llm_completed" if answer else "llm_empty"
     except Exception:
-        if task_type == "qa":
-            answer = "我已读取上传内容，但当前无法稳定完成问答。你可以改成先让我总结这份内容，或重新提一个更聚焦的问题。"
-        elif content_kind == "email":
-            answer = "我已按上传邮件内容进行概览。当前看起来这是一封需要阅读和提炼重点的来信，建议先确认主题、核心诉求和待办。"
-        else:
-            answer = compact_text(analysis_source, 600)
+        answer = ""
+        analysis_status = "llm_unavailable"
 
     if task_type == "critique" and content_kind != "email" and (not answer or answer == compact_text(analysis_source, 600)):
-        answer = "基于当前上传内容可初步判断：这份文档还不够成熟，主要问题通常集中在结构不清、重点不突出、论证支撑不足或表达冗长。建议先明确核心结论，再压缩重复表述，并补齐关键依据与行动建议。"
+        analysis_status = analysis_status if answer else "needs_llm_render"
     elif task_type == "rewrite" and (not answer or answer == compact_text(analysis_source, 600)):
-        answer = compact_text(analysis_source, 800)
+        analysis_status = analysis_status if answer else "needs_llm_render"
     elif task_type == "extract_action_items" and (not answer or answer == compact_text(analysis_source, 600)):
-        answer = "我已读到上传内容，但当前无法稳定抽取更完整的行动项。你可以让我先总结文档，或明确希望我提取的是待办、风险还是下一步计划。"
+        analysis_status = analysis_status if answer else "needs_llm_render"
 
-    summary = compact_text(answer, 400)
+    summary = compact_text(answer, 400) if answer else "Uploaded content is available; final wording should be composed from the content snippets and task constraints."
     raw_snippets = [segment.strip() for segment in re.split(r"\n{2,}", analysis_source) if segment.strip()]
     key_snippets = [compact_text(item, 220) for item in raw_snippets[:3]]
     return {
         "answer": answer,
+        "observation_summary": summary,
+        "analysis_status": analysis_status,
+        "task_type": task_type,
+        "constraints": {
+            "final_answer_must_use_uploaded_content": True,
+            "avoid_claiming_unavailable_capabilities": True,
+        },
         "upload_context": {
             "kind": content_kind,
             "filename": filename,
@@ -366,14 +378,23 @@ def _uploaded_content_analyze(payload: dict[str, Any], context: OrchestrationCon
 def _unsupported_capability(payload: dict[str, Any], _: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
     reason = str(payload.get("reason") or "当前暂不支持这个请求。")
     capability = str(payload.get("capability") or "unsupported_capability")
-    return {"answer": reason, "unsupported_capability": capability}
+    return {
+        "answer": reason,
+        "observation_summary": "Requested capability is not available in the current tool boundary.",
+        "unsupported_capability": capability,
+        "constraints": {"do_not_claim_capability": True},
+    }
 
 
 def _persona_or_chitchat(payload: dict[str, Any], _: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
     message = str(payload.get("message") or "").strip()
     lowered = message.lower()
     if lowered in {"你好", "hi", "hello", "hey"}:
-        return {"answer": "你好，我是安全外发与邮件协作 Agent。你可以让我总结上传文档、查看收件早报、回答企业知识问题，或把外发内容交给我走 DLP 审批和真实发信。"}
+        return {
+            "answer": "",
+            "observation_summary": "User sent a lightweight greeting. Available capabilities include safe outbound mail governance, inbox summaries, EnterpriseRAG Q&A, uploaded content analysis, and DLP approval workflows.",
+            "persona_kind": "greeting",
+        }
     try:
         response = get_llm().invoke(
             [
@@ -382,9 +403,23 @@ def _persona_or_chitchat(payload: dict[str, Any], _: OrchestrationContext, __: d
             ]
         )
         answer = str(getattr(response, "content", response)).strip()
+        status = "llm_completed" if answer else "llm_empty"
     except Exception:
-        answer = "我是安全外发与邮件协作 Agent，主要帮助你做上传内容分析、企业知识问答、收件早报查看，以及带 DLP 审批的安全外发。"
-    return {"answer": answer}
+        answer = ""
+        status = "llm_unavailable"
+    return {
+        "answer": answer,
+        "observation_summary": "Persona/chitchat response should be grounded in the current capability manifest.",
+        "persona_kind": "capability_or_chitchat",
+        "status": status,
+        "capabilities": [
+            "safe_outbound_mail_governance",
+            "inbound_mail_summary",
+            "enterprise_rag_qa",
+            "uploaded_content_analysis",
+            "dlp_task_governance",
+        ],
+    }
 
 
 def _legacy_tool_registry() -> dict[str, ToolDefinition]:

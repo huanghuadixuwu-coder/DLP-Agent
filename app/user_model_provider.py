@@ -32,10 +32,7 @@ class LocalUserModelProvider:
             return None
         facts = list(context.get("facts") or [])
         active = [item for item in facts if item.get("status") == "active"]
-        pending = [item for item in facts if item.get("status") == "pending"]
         preferences = [str(item.get("content") or "") for item in active if item.get("category") == "user_preference"]
-        if pending:
-            preferences.extend(f"Pending candidate: {item.get('content')}" for item in pending[:3])
         return UserModelSummary(
             summary=str(context.get("summary") or "Local enterprise-agent user memory is available."),
             preferences=[item for item in preferences if item][:8],

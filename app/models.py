@@ -554,7 +554,7 @@ class DlpTaskApprovalRequest(BaseModel):
 
 class MemoryReviewRequest(BaseModel):
     reviewer: str = Field(default="local_reviewer", min_length=1)
-    status: Literal["active", "approved", "rejected", "pending"]
+    status: Literal["active", "approved", "rejected", "pending", "expired"]
     reason: str = ""
     tenant_id: str = ""
     user_id: str = ""
@@ -675,6 +675,45 @@ class DlpScenarioReplayRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     destination_email: str = ""
     fault_injection: dict[str, Any] | None = None
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
+
+
+class ExmailLoginCodeRequest(BaseModel):
+    email: str = Field(min_length=3)
+
+
+class ExmailLoginVerifyRequest(BaseModel):
+    email: str = Field(min_length=3)
+    code: str = Field(min_length=4, max_length=12)
+
+
+class AuthUserProfile(BaseModel):
+    user_id: str
+    tenant_id: str
+    workspace_id: str
+    email: str
+    display_name: str = ""
+    roles: list[str] = Field(default_factory=list)
+    status: str = "active"
+    email_verified: bool = False
+    last_login_at: str = ""
+
+
+class ExmailLoginCodeResponse(BaseModel):
+    ok: bool = True
+    email_masked: str
+    expires_in_seconds: int
+    delivery_channel: str = "tencent_exmail_smtp"
+
+
+class ExmailLoginVerifyResponse(BaseModel):
+    ok: bool = True
+    session_token: str
+    expires_at: str
+    user: AuthUserProfile
 
 
 class ConversationMergeRequest(BaseModel):

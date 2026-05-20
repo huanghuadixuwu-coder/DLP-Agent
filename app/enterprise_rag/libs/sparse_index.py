@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID
 from app.config import get_settings
 
 
@@ -79,6 +80,9 @@ def reset_enterprise_sparse_index(db_path: str | Path | None = None) -> None:
 def delete_enterprise_sparse_documents_by_doc_ids(
     doc_ids: list[str] | tuple[str, ...] | set[str],
     db_path: str | Path | None = None,
+    *,
+    tenant_id: str = "",
+    workspace_id: str = "",
 ) -> dict[str, int]:
     normalized = sorted({str(doc_id).strip() for doc_id in doc_ids if str(doc_id or "").strip()})
     if not normalized:
@@ -86,16 +90,29 @@ def delete_enterprise_sparse_documents_by_doc_ids(
     init_enterprise_sparse_index(db_path)
     with _connect(db_path) as conn:
         placeholders = ",".join("?" for _ in normalized)
+        clauses = [f"doc_id IN ({placeholders})"]
+        params: list[Any] = list(normalized)
+        scoped = False
+        if tenant_id and tenant_id != DEFAULT_TENANT_ID:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+            scoped = True
+        if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+            scoped = True
+        where_sql = " AND ".join(clauses)
         chunk_rows = conn.execute(
-            f"SELECT chunk_id FROM enterprise_chunks WHERE doc_id IN ({placeholders})",
-            normalized,
+            f"SELECT chunk_id FROM enterprise_chunks WHERE {where_sql}",
+            params,
         ).fetchall()
         chunk_ids = [str(row["chunk_id"]) for row in chunk_rows if row["chunk_id"]]
         for chunk_id in chunk_ids:
             conn.execute("DELETE FROM enterprise_chunks_fts WHERE chunk_id = ?", (chunk_id,))
-        conn.execute(f"DELETE FROM enterprise_chunks WHERE doc_id IN ({placeholders})", normalized)
-        # Defensive cleanup for legacy rows that might exist without a matching dense row.
-        conn.execute(f"DELETE FROM enterprise_chunks_fts WHERE doc_id IN ({placeholders})", normalized)
+        conn.execute(f"DELETE FROM enterprise_chunks WHERE {where_sql}", params)
+        if not scoped:
+            # Defensive cleanup for legacy rows that might exist without a matching dense row.
+            conn.execute(f"DELETE FROM enterprise_chunks_fts WHERE doc_id IN ({placeholders})", normalized)
     return {"documents_requested": len(normalized), "chunks_deleted": len(chunk_ids)}
 
 

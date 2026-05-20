@@ -20,6 +20,43 @@ from app.upload_blob_store import load_upload_blob
 
 TEMPORARY_PROVIDER_TOKENS = ("timeout", "timed out", "tempor", "refused", "unavailable", "reset", "limit", "quota", "429")
 PERMANENT_PROVIDER_TOKENS = ("auth", "credential", "password", "invalid recipient", "mailbox unavailable", "550", "553", "format")
+MODEL_RISK_EVIDENCE_TOKENS = (
+    "pii",
+    "personal data",
+    "personal information",
+    "phone",
+    "email address",
+    "id card",
+    "bank",
+    "credential",
+    "credentials included",
+    "api key",
+    "secret",
+    "token",
+    "password",
+    "private key",
+    "customer list",
+    "contract amount",
+    "internal ip",
+    "database",
+    "connection string",
+    "[phone]",
+    "[email]",
+    "[secret]",
+    "[id_card]",
+    "[bank_card]",
+)
+MODEL_CONSERVATIVE_ONLY_TOKENS = (
+    "cannot independently verify",
+    "unable to verify",
+    "external address",
+    "external recipient",
+    "may contain",
+    "might contain",
+    "potential interest",
+    "potentially sensitive",
+    "release notes may contain",
+)
 
 
 def _looks_like_instruction_only(text: str) -> bool:
@@ -72,6 +109,29 @@ def _is_template_summary(summary: str, redacted_text: str) -> bool:
         return True
     if redacted_lower and "content:" in lowered and redacted_lower not in lowered and len(cleaned) < 120:
         return True
+    return False
+
+
+def _model_risk_upgrade_supported(
+    *,
+    rule_risk_level: str,
+    model_risk_level: str,
+    redactions: list[dict[str, Any]],
+    model_reasons: list[str],
+) -> bool:
+    if max_risk_level(rule_risk_level, model_risk_level) == rule_risk_level:
+        return True
+    if rule_risk_level != "low":
+        return True
+    if redactions:
+        return True
+    reason_text = " ".join(str(reason).lower() for reason in model_reasons)
+    if any(token in reason_text for token in MODEL_RISK_EVIDENCE_TOKENS):
+        return True
+    if reason_text and all(token in reason_text for token in ("no pii", "no sensitive")):
+        return False
+    if any(token in reason_text for token in MODEL_CONSERVATIVE_ONLY_TOKENS):
+        return False
     return False
 
 
@@ -355,7 +415,15 @@ def _run_rule_retrieval_model_pipeline(task: dict[str, Any], fault_injection: di
 
     final_risk_level = rule_risk_level
     if summary_status == "completed":
-        final_risk_level = max_risk_level(rule_risk_level, model_risk_level)
+        if _model_risk_upgrade_supported(
+            rule_risk_level=rule_risk_level,
+            model_risk_level=model_risk_level,
+            redactions=redactions,
+            model_reasons=model_reasons,
+        ):
+            final_risk_level = max_risk_level(rule_risk_level, model_risk_level)
+        else:
+            model_reasons.append("Model risk upgrade suppressed because no concrete sensitive content was detected.")
         risk_reasons.extend(model_reasons)
     elif degradation_reasons:
         record_task_degradation("rule_only")

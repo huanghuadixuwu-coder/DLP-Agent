@@ -71,6 +71,9 @@ RISK_KEYWORDS = {
 }
 
 STRUCTURED_FILE_HINTS = (".csv", ".json", ".log", "text/csv", "application/json", "text/plain")
+NEGATION_PREFIX_RE = re.compile(
+    r"(?i)(?:\bno\b|\bnot\b|\bwithout\b|\bnone\b|\babsent\b|\bdoes\s+not\s+(?:include|contain)\b|\bdo\s+not\s+(?:include|contain)\b)"
+)
 _POLICY_CACHE_LOCK = Lock()
 _POLICY_CACHE: dict[str, Any] = {}
 
@@ -348,6 +351,31 @@ def _field_value_hits(message: str) -> list[tuple[str, str]]:
     return [(match.group(1).lower(), match.group(2)) for match in FIELD_VALUE_RE.finditer(message or "")]
 
 
+def _is_negated_keyword(lowered_text: str, start_index: int) -> bool:
+    window = lowered_text[max(0, start_index - 64) : start_index]
+    return bool(NEGATION_PREFIX_RE.search(window))
+
+
+def _keyword_hits(text: str, keywords: tuple[str, ...]) -> list[str]:
+    lowered = (text or "").lower()
+    hits: list[str] = []
+    for keyword in keywords:
+        normalized = str(keyword or "").strip().lower()
+        if not normalized:
+            continue
+        search_from = 0
+        while True:
+            index = lowered.find(normalized, search_from)
+            if index < 0:
+                break
+            search_from = index + max(1, len(normalized))
+            if _is_negated_keyword(lowered, index):
+                continue
+            hits.append(normalized)
+            break
+    return hits
+
+
 def classify_risk(
     raw_message: str,
     redacted_message: str,
@@ -363,8 +391,10 @@ def classify_risk(
     structured_source = _is_structured_source(source_filename, source_content_type)
     high_keywords = tuple(RISK_KEYWORDS["high"]) + tuple(policy.high_keywords if policy else ())
     medium_keywords = tuple(RISK_KEYWORDS["medium"]) + tuple(policy.medium_keywords if policy else ())
+    high_keyword_hits = _keyword_hits(lowered, high_keywords)
+    medium_keyword_hits = _keyword_hits(lowered, medium_keywords)
 
-    if any(keyword.lower() in lowered for keyword in high_keywords):
+    if high_keyword_hits:
         reasons.append("命中高风险关键词或敏感资产标识。")
     if any(
         item.pii_type in {"id_card", "secret", "bank_card", "private_key", "db_url", "jwt"}
@@ -387,7 +417,7 @@ def classify_risk(
     ):
         reasons.append("结构化文件中命中了个人信息或业务敏感字段。")
         return "medium", reasons
-    if non_destination_redactions or any(keyword.lower() in lowered for keyword in medium_keywords):
+    if non_destination_redactions or medium_keyword_hits:
         reasons.append("包含个人信息或业务敏感信息。")
         return "medium", reasons
 
