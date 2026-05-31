@@ -10,6 +10,7 @@
 ## 入口
 
 - Web: `http://localhost:8511`
+- Governance console: `http://localhost:8512`
 - API docs: `http://localhost:8010/docs`
 - Chroma: `http://localhost:8011`
 - Prometheus: `http://localhost:9091`
@@ -59,6 +60,10 @@ IMAP_MAILBOX=INBOX
 ENTERPRISE_EMBEDDING_LOCAL_DIR=/app/external-models/bge-m3
 ENTERPRISE_RERANKER_LOCAL_DIR=/app/external-models/bge-reranker-v2-m3
 ENTERPRISE_SPARSE_DB_PATH=/app/data/enterprise_sparse.db
+CHROMA_COLLECTION=leetcode_rag_bge_m3_v1
+CONVERSATION_MEMORY_CHROMA_COLLECTION=conversation_memory_bge_m3_v1
+CONVERSATION_MEMORY_COLLECTION_VERSION=bge-m3-1024-v1
+CONVERSATION_MEMORY_EMBEDDING_DIMENSION=1024
 ```
 
 当前默认 embedding / reranker：
@@ -176,6 +181,15 @@ documents/questions
 - `turn_summary`: 结构化 turn memory
 - `workspace_memory`: 项目文档、规则、todolist、技术笔记
 - `user_model`: 用户偏好和长期记忆候选
+
+Conversation memory 使用独立的版本化 Chroma collection，不再与旧 LeetCode 语料共用索引。当前 collection 为 `conversation_memory_bge_m3_v1`，使用 `bge-m3` 的 1024 维 embedding。模型升级时先迁移到新 collection，验证后再切换配置；旧 collection 默认保留，便于回滚。迁移会比较 content hash、模型、维度与 schema version，未变化记录不会重复 embedding。
+
+Docker 内迁移与回归：
+
+```powershell
+docker compose exec -T api python scripts/migrate_conversation_memory_collection.py --source leetcode_rag_v1
+docker compose exec -T api python scripts/conversation_memory_migration_regression.py
+```
 
 Memory 边界：
 
@@ -304,7 +318,7 @@ Admin：
 
 - `GET /admin/queue-health`
 - `GET /admin/task-stats`
-- `GET /admin/privacy-policy`
+- `GET /admin/policy-version`
 - `GET /admin/memory-candidates`
 - `GET /admin/rag-manifest`
 
@@ -316,5 +330,71 @@ Metrics：
 
 - 本轮不提供完整 SSO/OIDC；v1 使用企业邮箱绑定 + request headers / payload 身份注入。
 - Streamlit 是多人试用前端，不是完整生产前端。
-- PDF、GraphRAG、日历、腾讯会议能力保留为后续计划，不纳入当前主线。
-- 历史 LeetCode / Labs 接口可能仍保留用于兼容或调试，但不再是当前产品主线。
+- PDF 与 GraphRAG 保留为后续计划；Calendar provider 边界和腾讯会议 Skill/MCP 已作为 Domain Agent 能力接入。
+- 历史 LeetCode V1 Agent、旧 sensitive workflow 和 `/problems /ingest /plan /execute /chat` 接口已经移除。
+- Labs 与 MCP 工具作为受控扩展接口保留；`app/graph.py` 只保留共享 LLM client 工厂，不再承载旧 LeetCode LangGraph QA 主链。
+## Mail Provider Abstraction (M3)
+
+Mail Agent V2 now has a provider adapter boundary:
+
+- `FakeMailProvider` is the deterministic harness provider for happy path, timeout, auth-expired, rate-limited, unavailable, and uncertain-send tests.
+- `CurrentImapSmtpMailProvider` wraps the existing local inbound mail store plus SMTP send path.
+- Provider calls return `MailProviderResponse`, which can be converted to typed observations through `to_observation(...)`.
+- Contract regressions do not perform real external sync/send by default. Current-provider sync/send are represented as `provider_not_configured` or `confirmation_required` observations unless explicitly enabled by production workflow code.
+
+Docker validation:
+
+```powershell
+docker compose exec -T api python scripts/mail_provider_contract_regression.py
+docker compose exec -T api python scripts/mail_harness_regression.py
+docker compose exec -T api python scripts/mail_provider_failure_regression.py
+docker compose exec -T api python scripts/mail_persistent_draft_regression.py
+```
+
+## Mail Normalization (M4)
+
+Inbound mail is now normalized before it reaches provider results or UI-facing models:
+
+- `body_text`, `body_html_sanitized`, and `body_preview` are persisted in the inbound mail store.
+- HTML is converted to visible text for safe downstream use, while sanitized HTML strips script/style/iframe-like content, event handlers, and `javascript:` URLs.
+- Thread fallback creates a stable local `thread_id`; provider-native thread hints from `References` / `In-Reply-To` are preserved as `provider_thread_id`.
+- Labels are normalized from mailbox and IMAP flags, for example `inbox`, `seen`, `unread`, `answered`, and `flagged`.
+- Attachments are stored as metadata only: filename, content type, size, provider attachment id, inline flag, and source policy. Attachment body content is not copied into the mail body.
+- Provider capability gaps remain explicit. The current IMAP/SMTP adapter returns `provider_write_supported=false` for unsupported label writes.
+
+Docker validation:
+
+```powershell
+docker compose exec -T api python scripts/mail_m4_normalization_regression.py
+```
+
+## Mail Reliability and DLQ (M5)
+
+Mail failures now have a replayable reliability layer instead of disappearing into task status text:
+
+- `mail_dead_letter_queue` stores failed mail operations with task id, operation, payload digest, last error, attempt count, safe replay flag, recovery hint, actor context, and payload snapshot.
+- Retry exhaustion can move a task into `dead_letter` with an attached DLQ entry.
+- SMTP uncertain delivery is treated specially: automatic replay is blocked with `safe_replay_allowed=false` until a human verifies the provider outbox/logs.
+- Safe DLQ replay moves the original task back to the `queued_for_send` checkpoint without changing its idempotency key.
+- Prometheus exposes `agent_mail_dlq_created_total` and `agent_mail_dlq_replay_total`.
+
+Docker validation:
+
+```powershell
+docker compose exec -T api python scripts/mail_m5_reliability_regression.py
+```
+
+## Mail UI and Governance Console (M6)
+
+Mail Agent V2 now separates the user workspace from the governance surface:
+
+- `http://localhost:8511/` remains the user-facing workspace for chat, inbox status, draft review, explicit confirmation, and simplified outbound task progress.
+- `http://localhost:8512/` is the governance console for high-risk approval/rejection, task timeline, provider health, queue health, recovery observations, DLQ safe replay, and harness diagnostics.
+- `8511` does not expose high-risk exception approval controls or raw trace/token/cost panels.
+- Governance APIs include `/admin/task-stats`, `/admin/mail-provider-health`, `/admin/mail-dlq`, `/admin/mail-dlq/{dlq_id}/replay`, and `/admin/mail-harness-summary`.
+
+Docker validation:
+
+```powershell
+docker compose exec -T api python scripts/mail_m6_ui_governance_regression.py
+```

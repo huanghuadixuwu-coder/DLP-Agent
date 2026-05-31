@@ -36,7 +36,6 @@ from app.conversation_store import (
     save_merge,
     update_conversation_summary,
 )
-from app.corpus import list_problem_summaries, problem_lookup
 from app.dlp_entry import classify_dlp_entry, extract_destination_email as dlp_extract_destination_email, looks_like_outbound_action as dlp_looks_like_outbound_action
 from app.dlp_scenarios import build_status_path, evaluate_scenario_task, get_dlp_scenario, list_dlp_scenarios, normalize_fault_injection
 from app.email_sender import send_email_smtp
@@ -45,7 +44,7 @@ from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
 from app.enterprise_rag.eval.casebook import build_casebook
 from app.enterprise_rag.ingestion.manifest_store import load_manifest
 from app.enterprise_rag.ingestion.indexer import ingest_enterprise_rag_bench
-from app.graph import execute_confirmed_plan, get_llm, preview_plan, run_agent
+from app.graph import get_llm
 from app.hermes_memory import init_workspace_memory_index
 from app.hermes_dynamic_memory import (
     get_recent_compactions,
@@ -65,9 +64,16 @@ from app.inbound_mail import (
     sync_inbound_mail,
 )
 from app.inbound_mail_store import init_inbound_mail_store, list_notifications
+from app.mail.current_provider import CurrentImapSmtpMailProvider
+from app.mail.draft_store import (
+    bind_mail_draft_task,
+    build_persisted_confirmation_payload,
+    get_latest_active_mail_draft,
+    init_mail_draft_store,
+    upsert_mail_draft,
+)
 from app.disambiguation_lab import answer_apple_query
 from app.labs_long_doc import allocate_context
-from app.memory import build_conversation_summary_document
 from app.metrics import (
     content_type,
     record_context_budget,
@@ -88,11 +94,8 @@ from app.metrics import (
     record_turn_summary_write,
     record_unified_agent,
     record_unified_evidence_hits,
-    record_workflow_approved,
-    record_workflow_created,
-    record_workflow_email_sent,
-    record_workflow_rejected,
     record_queue_backlog,
+    record_mail_dlq_replay,
     refresh_task_metrics,
     render_metrics,
 )
@@ -106,9 +109,6 @@ from app.outbound_delivery import (
     patch_pending_mail_plan,
 )
 from app.models import (
-    ChatRequest,
-    ChatResponse,
-    Citation,
     ConversationCreateRequest,
     ConversationMergeRequest,
     ConversationMergeResponse,
@@ -127,11 +127,9 @@ from app.models import (
     EnterpriseRagIngestResponse,
     EnterpriseRagQueryRequest,
     EnterpriseRagQueryResponse,
-    ExecuteRequest,
     FrameworkCompareRequest,
     FrameworkCompareResponse,
     HealthResponse,
-    IngestResponse,
     InboundDraftReplyResponse,
     InboundMailMessage,
     InboundMailSummaryResponse,
@@ -141,15 +139,8 @@ from app.models import (
     OutboundMailSummaryResponse,
     LongDocQueryRequest,
     LongDocQueryResponse,
-    PlanRequest,
-    PlanResponse,
     PrivacyScanRequest,
     PrivacyScanResponse,
-    ProblemSummary,
-    RetrievalPreview,
-    SensitiveWorkflowApprovalRequest,
-    SensitiveWorkflowCreateRequest,
-    SensitiveWorkflowResponse,
     UnifiedAgentRequest,
     UnifiedAgentResponse,
 )
@@ -165,8 +156,6 @@ from app.orchestration.types import OrchestrationContext
 from app.privacy_lab import load_active_privacy_policy, scan_sensitive_message
 from app.raw_vs_langgraph import compare_raw_llm_and_langgraph
 from app.resilience import make_failure_observation
-from app.session_store import append_turn, delete_plan, load_plan, save_plan
-from app.sensitive_workflow import run_sensitive_outbound_workflow
 from app.task_events import build_task_event, publish_task_event, task_event_iterator
 from app.task_queue import (
     EMAIL_QUEUE,
@@ -186,6 +175,7 @@ from app.task_store import (
     approve_task,
     create_dlp_task,
     get_dlp_task,
+    get_dlp_task_by_idempotency_key,
     get_latest_recoverable_task,
     get_sent_mail_stats,
     get_task_approvals,
@@ -193,23 +183,15 @@ from app.task_store import (
     get_task_stats,
     init_task_store,
     list_dlp_tasks,
+    list_mail_dlq_entries,
+    mark_mail_dlq_replay,
+    replay_mail_dlq_entry,
     reject_task,
     update_task,
 )
 from app.upload_analysis import build_upload_context, classify_upload_request, infer_upload_task_type, refers_to_recent_upload
 from app.upload_blob_store import save_upload_blob
-from app.vectorstore import count_collection, upsert_documents
-from app.workflow_store import (
-    add_audit_event,
-    approve_sensitive_workflow,
-    create_sensitive_workflow,
-    get_audit_events,
-    get_sensitive_workflow,
-    init_workflow_store,
-    list_sensitive_workflows,
-    reject_sensitive_workflow,
-    send_sensitive_workflow_email,
-)
+from app.vectorstore import count_collection, upsert_conversation_memory_documents
 
 
 logging.basicConfig(level=logging.INFO)
@@ -326,8 +308,8 @@ def _mark_task_enqueue_failed(
 async def lifespan(_: FastAPI):
     configure_observability()
     init_conversation_store()
-    init_workflow_store()
     init_task_store()
+    init_mail_draft_store()
     init_auth_store()
     init_inbound_mail_store()
     init_workspace_memory_index()
@@ -379,10 +361,6 @@ OUTBOUND_NON_CONTENT_ANSWERS = {
     "当前没有可回顾历史",
     "当前没有可用历史",
 }
-
-
-def _workflow_response(workflow: dict) -> SensitiveWorkflowResponse:
-    return SensitiveWorkflowResponse(**workflow, audit_events=get_audit_events(str(workflow["workflow_id"])))
 
 
 def _task_response(task: dict) -> DlpTaskResponse:
@@ -716,20 +694,6 @@ def _collect_outbound_candidates(
             _append_candidate(kind="user_recent_text", content=content, label="你最近粘贴/输入的长文本")
             break
     return candidates
-
-
-def _build_outbound_clarification_question(message: str, candidates: list[dict[str, Any]]) -> str:
-    if not candidates:
-        return "我已经识别到你想外发内容，但“这个文档/这个内容”目前没有明确指向。请直接回复要发送的是“刚才的总结”，或者重新上传/粘贴要发送的正文。"
-    options = []
-    for index, item in enumerate(candidates, start=1):
-        preview = compact_text(str(item.get("content") or ""), 80)
-        options.append(f"{index}. {item.get('label')}: {preview}")
-    return (
-        "我已经识别到这是指代型外发请求，但还不能安全判断你要发送哪一份内容。"
-        "请直接回复要发送的对象，例如“发刚才的总结”或“发原始上传内容”。\n\n可选对象：\n"
-        + "\n".join(options)
-    )
 
 
 def _build_outbound_resolution(
@@ -1179,6 +1143,8 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[st
         scenario_name=payload.scenario_name,
         fault_injection=fault_injection,
         expected_outcome=dict(payload.expected_outcome or {}),
+        mail_draft_id=str(payload.mail_draft_id or ""),
+        idempotency_key=str(payload.idempotency_key or ""),
         tenant_id=actor.tenant_id,
         user_id=actor.user_id,
         workspace_id=actor.workspace_id,
@@ -1296,7 +1262,43 @@ def _build_mail_action_plan(
     )
 
 
-def _get_latest_pending_mail_confirmation(conversation_id: str) -> dict[str, Any]:
+def _persist_mail_plan(
+    *,
+    session_id: str,
+    conversation_id: str,
+    mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    stored = upsert_mail_draft(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=mail_plan,
+        actor_context=actor_context,
+        status=status,
+    )
+    persisted_plan = dict(stored.get("mail_plan") or mail_plan or {})
+    persisted_plan["draft_id"] = str(stored.get("draft_id") or persisted_plan.get("draft_id") or "")
+    persisted_plan["status"] = str(stored.get("status") or persisted_plan.get("status") or "")
+    persisted_plan["draft_version"] = int(stored.get("version") or persisted_plan.get("draft_version") or 1)
+    if stored.get("confirmation_id"):
+        persisted_plan["confirmation_id"] = str(stored.get("confirmation_id") or "")
+    if stored.get("confirmation_key"):
+        persisted_plan["idempotency_key"] = str(stored.get("confirmation_key") or "")
+    return persisted_plan
+
+
+def _get_latest_pending_mail_confirmation(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    persisted = get_latest_active_mail_draft(
+        conversation_id,
+        actor_context=actor_context,
+        pending_confirmation_only=True,
+    )
+    if persisted:
+        return build_persisted_confirmation_payload(persisted)
     for turn in reversed(get_turns(conversation_id, limit=12)):
         if str(turn.get("role") or "").lower() != "assistant":
             continue
@@ -1308,19 +1310,13 @@ def _get_latest_pending_mail_confirmation(conversation_id: str) -> dict[str, Any
     return {}
 
 
-def _get_latest_pending_domain_confirmation(conversation_id: str) -> dict[str, Any]:
-    for turn in reversed(get_turns(conversation_id, limit=12)):
-        if str(turn.get("role") or "").lower() != "assistant":
-            continue
-        debug_payload = dict(turn.get("debug_payload") or {})
-        confirmation_payload = dict(debug_payload.get("confirmation_payload") or {})
-        tool_name = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "")
-        if confirmation_payload and tool_name.startswith(("meeting_", "calendar_")):
-            return confirmation_payload
-    return {}
-
-
-def _get_latest_pending_confirmation(conversation_id: str) -> dict[str, Any]:
+def _get_latest_pending_confirmation(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    persisted_mail = _get_latest_pending_mail_confirmation(conversation_id, actor_context)
+    if persisted_mail:
+        return {"kind": "mail", "payload": persisted_mail}
     for turn in reversed(get_turns(conversation_id, limit=12)):
         if str(turn.get("role") or "").lower() != "assistant":
             continue
@@ -1401,8 +1397,14 @@ def _create_domain_task_from_confirmation(
     return task
 
 
-def _get_latest_pending_mail_draft(conversation_id: str) -> dict[str, Any]:
-    confirmation_payload = _get_latest_pending_mail_confirmation(conversation_id)
+def _get_latest_pending_mail_draft(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    persisted = get_latest_active_mail_draft(conversation_id, actor_context=actor_context)
+    if persisted:
+        return dict(persisted.get("mail_plan") or {})
+    confirmation_payload = _get_latest_pending_mail_confirmation(conversation_id, actor_context)
     if confirmation_payload.get("mail_plan"):
         return dict(confirmation_payload.get("mail_plan") or {})
     for turn in reversed(get_turns(conversation_id, limit=12)):
@@ -1734,12 +1736,20 @@ def _build_mail_clarification_response(
     display_message: str,
     mail_plan: dict[str, Any] | None = None,
     candidates: list[dict[str, Any]] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     rendered_plan, render_result = _render_mail_plan_with_llm(
         message=message,
         mail_plan=dict(mail_plan or {}),
         render_mode="clarification",
         candidates=list(candidates or []),
+    )
+    rendered_plan = _persist_mail_plan(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        actor_context=actor_context,
+        status="needs_clarification",
     )
     latency_ms = _mail_render_latency_ms(render_result)
     clarification_question = str(render_result.get("clarification_question") or render_result.get("user_message") or "").strip()
@@ -1841,11 +1851,19 @@ def _build_mail_confirmation_response(
     message: str,
     display_message: str,
     mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     rendered_plan, render_result = _render_mail_plan_with_llm(
         message=message,
         mail_plan=mail_plan,
         render_mode="confirmation",
+    )
+    rendered_plan = _persist_mail_plan(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        actor_context=actor_context,
+        status="pending_confirmation",
     )
     latency_ms = _mail_render_latency_ms(render_result)
     confirmation_payload = {
@@ -1853,6 +1871,10 @@ def _build_mail_confirmation_response(
         "title": "请确认邮件发送计划",
         "message": str(render_result.get("user_message") or ""),
         "mail_plan": rendered_plan,
+        "draft_id": str(rendered_plan.get("draft_id") or ""),
+        "confirmation_id": str(rendered_plan.get("confirmation_id") or ""),
+        "idempotency_key": str(rendered_plan.get("idempotency_key") or ""),
+        "persistence_source": "mail_drafts",
     }
     mail_observation = _build_mail_plan_observation(
         rendered_plan,
@@ -1961,11 +1983,19 @@ def _build_mail_patch_response(
     display_message: str,
     mail_plan: dict[str, Any],
     patch_kind: str,
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     rendered_plan, render_result = _render_mail_plan_with_llm(
         message=message,
         mail_plan=mail_plan,
         render_mode="patch",
+    )
+    rendered_plan = _persist_mail_plan(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        actor_context=actor_context,
+        status="pending_confirmation",
     )
     latency_ms = _mail_render_latency_ms(render_result)
     confirmation_payload = {
@@ -1973,6 +2003,10 @@ def _build_mail_patch_response(
         "title": "请确认更新后的邮件发送计划",
         "message": str(render_result.get("user_message") or ""),
         "mail_plan": rendered_plan,
+        "draft_id": str(rendered_plan.get("draft_id") or ""),
+        "confirmation_id": str(rendered_plan.get("confirmation_id") or ""),
+        "idempotency_key": str(rendered_plan.get("idempotency_key") or ""),
+        "persistence_source": "mail_drafts",
     }
     patch_observation = _build_mail_plan_observation(
         rendered_plan,
@@ -2082,11 +2116,19 @@ def _build_mail_draft_response(
     message: str,
     display_message: str,
     mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     rendered_plan, render_result = _render_mail_plan_with_llm(
         message=message,
         mail_plan=mail_plan,
         render_mode="draft",
+    )
+    rendered_plan = _persist_mail_plan(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        actor_context=actor_context,
+        status="draft_ready",
     )
     latency_ms = _mail_render_latency_ms(render_result)
     draft_observation = _build_mail_plan_observation(
@@ -3040,11 +3082,6 @@ def _looks_like_outbound_mail_summary_query(message: str) -> bool:
     )
 
 
-def _looks_like_mail_draft_request(message: str) -> bool:
-    text = (message or "").lower()
-    return any(token in message or token in text for token in ("起草回复", "草拟回复", "回复草稿", "draft reply"))
-
-
 def _build_inbound_mail_agent_response(
     *,
     session_id: str,
@@ -3162,52 +3199,10 @@ def _build_inbound_mail_agent_response(
     )
 
 
-def _inbound_summary_answer(summary: dict[str, Any], state: dict[str, Any]) -> str:
-    lines = [
-        f"昨日到现在共收到 {summary.get('total', 0)} 封邮件，其中未读 {summary.get('unread', 0)} 封。",
-        f"重要邮件候选 {summary.get('important_count', 0)} 封。",
-    ]
-    if state.get("last_error"):
-        lines.append(f"最近一次收件同步异常：{state['last_error']}")
-    important = summary.get("important_messages", [])[:5]
-    if important:
-        lines.append("")
-        lines.append("重要邮件摘要：")
-        for item in important:
-            sender = _format_sender_label(item.get("sender", ""))
-            lines.append(f"- {item.get('subject') or '(无主题)'} | {sender}: {item.get('summary') or item.get('snippet', '')}")
-    return "\n".join(lines)
-
-
-def _format_sender_label(sender: str) -> str:
-    value = (sender or "").strip()
-    if not value:
-        return "未知发件人"
-    if value.endswith("@exmail.weixin.qq.com"):
-        return "系统通知"
-    return f"`{value}`"
-
-
 def _local_day_window() -> tuple[str, str]:
     now_local = datetime.now(LOCAL_TZ)
     start_local = datetime.combine(now_local.date(), time.min, tzinfo=LOCAL_TZ)
     return start_local.astimezone(timezone.utc).isoformat(), now_local.astimezone(timezone.utc).isoformat()
-
-
-def _outbound_summary_answer(summary: dict[str, Any]) -> str:
-    total_sent = int(summary.get("total_sent", 0))
-    lines = [f"今天通过 Agent 成功发送了 {total_sent} 封邮件。"]
-    recent_sent = list(summary.get("recent_sent") or [])
-    if recent_sent:
-        lines.append("")
-        lines.append("最近发送：")
-        for item in recent_sent[:5]:
-            recipient = (item.get("destination_email") or "").strip() or "未填写"
-            sent_at = str(item.get("sent_at") or "")
-            lines.append(f"- `{sent_at}` -> `{recipient}`")
-    else:
-        lines.append("当前统计范围内还没有成功发送记录。")
-    return "\n".join(lines)
 
 
 def _looks_like_enterprise_rag_query(message: str) -> bool:
@@ -3231,20 +3226,6 @@ def _looks_like_enterprise_rag_query(message: str) -> bool:
         "google drive",
     )
     return any(hint in text or hint in message for hint in hints)
-
-
-def _enterprise_rag_answer_text(result: dict[str, Any]) -> str:
-    lines = [str(result.get("answer") or "当前企业知识库中没有检索到足够证据。")]
-    citations = list(result.get("citations") or [])[:5]
-    if citations:
-        lines.append("")
-        lines.append("引用证据：")
-        for item in citations:
-            title = item.get("title") or "(untitled)"
-            doc_id = item.get("doc_id") or ""
-            source_type = item.get("source_type") or ""
-            lines.append(f"- {title} [{source_type}] `{doc_id}`")
-    return "\n".join(lines)
 
 
 @dataclass
@@ -3531,7 +3512,19 @@ def _create_dlp_task_from_mail_plan(
 ) -> dict[str, Any]:
     attachment = dict((mail_plan.get("resolved_attachments") or [{}])[0] or {}) if mail_plan.get("resolved_attachments") else {}
     selected_candidate = dict(mail_plan.get("selected_candidate") or {})
-    return _create_async_dlp_task(
+    draft_id = str(mail_plan.get("draft_id") or "")
+    idempotency_key = str(mail_plan.get("idempotency_key") or "")
+    existing = get_dlp_task_by_idempotency_key(idempotency_key) if idempotency_key else None
+    if existing:
+        if draft_id:
+            bind_mail_draft_task(
+                draft_id,
+                actor_context=dict(actor_context or {}),
+                confirmation_key=idempotency_key,
+                task_id=str(existing.get("task_id") or ""),
+            )
+        return existing
+    task = _create_async_dlp_task(
         DlpTaskCreateRequest(
             session_id=session_id,
             conversation_id=conversation_id,
@@ -3557,9 +3550,19 @@ def _create_dlp_task_from_mail_plan(
             user_id=str((actor_context or {}).get("user_id") or ""),
             workspace_id=str((actor_context or {}).get("workspace_id") or ""),
             roles=list((actor_context or {}).get("roles") or []),
+            mail_draft_id=draft_id,
+            idempotency_key=idempotency_key,
         ),
         actor_context=actor_context,
     )
+    if draft_id and idempotency_key and task.get("task_id"):
+        bind_mail_draft_task(
+            draft_id,
+            actor_context=dict(actor_context or {}),
+            confirmation_key=idempotency_key,
+            task_id=str(task.get("task_id") or ""),
+        )
+    return task
 
 
 def _build_scenario_task_payload(
@@ -3582,152 +3585,6 @@ def _build_scenario_task_payload(
         scenario_name=str(scenario.get("name", "")),
         fault_injection=chosen_faults,
         expected_outcome=dict(scenario.get("expected_outcome") or {}),
-    )
-
-
-def _create_dlp_workflow_from_payload(payload: SensitiveWorkflowCreateRequest) -> dict:
-    result = run_sensitive_outbound_workflow(
-        message=payload.message,
-        business_context=payload.business_context,
-        recipient_type=payload.recipient_type,
-        destination_email=payload.destination_email,
-        source_filename=payload.source_filename,
-        source_content_type=payload.source_content_type,
-        requested_action=payload.requested_action,
-        context_budget=payload.context_budget,
-    )
-    workflow = create_sensitive_workflow(
-        session_id=payload.session_id,
-        conversation_id=payload.conversation_id,
-        message=payload.message,
-        redacted_text=str(result.get("redacted_text", "")),
-        business_context=payload.business_context,
-        recipient_type=payload.recipient_type,
-        destination_email=payload.destination_email,
-        source_filename=payload.source_filename,
-        source_content_type=payload.source_content_type,
-        source_text_preview=_source_preview(payload.message),
-        requested_action=payload.requested_action,
-        risk_level=str(result.get("risk_level", "low")),
-        risk_reasons=result.get("risk_reasons", []),
-        redactions=result.get("redactions", []),
-        proposed_action=str(result.get("proposed_action", "")),
-        final_result=str(result.get("final_result", "")),
-        draft_summary=str(result.get("draft_summary", "")),
-        simulated_delivery_result=str(result.get("simulated_delivery_result", "")),
-        approval_required=bool(result.get("approval_required", False)),
-        status=str(result.get("status", "completed")),
-    )
-    for event in result.get("audit_events", []):
-        add_audit_event(str(workflow["workflow_id"]), str(event.get("event_type", "workflow_event")), "agent", event)
-    record_workflow_created(str(workflow["risk_level"]), bool(workflow["approval_required"]))
-    if not workflow["approval_required"]:
-        workflow = send_sensitive_workflow_email(str(workflow["workflow_id"]), "agent") or workflow
-        record_workflow_email_sent(str(workflow.get("status")) == "sent")
-    return workflow
-
-
-def _validate_problem(problem_id: str) -> None:
-    if problem_id not in problem_lookup():
-        raise HTTPException(status_code=404, detail="Unknown problem_id")
-
-
-def _build_retrieval_preview(payload: dict) -> RetrievalPreview:
-    preview = payload.get("retrieval_preview") or {"retrieval_hits": 0, "snippets": []}
-    return RetrievalPreview(
-        retrieval_hits=int(preview.get("retrieval_hits", 0)),
-        snippets=[Citation(**snippet) for snippet in preview.get("snippets", [])],
-    )
-
-
-def _should_write_summary(answer: str) -> bool:
-    text = (answer or "").strip()
-    if not text:
-        return False
-    if "证据不足" in text:
-        return False
-    return True
-
-
-def _persist_conversation_memory(result: dict) -> bool:
-    final_answer = str(result.get("final_answer") or result.get("answer") or "")
-    if not _should_write_summary(final_answer):
-        return False
-
-    try:
-        session_id = str(result["session_id"])
-        problem_id = str(result["problem_id"])
-        problem = problem_lookup()[problem_id]
-        citations = result.get("citations", [])
-
-        turn_index = append_turn(
-            session_id,
-            problem_id,
-            {
-                "question": result["question"],
-                "answer": final_answer,
-                "draft_answer": result.get("draft_answer"),
-                "reflection_notes": result.get("reflection_notes"),
-                "final_answer": final_answer,
-                "citations": citations,
-                "query_type": result.get("query_type", ""),
-            },
-            max_turns=5,
-        )
-
-        summary_doc = build_conversation_summary_document(
-            session_id=session_id,
-            problem_id=problem_id,
-            problem_title=problem.title,
-            question=str(result["question"]),
-            final_answer=final_answer,
-            query_type=str(result.get("query_type", "")),
-            turn_index=turn_index,
-            citations=citations,
-        )
-        upsert_documents([summary_doc])
-        return True
-    except Exception as exc:  # pragma: no cover - best effort memory write
-        logger.warning("Conversation memory write skipped: %s", exc)
-        return False
-
-
-def _build_chat_response(result: dict) -> ChatResponse:
-    return ChatResponse(
-        session_id=str(result["session_id"]),
-        answer=str(result["final_answer"]),
-        citations=[Citation(**citation) for citation in result.get("citations", [])],
-        trace_id=str(result["request_id"]),
-        latency_ms=float(result["node_latencies_ms"]["total"]),
-        token_in=int(result["token_in"]),
-        token_out=int(result["token_out"]),
-        estimated_cost=float(result["estimated_cost"]),
-        mode_used=result["mode_used"],
-        query_type=str(result["query_type"]),
-        draft_answer=result.get("draft_answer"),
-        reflection_notes=result.get("reflection_notes"),
-        final_answer=result.get("final_answer"),
-        plan_steps=result.get("plan_steps"),
-        retrieval_preview=_build_retrieval_preview(result),
-        requires_confirmation=bool(result.get("requires_confirmation", False)),
-        memory_hits=int(result.get("memory_hits", 0)),
-        used_conversation_memory=bool(result.get("used_conversation_memory", False)),
-        conversation_summary_written=bool(result.get("conversation_summary_written", False)),
-    )
-
-
-def _record_success_metrics(result: dict) -> None:
-    record_request(
-        mode=str(result["mode_used"]),
-        latency_ms=float(result["node_latencies_ms"]["total"]),
-        token_in=int(result["token_in"]),
-        token_out=int(result["token_out"]),
-        estimated_cost=float(result["estimated_cost"]),
-        retrieval_hits=int(result["retrieval_hits"]),
-        node_latencies_ms=result.get("node_latencies_ms"),
-        memory_hits=int(result.get("memory_hits", 0)),
-        used_conversation_memory=bool(result.get("used_conversation_memory", False)),
-        conversation_summary_written=bool(result.get("conversation_summary_written", False)),
     )
 
 
@@ -3970,7 +3827,7 @@ def health() -> HealthResponse:
     return HealthResponse(
         status="ok" if chroma_ok else "degraded",
         chroma_ok=chroma_ok,
-        problems_loaded=len(list_problem_summaries()),
+        knowledge_chunks_loaded=count_collection() if chroma_ok else 0,
         langsmith_enabled=settings.langsmith_enabled,
     )
 
@@ -4055,6 +3912,161 @@ def admin_queue_health(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/admin/task-stats")
+def admin_task_stats(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "task_stats")
+    stats = get_task_stats()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "task_stats": stats,
+    }
+
+
+@app.get("/admin/mail-provider-health")
+def admin_mail_provider_health(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "mail_provider_health")
+    response = CurrentImapSmtpMailProvider().get_health()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "provider_health": response.to_dict(),
+        "observation": response.to_observation(
+            observation_type="mail_provider_health",
+            actor_context=actor.to_dict(),
+        ),
+    }
+
+
+@app.get("/admin/mail-dlq")
+def admin_mail_dlq(
+    request: Request,
+    replay_status: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "mail_dead_letter_queue")
+    entries = list_mail_dlq_entries(replay_status=replay_status, limit=max(1, min(limit, 200)))
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
+@app.post("/admin/mail-dlq/{dlq_id}/replay")
+def admin_replay_mail_dlq(dlq_id: str, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "task.approve", f"mail_dlq:{dlq_id}")
+    replay = replay_mail_dlq_entry(dlq_id, actor=actor.user_id or "governance_admin")
+    operation = str((replay.get("entry") or {}).get("operation") or "unknown")
+    if not replay.get("ok"):
+        record_mail_dlq_replay(operation, str(replay.get("status") or "blocked"))
+        return {
+            "ok": False,
+            "actor_context": actor.to_dict(),
+            "permission_decision": permission_decision,
+            "replay": replay,
+            "observation": {
+                "observation_type": "mail_dlq_replay",
+                "status": replay.get("status") or "blocked",
+                "success": False,
+                "summary": "DLQ replay was blocked or unavailable.",
+                "actor_context": actor.to_dict(),
+                "payload": replay,
+            },
+        }
+
+    task_id = str((replay.get("task") or {}).get("task_id") or "")
+    try:
+        enqueue_email_send_task(task_id)
+        queued = mark_mail_dlq_replay(
+            dlq_id,
+            status="worker_queued",
+            result={"ok": True, "task_id": task_id, "worker_queue": EMAIL_QUEUE},
+        )
+        record_mail_dlq_replay(operation, "worker_queued")
+        return {
+            "ok": True,
+            "actor_context": actor.to_dict(),
+            "permission_decision": permission_decision,
+            "replay": {**replay, "entry": queued or replay.get("entry")},
+            "observation": {
+                "observation_type": "mail_dlq_replay",
+                "status": "worker_queued",
+                "success": True,
+                "summary": "DLQ entry was replayed and queued for the email worker.",
+                "actor_context": actor.to_dict(),
+                "payload": {"task_id": task_id, "dlq_id": dlq_id, "worker_queue": EMAIL_QUEUE},
+            },
+        }
+    except Exception as exc:
+        failed = mark_mail_dlq_replay(
+            dlq_id,
+            status="enqueue_failed",
+            result={"ok": False, "task_id": task_id, "error": str(exc)},
+        )
+        record_mail_dlq_replay(operation, "enqueue_failed")
+        return {
+            "ok": False,
+            "actor_context": actor.to_dict(),
+            "permission_decision": permission_decision,
+            "replay": {**replay, "entry": failed or replay.get("entry")},
+            "observation": make_failure_observation(
+                service="celery",
+                operation="mail_dlq_replay_enqueue",
+                error=str(exc),
+                fallback_strategy="keep_dlq_entry_for_manual_recovery",
+                retry_count=0,
+                actor_context=actor.to_dict(),
+                severity="high",
+            ),
+        }
+
+
+@app.get("/admin/mail-harness-summary")
+def admin_mail_harness_summary(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "mail_harness")
+    harnesses = [
+        {
+            "name": "mail_harness_regression",
+            "scope": "draft/confirm/DLP/send workflow",
+            "docker_command": "docker compose exec -T api python scripts/mail_harness_regression.py",
+        },
+        {
+            "name": "mail_provider_contract_regression",
+            "scope": "provider contract and typed observation shape",
+            "docker_command": "docker compose exec -T api python scripts/mail_provider_contract_regression.py",
+        },
+        {
+            "name": "mail_m5_reliability_regression",
+            "scope": "DLQ, retry exhaustion, uncertain SMTP and safe replay",
+            "docker_command": "docker compose exec -T api python scripts/mail_m5_reliability_regression.py",
+        },
+    ]
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "observation": {
+            "observation_type": "mail_harness_catalog",
+            "status": "available",
+            "success": True,
+            "summary": "Mail harness commands are available for Docker regression and governance diagnostics.",
+            "actor_context": actor.to_dict(),
+            "payload": {"harnesses": harnesses},
+        },
+        "harnesses": harnesses,
+    }
+
+
 @app.get("/admin/policy-version")
 def admin_policy_version(request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
@@ -4103,11 +4115,6 @@ def admin_rag_manifest(request: Request, limit: int = 20) -> dict[str, Any]:
         "permission_decision": permission_decision,
         "manifest": manifest,
     }
-
-
-@app.get("/problems", response_model=list[ProblemSummary])
-def problems() -> list[ProblemSummary]:
-    return list_problem_summaries()
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
@@ -4604,168 +4611,8 @@ async def task_status_stream(task_id: str, websocket: WebSocket) -> None:
             await websocket.close(code=1011)
 
 
-@app.get("/workflows/sensitive-outbound", response_model=list[SensitiveWorkflowResponse])
-def list_sensitive_workflows_api(
-    session_id: str | None = None,
-    status: str | None = None,
-) -> list[SensitiveWorkflowResponse]:
-    return [_workflow_response(item) for item in list_sensitive_workflows(session_id=session_id, status=status)]
-
-
-@app.post("/workflows/sensitive-outbound", response_model=SensitiveWorkflowResponse)
-def create_sensitive_workflow_api(payload: SensitiveWorkflowCreateRequest) -> SensitiveWorkflowResponse:
-    if payload.conversation_id:
-        conversation = get_conversation(payload.conversation_id)
-        if not conversation:
-            raise HTTPException(status_code=404, detail="Unknown conversation_id")
-        if conversation["session_id"] != payload.session_id:
-            raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
-
-    workflow = _create_dlp_workflow_from_payload(payload)
-    return _workflow_response(workflow)
-
-
-@app.get("/workflows/sensitive-outbound/{workflow_id}", response_model=SensitiveWorkflowResponse)
-def get_sensitive_workflow_api(workflow_id: str) -> SensitiveWorkflowResponse:
-    workflow = get_sensitive_workflow(workflow_id)
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Unknown workflow_id")
-    return _workflow_response(workflow)
-
-
-@app.post("/workflows/sensitive-outbound/{workflow_id}/approve", response_model=SensitiveWorkflowResponse)
-def approve_sensitive_workflow_api(
-    workflow_id: str,
-    payload: SensitiveWorkflowApprovalRequest,
-    request: Request,
-) -> SensitiveWorkflowResponse:
-    actor = build_actor_context(request=request)
-    _ensure_permission(actor, "task.approve", workflow_id)
-    workflow = approve_sensitive_workflow(workflow_id, payload.actor)
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Unknown workflow_id")
-    record_workflow_approved()
-    record_workflow_email_sent(str(workflow.get("status")) == "sent")
-    return _workflow_response(workflow)
-
-
-@app.post("/workflows/sensitive-outbound/{workflow_id}/reject", response_model=SensitiveWorkflowResponse)
-def reject_sensitive_workflow_api(
-    workflow_id: str,
-    payload: SensitiveWorkflowApprovalRequest,
-    request: Request,
-) -> SensitiveWorkflowResponse:
-    actor = build_actor_context(request=request)
-    _ensure_permission(actor, "task.approve", workflow_id)
-    workflow = reject_sensitive_workflow(workflow_id, payload.actor, payload.reason)
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Unknown workflow_id")
-    record_workflow_rejected()
-    return _workflow_response(workflow)
-
-
-@app.post("/ingest", response_model=IngestResponse)
-def ingest(request: Request, force: bool = False) -> IngestResponse:
-    actor = build_actor_context(request=request)
-    _ensure_permission(actor, "rag.ingest", "leetcode_corpus")
-    written = ingest_if_needed(force=force)
-    settings = get_settings()
-    return IngestResponse(documents_written=written, collection_name=settings.chroma_collection)
-
-
-@app.post("/plan", response_model=PlanResponse)
-def plan(payload: PlanRequest) -> PlanResponse:
-    _validate_problem(payload.problem_id)
-
-    try:
-        result = preview_plan(payload.session_id, payload.problem_id, payload.question, payload.mode)
-    except Exception as exc:
-        record_failure()
-        logger.exception("Plan preview failed")
-        raise HTTPException(status_code=500, detail=f"Plan preview failed: {exc}") from exc
-
-    save_plan(
-        str(result["request_id"]),
-        {
-            "session_id": payload.session_id,
-            "problem_id": payload.problem_id,
-            "question": payload.question,
-            "mode": result["mode_used"],
-            "plan_steps": result.get("plan_steps", ""),
-        },
-    )
-
-    return PlanResponse(
-        session_id=payload.session_id,
-        trace_id=str(result["request_id"]),
-        mode_suggested=result["mode_used"],
-        query_type=str(result["query_type"]),
-        retrieval_preview=_build_retrieval_preview(result),
-        plan_steps=str(result.get("plan_steps", "")),
-        requires_confirmation=bool(result.get("requires_confirmation", False)),
-        memory_hits=int(result.get("memory_hits", 0)),
-        used_conversation_memory=bool(result.get("used_conversation_memory", False)),
-    )
-
-
-@app.post("/execute", response_model=ChatResponse)
-def execute(payload: ExecuteRequest) -> ChatResponse:
-    stored = load_plan(payload.request_id)
-    if stored is None:
-        record_failure()
-        raise HTTPException(status_code=404, detail="Unknown or expired request_id")
-    if stored["session_id"] != payload.session_id:
-        record_failure()
-        raise HTTPException(status_code=403, detail="session_id does not match the planned request")
-    if not payload.approved_plan:
-        delete_plan(payload.request_id)
-        raise HTTPException(status_code=400, detail="Plan was not approved")
-
-    try:
-        result = execute_confirmed_plan(
-            stored["session_id"],
-            stored["problem_id"],
-            stored["question"],
-            stored["mode"],
-            plan_steps=stored.get("plan_steps"),
-            request_id=payload.request_id,
-        )
-        result["conversation_summary_written"] = _persist_conversation_memory(result)
-    except Exception as exc:
-        record_failure()
-        logger.exception("Execution failed")
-        raise HTTPException(status_code=500, detail=f"Execution failed: {exc}") from exc
-    finally:
-        delete_plan(payload.request_id)
-
-    _record_success_metrics(result)
-    return _build_chat_response(result)
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(payload: ChatRequest) -> ChatResponse:
-    _validate_problem(payload.problem_id)
-
-    if payload.mode == "plan_execute":
-        raise HTTPException(status_code=409, detail="plan_execute requires POST /plan followed by POST /execute")
-
-    try:
-        result = run_agent(payload.session_id, payload.problem_id, payload.question, payload.mode)
-        result["conversation_summary_written"] = _persist_conversation_memory(result)
-    except Exception as exc:
-        record_failure()
-        logger.exception("Chat request failed")
-        raise HTTPException(status_code=500, detail=f"Agent execution failed: {exc}") from exc
-
-    _record_success_metrics(result)
-    return _build_chat_response(result)
-
-
 @app.post("/agent/chat", response_model=UnifiedAgentResponse)
 def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentResponse:
-    if payload.problem_id:
-        _validate_problem(payload.problem_id)
-
     actor = build_actor_context(
         request=request,
         payload=payload,
@@ -4835,6 +4682,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 display_message=display_message,
                 mail_plan=dict(patched_mail_plan.get("mail_plan") or meeting_mail_plan),
                 candidates=[],
+                actor_context=actor_context,
             ))
         if patched_mail_plan.get("ok"):
             patched_plan = dict(patched_mail_plan.get("mail_plan") or meeting_mail_plan)
@@ -4845,6 +4693,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     message=payload.message,
                     display_message=display_message,
                     mail_plan=patched_plan,
+                    actor_context=actor_context,
                 ))
             return finalize(_build_mail_patch_response(
                 session_id=payload.session_id,
@@ -4853,6 +4702,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 display_message=display_message,
                 mail_plan=patched_plan,
                 patch_kind=str(patched_mail_plan.get("patch_kind") or "meeting_invitation_continuation"),
+                actor_context=actor_context,
             ))
         return finalize(_build_mail_clarification_response(
             session_id=payload.session_id,
@@ -4861,10 +4711,11 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             display_message=display_message,
             mail_plan=meeting_mail_plan,
             candidates=[],
+            actor_context=actor_context,
         ))
     multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
     if looks_like_send_confirmation(payload.message) and multi_agent_dag_plan is None:
-        latest_confirmation = _get_latest_pending_confirmation(conversation_id)
+        latest_confirmation = _get_latest_pending_confirmation(conversation_id, actor_context)
         if latest_confirmation.get("kind") == "domain":
             pending_domain_confirmation = dict(latest_confirmation.get("payload") or {})
             action = str(pending_domain_confirmation.get("tool_name") or pending_domain_confirmation.get("action_name") or "")
@@ -4929,7 +4780,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             routing_reason="Applied supplemental information to a governed DLP task.",
         ))
     if looks_like_pending_draft_edit_request(payload.message) and multi_agent_dag_plan is None:
-        pending_mail_plan = _get_latest_pending_mail_draft(conversation_id)
+        pending_mail_plan = _get_latest_pending_mail_draft(conversation_id, actor_context)
         if pending_mail_plan:
             patched_mail_plan = patch_pending_mail_plan(
                 message=payload.message,
@@ -4944,6 +4795,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     candidates=[],
+                    actor_context=actor_context,
                 ))
             if patched_mail_plan.get("ok"):
                 return finalize(_build_mail_patch_response(
@@ -4953,6 +4805,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
+                    actor_context=actor_context,
                 ))
         return finalize(_build_mail_clarification_response(
             session_id=payload.session_id,
@@ -4961,6 +4814,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             display_message=display_message,
             mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
             candidates=[],
+            actor_context=actor_context,
         ))
     if multi_agent_dag_plan is None and looks_like_mail_action_request(payload.message) and not (
         _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
@@ -4974,6 +4828,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
                 candidates=list(mail_action_plan.get("candidates") or []),
+                actor_context=actor_context,
             ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "unsupported":
             return finalize(_build_mail_unsupported_response(
@@ -4982,6 +4837,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
             ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "draft_only":
             return finalize(_build_mail_draft_response(
@@ -4990,6 +4846,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
             ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "confirmation_required":
             return finalize(_build_mail_confirmation_response(
@@ -4998,6 +4855,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
             ))
     upload_decision = classify_upload_request(message=payload.message, upload_context=upload_context)
     if upload_decision.route == "outbound" and multi_agent_dag_plan is None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from app.corpus import build_documents
 from app.config import get_settings
 from app.unified_corpus import UNIFIED_DOMAINS, build_unified_lab_documents
 from app.vectorstore import count_collection, get_chroma_client, reset_collection, upsert_documents
@@ -22,5 +21,5 @@ def ingest_if_needed(force: bool = False) -> int:
     current_count = count_collection()
     if current_count > 0 and not force and _has_unified_lab_documents():
         return 0
-    documents = build_documents() + build_unified_lab_documents()
+    documents = build_unified_lab_documents()
     return upsert_documents(documents)

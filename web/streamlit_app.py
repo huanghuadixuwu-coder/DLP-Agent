@@ -13,7 +13,6 @@ import streamlit.components.v1 as components
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 EXTERNAL_API_URL = "http://localhost:8010"
 EXTERNAL_PROMETHEUS_URL = "http://localhost:9091"
-DEFAULT_DESTINATION_EMAIL = ""
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 
@@ -132,75 +131,11 @@ def delete_conversation(session_id: str, conversation_id: str) -> dict:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def list_sensitive_workflows(session_id: str) -> list[dict]:
+def list_dlp_tasks(session_id: str) -> list[dict]:
     try:
         return api_get("/tasks", params={"session_id": session_id})
     except Exception:
         return []
-
-
-def supplement_dlp_task(
-    task_id: str,
-    session_id: str,
-    conversation_id: str,
-    message: str,
-    destination_email: str,
-    source_filename: str = "",
-    source_content_type: str = "",
-    uploaded_text: str = "",
-    uploaded_file_base64: str = "",
-    source_parse_status: str = "not_provided",
-    source_parse_error: str = "",
-) -> dict:
-    return api_post(
-        f"/tasks/{task_id}/supplement",
-        {
-            "session_id": session_id,
-            "conversation_id": conversation_id,
-            "message": message,
-            "destination_email": destination_email,
-            "uploaded_filename": source_filename,
-            "uploaded_content_type": source_content_type,
-            "uploaded_text": uploaded_text,
-            "uploaded_file_base64": uploaded_file_base64,
-            "source_parse_status": source_parse_status,
-            "source_parse_error": source_parse_error,
-        },
-        timeout=60.0,
-    )
-
-
-def list_dlp_scenarios() -> list[dict]:
-    try:
-        return api_get("/labs/dlp/scenarios")
-    except Exception:
-        return []
-
-
-def load_dlp_scenarios() -> tuple[list[dict], str | None]:
-    try:
-        return api_get("/labs/dlp/scenarios"), None
-    except Exception as exc:
-        return [], friendly_api_error(exc)
-
-
-def replay_dlp_scenario(
-    scenario_id: str,
-    session_id: str,
-    conversation_id: str,
-    destination_email: str,
-    fault_injection: dict,
-) -> dict:
-    return api_post(
-        f"/labs/dlp/scenarios/{scenario_id}/replay",
-        {
-            "session_id": session_id,
-            "conversation_id": conversation_id,
-            "destination_email": destination_email,
-            "fault_injection": fault_injection,
-        },
-        timeout=60.0,
-    )
 
 
 def sync_inbound_mailbox() -> dict:
@@ -224,19 +159,6 @@ def load_inbound_mail_messages(limit: int = 5) -> list[dict]:
 @st.cache_data(ttl=20, show_spinner=False)
 def load_notification_outbox(limit: int = 5) -> list[dict]:
     return api_get("/notifications/outbox", params={"limit": limit}, timeout=30.0)
-
-
-def approve_sensitive_workflow(workflow_id: str, actor: str) -> dict:
-    return api_post(f"/tasks/{workflow_id}/approve", {"actor": actor}, timeout=60.0)
-
-
-def reject_sensitive_workflow(workflow_id: str, actor: str, reason: str) -> dict:
-    return api_post(f"/tasks/{workflow_id}/reject", {"actor": actor, "reason": reason})
-
-
-def trigger_ingest(force: bool) -> str:
-    payload = api_post("/ingest", params={"force": force}, timeout=120.0)
-    return f"写入文档数: {payload['documents_written']}, collection: {payload['collection_name']}"
 
 
 def run_unified_agent(
@@ -339,7 +261,7 @@ def decode_uploaded_file(uploaded_file) -> tuple[str, str, str, str]:
     return "", "parse_failed", "文件解码失败。请上传 UTF-8、GBK 或 GB18030 编码的文本类文件。", raw_base64
 
 
-def workflow_sort_key(item: dict) -> tuple[int, str]:
+def task_sort_key(item: dict) -> tuple[int, str]:
     rank = {
         "needs_clarification": 0,
         "input_invalid": 1,
@@ -379,465 +301,6 @@ def apply_task_panel_filter(filter_name: str, *, task_id: str | None = None) -> 
 def gradient_header(label: str, css_class: str) -> None:
     st.markdown(f"<div class='gradient-card {css_class}'>{label}</div>", unsafe_allow_html=True)
 
-
-def render_realtime_task_panel(
-    session_id: str,
-    api_url: str,
-    height: int = 820,
-    *,
-    preferred_task_id: str | None = None,
-    preferred_filter: str = "all",
-    focus_nonce: str = "",
-) -> None:
-    payload = {
-        "sessionId": session_id,
-        "apiBase": api_url,
-        "defaultEmail": DEFAULT_DESTINATION_EMAIL,
-        "preferredTaskId": preferred_task_id,
-        "preferredFilter": preferred_filter,
-        "focusNonce": focus_nonce,
-    }
-    component_html = """
-    <div id="dlp-task-panel"></div>
-    <script>
-    const cfg = __PAYLOAD__;
-    const root = document.getElementById("dlp-task-panel");
-    const state = {{
-      tasks: [],
-      selectedTaskId: null,
-      filter: "all",
-      sockets: {{}},
-      refreshTimer: null,
-      wsScheme: cfg.apiBase.startsWith("https") ? "wss" : "ws",
-    }};
-
-    const rank = {{
-      needs_clarification: 0,
-      input_invalid: 1,
-      delivery_deferred: 2,
-      pending_approval: 3,
-      processing: 4,
-      queued_for_send: 5,
-      sending: 6,
-      send_failed: 7,
-      queued: 8,
-      sent: 9,
-      approved: 10,
-      rejected: 11,
-      failed: 12
-    }};
-
-    function escapeHtml(value) {{
-      return String(value ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }}
-
-    function taskStatusLabel(status) {{
-      const map = {{
-        needs_clarification: "寰呰ˉ鍏呬俊鎭?,
-        input_invalid: "杈撳叆鏃犳晥",
-        delivery_deferred: "寤跺悗閲嶈瘯",
-        queued: "鎺掗槦涓?,
-        processing: "椋庨櫓鍒ゆ柇涓?,
-        pending_approval: "寰呭鎵?,
-        approved: "宸叉壒鍑?,
-        rejected: "宸查┏鍥?,
-        queued_for_send: "寰呭彂閫?,
-        sending: "鍙戦€佷腑",
-        sent: "宸插彂閫?,
-        send_failed: "鍙戦€佸け璐?,
-        failed: "鎵ц澶辫触"
-      }};
-      return map[status] || status || "unknown";
-    }}
-
-    function filterTasks() {{
-      const tasks = [...state.tasks].sort((a, b) => {{
-        const rankDiff = (rank[a.status] ?? 99) - (rank[b.status] ?? 99);
-        if (rankDiff !== 0) return rankDiff;
-        return (b.updated_at || "").localeCompare(a.updated_at || "");
-      }});
-      if (state.filter === "all") return tasks;
-      return tasks.filter((task) => task.status === state.filter);
-    }}
-
-    function count(status) {{
-      return state.tasks.filter((task) => task.status === status).length;
-    }}
-
-    function getSelectedTask() {{
-      return state.tasks.find((task) => task.task_id === state.selectedTaskId) || filterTasks()[0] || null;
-    }}
-
-    async function fetchJson(path, options = undefined) {{
-      const response = await fetch(cfg.apiBase + path, {{
-        headers: {{ "Content-Type": "application/json" }},
-        ...(options || {{}})
-      }});
-      if (!response.ok) {{
-        const text = await response.text();
-        throw new Error(text || `HTTP ${{response.status}}`);
-      }}
-      return await response.json();
-    }}
-
-    async function loadTasks() {{
-      const tasks = await fetchJson(`/tasks?session_id=${{encodeURIComponent(cfg.sessionId)}}`);
-      state.tasks = tasks;
-      if (!state.selectedTaskId && tasks.length) {{
-        state.selectedTaskId = tasks[0].task_id;
-      }}
-      if (state.selectedTaskId && !tasks.some((task) => task.task_id === state.selectedTaskId)) {{
-        state.selectedTaskId = tasks[0]?.task_id || null;
-      }}
-      syncSockets();
-      render();
-    }}
-
-    async function refreshTask(taskId) {{
-      const task = await fetchJson(`/tasks/${{encodeURIComponent(taskId)}}`);
-      const idx = state.tasks.findIndex((item) => item.task_id === taskId);
-      if (idx >= 0) {{
-        state.tasks[idx] = task;
-      }} else {{
-        state.tasks.unshift(task);
-      }}
-      render();
-    }}
-
-    function closeSocket(taskId) {{
-      const socket = state.sockets[taskId];
-      if (socket) {{
-        try {{ socket.close(); }} catch (err) {{}}
-        delete state.sockets[taskId];
-      }}
-    }}
-
-    function openSocket(taskId) {{
-      if (!taskId || state.sockets[taskId]) return;
-      const url = cfg.apiBase.replace(/^http/, state.wsScheme) + `/ws/tasks/${{encodeURIComponent(taskId)}}`;
-      const socket = new WebSocket(url);
-      socket.onmessage = async (event) => {{
-        try {{
-          const payload = JSON.parse(event.data);
-          if (payload?.task_id) {{
-            await refreshTask(payload.task_id);
-          }}
-        }} catch (err) {{
-          console.error("task ws parse error", err);
-        }}
-      }};
-      socket.onclose = () => {{
-        delete state.sockets[taskId];
-      }};
-      socket.onerror = () => {{
-        delete state.sockets[taskId];
-      }};
-      state.sockets[taskId] = socket;
-    }}
-
-    function syncSockets() {{
-      const keep = new Set(state.tasks.slice(0, 20).map((task) => task.task_id));
-      Object.keys(state.sockets).forEach((taskId) => {{
-        if (!keep.has(taskId)) closeSocket(taskId);
-      }});
-      keep.forEach((taskId) => openSocket(taskId));
-    }}
-
-    async function approveTask(taskId) {{
-      await fetchJson(`/tasks/${{encodeURIComponent(taskId)}}/approve`, {{
-        method: "POST",
-        body: JSON.stringify({{ actor: "browser_reviewer" }})
-      }});
-      await refreshTask(taskId);
-    }}
-
-    async function rejectTask(taskId) {{
-      const reason = prompt("璇疯緭鍏ラ┏鍥炲師鍥?, "contains sensitive outbound data");
-      if (reason === null) return;
-      await fetchJson(`/tasks/${{encodeURIComponent(taskId)}}/reject`, {{
-        method: "POST",
-        body: JSON.stringify({{ actor: "browser_reviewer", reason }})
-      }});
-      await refreshTask(taskId);
-    }}
-
-    function render() {{
-      const selected = getSelectedTask();
-      if (selected && state.selectedTaskId !== selected.task_id) {{
-        state.selectedTaskId = selected.task_id;
-      }}
-      const tasks = filterTasks();
-      const selectedEvents = (selected?.audit_events || []).slice(-8).reverse();
-      root.innerHTML = `
-        <style>
-          .task-root {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            color: #0f172a;
-          }}
-          .task-toolbar {{
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 8px;
-            margin-bottom: 10px;
-          }}
-          .task-chip {{
-            border: 1px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 10px 8px;
-            background: #fff;
-            text-align: center;
-          }}
-          .task-chip strong {{
-            display: block;
-            font-size: 0.95rem;
-          }}
-          .task-filters {{
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            margin-bottom: 12px;
-          }}
-          .task-filter {{
-            border: 1px solid #cbd5e1;
-            background: #fff;
-            color: #334155;
-            border-radius: 999px;
-            padding: 6px 10px;
-            cursor: pointer;
-            font-size: 0.78rem;
-          }}
-          .task-filter.active {{
-            background: linear-gradient(135deg, #dc2626, #f59e0b);
-            color: #fff;
-            border-color: transparent;
-          }}
-          .task-list {{
-            display: grid;
-            gap: 10px;
-            max-height: 280px;
-            overflow: auto;
-            margin-bottom: 12px;
-          }}
-          .task-card {{
-            border: 1px solid #e2e8f0;
-            border-radius: 14px;
-            background: #fff;
-            padding: 10px;
-            cursor: pointer;
-            box-shadow: 0 8px 16px rgba(15, 23, 42, 0.05);
-          }}
-          .task-card.active {{
-            border-color: #f97316;
-            box-shadow: 0 10px 22px rgba(249, 115, 22, 0.16);
-          }}
-          .task-card-header {{
-            display: flex;
-            justify-content: space-between;
-            gap: 10px;
-            align-items: center;
-            margin-bottom: 6px;
-          }}
-          .task-status {{
-            font-size: 0.75rem;
-            border-radius: 999px;
-            padding: 4px 8px;
-            color: #fff;
-            background: #475569;
-            white-space: nowrap;
-          }}
-          .task-status.pending_approval {{ background: #dc2626; }}
-          .task-status.processing, .task-status.sending {{ background: #2563eb; }}
-          .task-status.sent {{ background: #16a34a; }}
-          .task-status.send_failed, .task-status.failed {{ background: #7f1d1d; }}
-          .task-status.approved, .task-status.queued_for_send {{ background: #7c3aed; }}
-          .task-status.rejected {{ background: #475569; }}
-          .task-meta {{
-            color: #64748b;
-            font-size: 0.76rem;
-            line-height: 1.45;
-          }}
-          .task-detail {{
-            border: 1px solid #e2e8f0;
-            border-radius: 16px;
-            background: #fff;
-            padding: 12px;
-          }}
-          .task-detail h4 {{
-            margin: 0 0 10px 0;
-            font-size: 0.98rem;
-          }}
-          .task-detail pre {{
-            white-space: pre-wrap;
-            word-break: break-word;
-            background: #f8fafc;
-            border-radius: 12px;
-            padding: 10px;
-            font-size: 0.77rem;
-            border: 1px solid #e2e8f0;
-          }}
-          .task-actions {{
-            display: flex;
-            gap: 8px;
-            margin-top: 10px;
-          }}
-          .task-actions button {{
-            flex: 1;
-            border: none;
-            border-radius: 10px;
-            padding: 10px 12px;
-            cursor: pointer;
-            font-weight: 600;
-          }}
-          .approve-btn {{ background: #16a34a; color: #fff; }}
-          .reject-btn {{ background: #dc2626; color: #fff; }}
-          .detail-grid {{
-            display: grid;
-            gap: 8px;
-            margin-bottom: 10px;
-            font-size: 0.8rem;
-          }}
-          .detail-label {{ color: #64748b; }}
-          .event-list {{
-            display: grid;
-            gap: 8px;
-            margin-top: 12px;
-          }}
-          .event-item {{
-            border-left: 3px solid #f97316;
-            background: #fff7ed;
-            padding: 8px 10px;
-            border-radius: 8px;
-            font-size: 0.76rem;
-          }}
-          .task-empty {{
-            border: 1px dashed #cbd5e1;
-            border-radius: 14px;
-            padding: 16px;
-            color: #64748b;
-            text-align: center;
-            background: #f8fafc;
-          }}
-        </style>
-        <div class="task-root">
-          <div class="task-toolbar">
-            <div class="task-chip"><strong>${{count("pending_approval")}}</strong><span>寰呭鎵?/span></div>
-            <div class="task-chip"><strong>${{count("processing") + count("queued") + count("queued_for_send") + count("sending")}}</strong><span>澶勭悊涓?/span></div>
-            <div class="task-chip"><strong>${{count("send_failed")}}</strong><span>鍙戦€佸け璐?/span></div>
-          </div>
-          <div class="task-filters">
-            ${["all", "pending_approval", "processing", "send_failed", "sent"].map((key) => `
-              <button class="task-filter ${{state.filter === key ? "active" : ""}}" data-filter="${{key}}">
-                ${{key === "all" ? "鍏ㄩ儴" : taskStatusLabel(key)}}
-              </button>
-            `).join("")}
-          </div>
-          <div class="task-list">
-            ${tasks.length ? tasks.map((task) => `
-              <div class="task-card ${{state.selectedTaskId === task.task_id ? "active" : ""}}" data-task-id="${{task.task_id}}">
-                <div class="task-card-header">
-                  <strong>${{escapeHtml(task.task_id)}}</strong>
-                  <span class="task-status ${{escapeHtml(task.status)}}">${{escapeHtml(taskStatusLabel(task.status))}}</span>
-                </div>
-                <div class="task-meta">
-                  risk: ${{escapeHtml(task.risk_level || "-")}}<br/>
-                  to: ${{escapeHtml(task.destination_email || cfg.defaultEmail)}}<br/>
-                  file: ${{escapeHtml(task.source_filename || "text")}}
-                </div>
-              </div>
-            `).join("") : `<div class="task-empty">鏆傛棤浠诲姟锛屽垱寤哄鍙戜换鍔″悗浼氳嚜鍔ㄥ嚭鐜板湪杩欓噷銆?/div>`}
-          </div>
-          <div class="task-detail">
-            ${selected ? `
-              <h4>浠诲姟璇︽儏</h4>
-              <div class="detail-grid">
-                <div><span class="detail-label">task_id:</span> ${{escapeHtml(selected.task_id)}}</div>
-                <div><span class="detail-label">status:</span> ${{escapeHtml(taskStatusLabel(selected.status))}}</div>
-                <div><span class="detail-label">risk:</span> ${{escapeHtml(selected.risk_level || "-")}}</div>
-                <div><span class="detail-label">delivery:</span> ${{escapeHtml(selected.delivery_status || "not_sent")}}</div>
-              </div>
-              <div class="detail-label">鑴辨晱棰勮</div>
-              <pre>${{escapeHtml(selected.message_redacted || selected.message_raw || "")}}</pre>
-              <div class="detail-label">鎽樿鑽夌</div>
-              <pre>${{escapeHtml(selected.draft_summary || "")}}</pre>
-              ${selected.delivery_result ? `<div class="detail-label">鍙戦€佺粨鏋?/div><pre>${{escapeHtml(selected.delivery_result)}}</pre>` : ""}
-              ${selected.delivery_error ? `<div class="detail-label">閿欒</div><pre>${{escapeHtml(selected.delivery_error)}}</pre>` : ""}
-              ${selected.status === "pending_approval" ? `
-                <div class="task-actions">
-                  <button class="approve-btn" data-action="approve" data-task-id="${{selected.task_id}}">鎵瑰噯骞剁湡瀹炲彂閫?/button>
-                  <button class="reject-btn" data-action="reject" data-task-id="${{selected.task_id}}">椹冲洖骞剁粓姝?/button>
-                </div>
-              ` : ""}
-              <div class="detail-label" style="margin-top:12px;">鏈€杩戜簨浠?/div>
-              <div class="event-list">
-                ${selectedEvents.map((event) => `
-                  <div class="event-item">
-                    <strong>${{escapeHtml(event.event_type)}}</strong><br/>
-                    <span>${{escapeHtml(event.details_json?.message || "")}}</span><br/>
-                    <span style="color:#64748b;">${{escapeHtml(event.created_at || "")}}</span>
-                  </div>
-                `).join("")}
-              </div>
-            ` : `<div class="task-empty">璇烽€夋嫨涓€涓换鍔℃煡鐪嬭鎯呫€?/div>`}
-          </div>
-        </div>
-      `;
-
-      root.querySelectorAll("[data-filter]").forEach((button) => {{
-        button.addEventListener("click", () => {{
-          state.filter = button.getAttribute("data-filter");
-          render();
-        }});
-      }});
-      root.querySelectorAll("[data-task-id]").forEach((card) => {{
-        if (card.getAttribute("data-action")) return;
-        card.addEventListener("click", () => {{
-          state.selectedTaskId = card.getAttribute("data-task-id");
-          render();
-        }});
-      }});
-      root.querySelectorAll("[data-action='approve']").forEach((button) => {{
-        button.addEventListener("click", async () => {{
-          button.disabled = true;
-          try {{
-            await approveTask(button.getAttribute("data-task-id"));
-          }} catch (err) {{
-            alert(`鎵瑰噯澶辫触: ${{err.message}}`);
-          }} finally {{
-            button.disabled = false;
-          }}
-        }});
-      }});
-      root.querySelectorAll("[data-action='reject']").forEach((button) => {{
-        button.addEventListener("click", async () => {{
-          button.disabled = true;
-          try {{
-            await rejectTask(button.getAttribute("data-task-id"));
-          }} catch (err) {{
-            alert(`椹冲洖澶辫触: ${{err.message}}`);
-          }} finally {{
-            button.disabled = false;
-          }}
-        }});
-      }});
-    }}
-
-    async function init() {{
-      await loadTasks();
-      if (state.refreshTimer) clearInterval(state.refreshTimer);
-      state.refreshTimer = setInterval(loadTasks, 5000);
-    }}
-
-    init().catch((err) => {{
-      root.innerHTML = `<div style="padding:12px;border:1px solid #fecaca;background:#fff1f2;border-radius:12px;color:#9f1239;">浠诲姟鍙板垵濮嬪寲澶辫触: ${{escapeHtml(err.message)}}</div>`;
-    }});
-    </script>
-    """
-    component_html = component_html.replace("__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
-    components.html(component_html, height=height, scrolling=True)
 
 
 def render_realtime_task_panel_v2(
@@ -925,7 +388,7 @@ def render_realtime_task_panel_v2(
     }
 
     function taskDetailHint(status) {
-      if (status === "pending_approval") return "下一步：审批或驳回";
+      if (status === "pending_approval") return "下一步：等待治理台审核，用户侧只显示进度。";
       if (status === "needs_clarification" || status === "input_invalid") return "下一步：补充信息并恢复任务";
       if (status === "send_failed" || status === "delivery_deferred") return "下一步：查看错误并决定是否重试或人工接管";
       return "下一步：查看任务进展";
@@ -1117,24 +580,6 @@ def render_realtime_task_panel_v2(
       keep.forEach((taskId) => openSocket(taskId));
     }
 
-    async function approveTask(taskId) {
-      await fetchJson(`/tasks/${encodeURIComponent(taskId)}/approve`, {
-        method: "POST",
-        body: JSON.stringify({ actor: "browser_reviewer" })
-      });
-      await refreshTask(taskId);
-    }
-
-    async function rejectTask(taskId) {
-      const reason = prompt("请输入驳回原因", "contains sensitive outbound data");
-      if (reason === null) return;
-      await fetchJson(`/tasks/${encodeURIComponent(taskId)}/reject`, {
-        method: "POST",
-        body: JSON.stringify({ actor: "browser_reviewer", reason })
-      });
-      await refreshTask(taskId);
-    }
-
     async function supplementTask(taskId) {
       const emailNode = root.querySelector(`[data-supplement-email='${CSS.escape(taskId)}']`);
       const textNode = root.querySelector(`[data-supplement-text='${CSS.escape(taskId)}']`);
@@ -1222,8 +667,6 @@ def render_realtime_task_panel_v2(
           .task-detail pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border-radius: 12px; padding: 10px; font-size: 0.77rem; border: 1px solid #e2e8f0; }
           .task-actions { display: flex; gap: 8px; margin-top: 10px; }
           .task-actions button { flex: 1; border: none; border-radius: 10px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
-          .approve-btn { background: #16a34a; color: #fff; }
-          .reject-btn { background: #dc2626; color: #fff; }
           .secondary-btn { background: #e2e8f0; color: #0f172a; }
           .detail-grid { display: grid; gap: 8px; margin-bottom: 10px; font-size: 0.8rem; }
           .detail-label { color: #64748b; }
@@ -1237,7 +680,7 @@ def render_realtime_task_panel_v2(
         </style>
         <div class="task-root">
           <div class="task-toolbar">
-            <div class="task-chip" data-filter="pending_approval"><strong>${count("pending_approval")}</strong><small>待审批</small></div>
+            <div class="task-chip" data-filter="pending_approval"><strong>${count("pending_approval")}</strong><small>待治理</small></div>
             <div class="task-chip" data-filter="send_failed"><strong>${count("send_failed")}</strong><small>发送失败</small></div>
             <div class="task-chip" data-filter="all"><strong>${state.tasks.length}</strong><small>全部任务</small></div>
           </div>
@@ -1291,10 +734,7 @@ def render_realtime_task_panel_v2(
                 </div>
               ` : ""}
               ${selected.status === "pending_approval" ? `
-                <div class="task-actions">
-                  <button class="approve-btn" data-action="approve" data-task-id="${escapeAttr(selected.task_id)}">批准并真实发送</button>
-                  <button class="reject-btn" data-action="reject" data-task-id="${escapeAttr(selected.task_id)}">驳回并终止</button>
-                </div>
+                <div class="task-empty">该任务需要治理台审核。请在 8512 查看审批、驳回和审计详情；8511 仅展示用户侧进度。</div>
               ` : ""}
               <div class="detail-label" style="margin-top:12px;">最近事件</div>
               <div class="event-list">
@@ -1323,30 +763,6 @@ def render_realtime_task_panel_v2(
         card.addEventListener("click", () => {
           state.selectedTaskId = card.getAttribute("data-task-id");
           render();
-        });
-      });
-      root.querySelectorAll("[data-action='approve']").forEach((button) => {
-        button.addEventListener("click", async () => {
-          button.disabled = true;
-          try {
-            await approveTask(button.getAttribute("data-task-id"));
-          } catch (err) {
-            alert(`批准失败: ${err.message}`);
-          } finally {
-            button.disabled = false;
-          }
-        });
-      });
-      root.querySelectorAll("[data-action='reject']").forEach((button) => {
-        button.addEventListener("click", async () => {
-          button.disabled = true;
-          try {
-            await rejectTask(button.getAttribute("data-task-id"));
-          } catch (err) {
-            alert(`驳回失败: ${err.message}`);
-          } finally {
-            button.disabled = false;
-          }
         });
       });
       root.querySelectorAll("[data-action='supplement']").forEach((button) => {
@@ -1399,43 +815,6 @@ def render_realtime_task_panel_v2(
     """
     component_html = component_html.replace("__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
     components.html(component_html, height=height, scrolling=True)
-
-def render_legacy_task_inspector(workflows: list[dict]) -> None:
-    if not workflows:
-        st.caption("暂无任务可供调试查看。")
-        return
-
-    workflow_labels = [
-        f"{item['status']} | {item.get('risk_level', '')} | {item.get('destination_email') or '未填写'} | {item.get('source_filename') or 'text'} | {item['task_id']}"
-        for item in workflows[:30]
-    ]
-    workflow_map = {label: workflows[index] for index, label in enumerate(workflow_labels)}
-    selected_workflow_label = st.selectbox("任务调试选择", workflow_labels, key="legacy_task_inspector_select")
-    selected_workflow = workflow_map[selected_workflow_label]
-    st.write(f"status: `{selected_workflow['status']}`")
-    st.write(f"risk: `{selected_workflow['risk_level']}`")
-    st.write(f"destination: `{selected_workflow.get('destination_email') or '未填写'}`")
-    st.write(f"delivery: `{selected_workflow.get('delivery_status', 'not_sent')}`")
-    st.json(
-        {
-            "task_id": selected_workflow.get("task_id"),
-            "status_path": selected_workflow.get("status_path", []),
-            "scenario_evaluation": selected_workflow.get("scenario_evaluation", {}),
-            "entry_governance": {
-                "entry_issue_type": selected_workflow.get("entry_issue_type", ""),
-                "missing_fields": selected_workflow.get("missing_fields", []),
-                "clarification_question": selected_workflow.get("clarification_question", ""),
-            },
-            "governance": {
-                "degradation_mode": selected_workflow.get("degradation_mode", ""),
-                "fallback_reason": selected_workflow.get("fallback_reason", ""),
-                "last_error_category": selected_workflow.get("last_error_category", ""),
-                "retrieval_status": selected_workflow.get("retrieval_status", ""),
-                "summary_status": selected_workflow.get("summary_status", ""),
-            },
-            "audit_events": selected_workflow.get("audit_events", []),
-        }
-    )
 
 
 if "session_id" not in st.session_state:
@@ -1563,13 +942,13 @@ with st.sidebar:
         with st.expander("合并来源", expanded=False):
             st.json(merge_summary)
 
-    gradient_header("安全外发治理台", "dlp-gradient")
-    workflows = sorted(list_sensitive_workflows(st.session_state.session_id), key=workflow_sort_key)
-    pending_count = len([item for item in workflows if item.get("status") == "pending_approval"])
-    failed_count = len([item for item in workflows if item.get("status") == "send_failed"])
+    gradient_header("外发任务进度", "dlp-gradient")
+    tasks = sorted(list_dlp_tasks(st.session_state.session_id), key=task_sort_key)
+    pending_count = len([item for item in tasks if item.get("status") == "pending_approval"])
+    failed_count = len([item for item in tasks if item.get("status") == "send_failed"])
     count_cols = st.columns(3)
     with count_cols[0]:
-        if st.button(f"待审批: {pending_count}", key="task_panel_filter_pending", use_container_width=True):
+        if st.button(f"待治理: {pending_count}", key="task_panel_filter_pending", use_container_width=True):
             apply_task_panel_filter("pending_approval")
             st.rerun()
     with count_cols[1]:
@@ -1577,12 +956,12 @@ with st.sidebar:
             apply_task_panel_filter("send_failed")
             st.rerun()
     with count_cols[2]:
-        if st.button(f"全部任务: {len(workflows)}", key="task_panel_filter_all", use_container_width=True):
+        if st.button(f"全部任务: {len(tasks)}", key="task_panel_filter_all", use_container_width=True):
             apply_task_panel_filter("all")
             st.rerun()
-    st.caption(f"待审批: {pending_count} / 发送失败: {failed_count} / 全部任务: {len(workflows)}")
+    st.caption(f"待治理: {pending_count} / 发送失败: {failed_count} / 全部任务: {len(tasks)}")
 
-    st.caption("实时任务台会持续刷新外发治理状态，并支持审批、驳回和补充恢复。")
+    st.caption("8511 只展示用户侧任务进度和补充恢复；高风险审批、驳回、DLQ 重放和审计请打开 8512 治理台。")
     render_realtime_task_panel_v2(
         st.session_state.session_id,
         st.session_state.current_conversation_id,
@@ -1603,13 +982,6 @@ with st.sidebar:
         "自动折叠长回复",
         value=st.session_state.auto_collapse_answers,
     )
-    force_ingest = st.checkbox("强制重建/补写语料", value=False)
-    if st.button("初始化统一 RAG 语料"):
-        try:
-            st.success(trigger_ingest(force_ingest))
-            st.cache_data.clear()
-        except Exception as exc:
-            st.error(f"初始化失败: {exc}")
     st.markdown(f"- API: `{EXTERNAL_API_URL}`\n- Prometheus: `{EXTERNAL_PROMETHEUS_URL}`")
 
 
@@ -1692,9 +1064,9 @@ with left:
                     st.error(f"请求失败: {exc}")
 
 with right:
-    st.subheader("调试面板")
-    with st.expander("邮件早报 / 收件状态（调试）", expanded=False):
-        st.caption("只读企业邮箱 IMAP 收件能力。这里仅用于手动同步和查看 notification outbox，不做强提醒弹窗。")
+    st.subheader("用户工作台")
+    with st.expander("邮件早报 / 收件状态", expanded=False):
+        st.caption("只读企业邮箱 IMAP 收件能力。同步和早报生成属于用户工作台动作，不包含治理审批。")
         mail_cols = st.columns(2)
         with mail_cols[0]:
             if st.button("同步收件箱", use_container_width=True):
@@ -1743,63 +1115,21 @@ with right:
                         st.markdown(f"- `{item.get('event_type')}` {item.get('title')} ({item.get('status')})")
         except Exception as exc:
             st.info(f"邮件状态暂不可用: {exc}")
-    with st.expander("任务调试视图", expanded=False):
-        render_legacy_task_inspector(workflows)
-    debug = st.session_state.last_debug
+
+    st.subheader("本轮状态")
+    debug = st.session_state.last_debug or {}
     if not debug:
-        st.caption("发起一次对话、合并或 DLP 任务后，这里会显示路由、工具、RAG 证据、任务和记忆命中。")
-    elif "merge_result" in debug:
-        st.metric("Merged", debug["merge_result"]["merged_conversation_id"])
-        st.metric("Source conversations", len(debug["merge_result"]["source_conversations"]))
-        st.metric("Source turns", len(debug["merge_result"]["source_turn_ids"]))
-        with st.expander("合并结果", expanded=True):
-            st.json(debug["merge_result"])
-    elif "workflow_result" in debug:
-        workflow_result = debug["workflow_result"]
-        st.metric("Task", workflow_result["task_id"])
-        st.metric("Status", workflow_result["status"])
-        st.metric("Risk", workflow_result["risk_level"])
-        st.metric("Delivery", workflow_result.get("delivery_status", "not_sent"))
-        with st.expander("Workflow result", expanded=True):
-            st.json(workflow_result)
+        st.caption("发起一次对话后，这里会显示用户侧状态摘要。完整治理、DLQ、Provider、Queue 与诊断请打开 8512。")
     else:
-        st.metric("Intent", debug.get("intent", "unknown"))
-        st.metric("Route", debug.get("routing_source", "unknown"))
-        st.metric("Memory", debug.get("memory_hits", 0))
-        st.metric("Merged Memory", debug.get("merged_memory_hits", 0))
-        st.metric("Latency", f"{debug.get('latency_ms', 0):.0f} ms")
-        st.metric("Input Tokens", int(debug.get("token_in", 0) or 0))
-        st.metric("Output Tokens", int(debug.get("token_out", 0) or 0))
-        st.metric("Cost", f"{float(debug.get('estimated_cost', 0.0) or 0.0):.4f}")
+        st.metric("Route", debug.get("routing_source", debug.get("intent", "unknown")))
         if debug.get("task_id"):
             st.metric("Task", debug["task_id"])
             st.metric("Task Status", debug.get("task_status", ""))
             st.metric("Delivery", debug.get("delivery_status", ""))
+            if debug.get("task_status") == "pending_approval":
+                st.info("该任务正在等待治理台审核。8511 不提供高风险审批按钮。")
             if debug.get("delivery_error"):
                 st.error(debug["delivery_error"])
-        if show_steps:
-            with st.expander("Tool Calls", expanded=True):
-                st.json(debug.get("tool_calls", []))
-            with st.expander("Unified RAG Evidence", expanded=False):
-                st.json(debug.get("retrieved_evidence", []))
-            with st.expander("Privacy / Workflow", expanded=False):
-                st.json(
-                    {
-                        "privacy": debug.get("privacy", {}),
-                        "task_id": debug.get("task_id"),
-                        "task_status": debug.get("task_status"),
-                        "task_risk_level": debug.get("task_risk_level"),
-                        "delivery_status": debug.get("delivery_status"),
-                        "delivery_result": debug.get("delivery_result"),
-                        "delivery_error": debug.get("delivery_error"),
-                    }
-                )
-            with st.expander("Memory Context", expanded=False):
-                st.json(
-                    {
-                        "memory_context": debug.get("memory_context", {}),
-                        "upload_context": debug.get("upload_context", {}),
-                    }
-                )
-
+        if debug.get("latency_ms"):
+            st.caption(f"本轮响应耗时约 {debug.get('latency_ms'):.0f} ms。成本、token 和原始 trace 已迁移到 8512 治理台/Prometheus。")
 

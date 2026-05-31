@@ -44,6 +44,9 @@ def _decode_message(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     item = dict(row)
     item["is_seen"] = bool(item.get("is_seen"))
+    item["labels"] = _decode_json(item.get("labels_json"), [])
+    item["attachments"] = _decode_json(item.get("attachments_json"), [])
+    item["headers_json"] = _decode_json(item.get("headers_json"), {})
     return item
 
 
@@ -70,12 +73,20 @@ def init_inbound_mail_store() -> None:
                     message_id TEXT PRIMARY KEY,
                     mailbox TEXT NOT NULL DEFAULT 'INBOX',
                     uid TEXT NOT NULL DEFAULT '',
+                    thread_id TEXT NOT NULL DEFAULT '',
+                    provider_thread_id TEXT NOT NULL DEFAULT '',
                     sender TEXT NOT NULL DEFAULT '',
                     recipients TEXT NOT NULL DEFAULT '',
                     subject TEXT NOT NULL DEFAULT '',
                     received_at TEXT NOT NULL DEFAULT '',
                     snippet TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
+                    body_text TEXT NOT NULL DEFAULT '',
+                    body_html_sanitized TEXT NOT NULL DEFAULT '',
+                    body_preview TEXT NOT NULL DEFAULT '',
+                    labels_json TEXT NOT NULL DEFAULT '[]',
+                    attachments_json TEXT NOT NULL DEFAULT '[]',
+                    headers_json TEXT NOT NULL DEFAULT '{}',
                     risk_hint TEXT NOT NULL DEFAULT '',
                     raw_size INTEGER NOT NULL DEFAULT 0,
                     is_seen BOOLEAN NOT NULL DEFAULT FALSE,
@@ -110,6 +121,28 @@ def init_inbound_mail_store() -> None:
                     ON notification_outbox(event_type, created_at);
                 """
             )
+            existing_columns = {
+                row["column_name"]
+                for row in conn.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'inbound_mail_messages'
+                    """
+                ).fetchall()
+            }
+            for column_name, column_sql in [
+                ("thread_id", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_thread_id", "TEXT NOT NULL DEFAULT ''"),
+                ("body_text", "TEXT NOT NULL DEFAULT ''"),
+                ("body_html_sanitized", "TEXT NOT NULL DEFAULT ''"),
+                ("body_preview", "TEXT NOT NULL DEFAULT ''"),
+                ("labels_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("attachments_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("headers_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ]:
+                if column_name not in existing_columns:
+                    conn.execute(f"ALTER TABLE inbound_mail_messages ADD COLUMN {column_name} {column_sql}")
             conn.commit()
         _INITIALIZED = True
 
@@ -121,22 +154,34 @@ def upsert_inbound_message(message: dict[str, Any]) -> bool:
         row = conn.execute(
             """
             INSERT INTO inbound_mail_messages (
-                message_id, mailbox, uid, sender, recipients, subject, received_at,
-                snippet, summary, risk_hint, raw_size, is_seen, created_at, updated_at
+                message_id, mailbox, uid, thread_id, provider_thread_id, sender, recipients,
+                subject, received_at, snippet, summary, body_text, body_html_sanitized,
+                body_preview, labels_json, attachments_json, headers_json, risk_hint,
+                raw_size, is_seen, created_at, updated_at
             ) VALUES (
-                %(message_id)s, %(mailbox)s, %(uid)s, %(sender)s, %(recipients)s,
-                %(subject)s, %(received_at)s, %(snippet)s, %(summary)s,
-                %(risk_hint)s, %(raw_size)s, %(is_seen)s, %(created_at)s, %(updated_at)s
+                %(message_id)s, %(mailbox)s, %(uid)s, %(thread_id)s, %(provider_thread_id)s,
+                %(sender)s, %(recipients)s, %(subject)s, %(received_at)s, %(snippet)s,
+                %(summary)s, %(body_text)s, %(body_html_sanitized)s, %(body_preview)s,
+                %(labels_json)s, %(attachments_json)s, %(headers_json)s, %(risk_hint)s,
+                %(raw_size)s, %(is_seen)s, %(created_at)s, %(updated_at)s
             )
             ON CONFLICT (message_id) DO UPDATE SET
                 mailbox = EXCLUDED.mailbox,
                 uid = EXCLUDED.uid,
+                thread_id = EXCLUDED.thread_id,
+                provider_thread_id = EXCLUDED.provider_thread_id,
                 sender = EXCLUDED.sender,
                 recipients = EXCLUDED.recipients,
                 subject = EXCLUDED.subject,
                 received_at = EXCLUDED.received_at,
                 snippet = EXCLUDED.snippet,
                 summary = EXCLUDED.summary,
+                body_text = EXCLUDED.body_text,
+                body_html_sanitized = EXCLUDED.body_html_sanitized,
+                body_preview = EXCLUDED.body_preview,
+                labels_json = EXCLUDED.labels_json,
+                attachments_json = EXCLUDED.attachments_json,
+                headers_json = EXCLUDED.headers_json,
                 risk_hint = EXCLUDED.risk_hint,
                 raw_size = EXCLUDED.raw_size,
                 is_seen = EXCLUDED.is_seen,
@@ -147,12 +192,20 @@ def upsert_inbound_message(message: dict[str, Any]) -> bool:
                 "message_id": message["message_id"],
                 "mailbox": message.get("mailbox", "INBOX"),
                 "uid": message.get("uid", ""),
+                "thread_id": message.get("thread_id", ""),
+                "provider_thread_id": message.get("provider_thread_id", ""),
                 "sender": message.get("sender", ""),
                 "recipients": message.get("recipients", ""),
                 "subject": message.get("subject", ""),
                 "received_at": message.get("received_at", ""),
                 "snippet": message.get("snippet", ""),
                 "summary": message.get("summary", ""),
+                "body_text": message.get("body_text", ""),
+                "body_html_sanitized": message.get("body_html_sanitized", ""),
+                "body_preview": message.get("body_preview", ""),
+                "labels_json": json.dumps(message.get("labels", []), ensure_ascii=False),
+                "attachments_json": json.dumps(message.get("attachments", []), ensure_ascii=False),
+                "headers_json": json.dumps(message.get("headers_json", {}), ensure_ascii=False),
                 "risk_hint": message.get("risk_hint", ""),
                 "raw_size": int(message.get("raw_size", 0) or 0),
                 "is_seen": bool(message.get("is_seen", False)),

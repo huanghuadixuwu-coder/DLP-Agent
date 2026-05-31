@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 import time
 from typing import Any
 
@@ -10,13 +12,13 @@ from app.dlp_runtime import max_risk_level, model_summary_and_risk, retrieve_dlp
 from app.dlp_scenarios import normalize_fault_injection
 from app.inbound_mail import generate_daily_mail_digest, sync_inbound_mail
 from app.mcp_client import call_mcp_tool
-from app.metrics import record_fault_injection, record_task_degradation, record_task_retry
+from app.metrics import record_fault_injection, record_mail_dlq_created, record_task_degradation, record_task_retry
 from app.orchestration.observations import make_typed_observation
 from app.privacy_lab import scan_sensitive_message
 from app.resilience import make_failure_observation
 from app.task_events import build_task_event, publish_task_event
 from app.task_queue import celery_app, enqueue_email_send_task
-from app.task_store import add_task_event, get_dlp_task, set_task_status, update_task
+from app.task_store import add_task_event, create_mail_dlq_entry, get_dlp_task, set_task_status, update_task
 from app.upload_blob_store import load_upload_blob
 from app.orchestration.tool_discovery import dispatch_tool_call
 from app.orchestration.types import OrchestrationContext
@@ -24,6 +26,60 @@ from app.orchestration.types import OrchestrationContext
 
 TEMPORARY_PROVIDER_TOKENS = ("timeout", "timed out", "tempor", "refused", "unavailable", "reset", "limit", "quota", "429")
 PERMANENT_PROVIDER_TOKENS = ("auth", "credential", "password", "invalid recipient", "mailbox unavailable", "550", "553", "format")
+
+
+def _actor_context_from_task(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tenant_id": str(task.get("tenant_id") or ""),
+        "user_id": str(task.get("user_id") or ""),
+        "workspace_id": str(task.get("workspace_id") or ""),
+        "session_id": str(task.get("session_id") or ""),
+        "conversation_id": str(task.get("conversation_id") or ""),
+    }
+
+
+def _payload_digest_for_task(task: dict[str, Any], *, operation: str) -> str:
+    payload = {
+        "operation": operation,
+        "task_id": str(task.get("task_id") or ""),
+        "idempotency_key": str(task.get("idempotency_key") or ""),
+        "destination_email": str(task.get("destination_email") or ""),
+        "delivery_subject": str(task.get("delivery_subject") or ""),
+        "delivery_body": str(task.get("delivery_body") or ""),
+        "mail_draft_id": str(task.get("mail_draft_id") or ""),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _create_mail_dlq_for_task(
+    task: dict[str, Any],
+    *,
+    operation: str,
+    error: str,
+    attempt_count: int,
+    safe_replay_allowed: bool,
+    recovery_hint: str,
+) -> dict[str, Any]:
+    entry = create_mail_dlq_entry(
+        task_id=str(task["task_id"]),
+        operation=operation,
+        payload_digest=_payload_digest_for_task(task, operation=operation),
+        last_error=error,
+        attempt_count=attempt_count,
+        safe_replay_allowed=safe_replay_allowed,
+        recovery_hint=recovery_hint,
+        actor_context=_actor_context_from_task(task),
+        payload_snapshot={
+            "task_type": str(task.get("task_type") or ""),
+            "status": str(task.get("status") or ""),
+            "delivery_status": str(task.get("delivery_status") or ""),
+            "destination_email": str(task.get("destination_email") or ""),
+            "mail_draft_id": str(task.get("mail_draft_id") or ""),
+            "idempotency_key": str(task.get("idempotency_key") or ""),
+        },
+    )
+    record_mail_dlq_created(operation, safe_replay_allowed)
+    return entry
 
 
 def _looks_like_instruction_only(text: str) -> bool:
@@ -216,6 +272,27 @@ def _finalize_worker_failure(task: dict[str, Any], exc: Exception) -> dict[str, 
             details={"error": error, "worker_failure": True},
         )
         if task:
+            dlq = _create_mail_dlq_for_task(
+                task,
+                operation="send_email_smtp",
+                error=error,
+                attempt_count=0,
+                safe_replay_allowed=category == "provider_temporary",
+                recovery_hint=(
+                    "retry_send_with_same_idempotency_key"
+                    if category == "provider_temporary"
+                    else "manual_handover_or_repair_configuration"
+                ),
+            )
+            task = update_task(
+                task_id,
+                status="dead_letter",
+                delivery_status="dead_letter",
+                domain_result={
+                    **dict(task.get("domain_result") or {}),
+                    "dlq_entry": dlq,
+                },
+            ) or task
             _publish_snapshot(task, "send_failed", "Outbound email failed after worker retries were exhausted.")
         return task
 
@@ -613,6 +690,64 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
             _publish_snapshot(task, "send_failed", "Outbound email failed to send.")
         return {"ok": False, "status": "send_failed", "error": error}
 
+    if fault_injection.get("force_smtp_uncertain"):
+        record_fault_injection("force_smtp_uncertain")
+        error = "Injected SMTP uncertain result after provider accepted payload."
+        failure_observation = make_failure_observation(
+            service="smtp",
+            operation="send_email_smtp",
+            error=error,
+            fallback_strategy="mark_delivery_uncertain_and_require_manual_verification",
+            retry_count=int(self.request.retries or 0),
+            actor_context=_actor_context_from_task(task),
+            severity="high",
+        )
+        task = set_task_status(
+            task_id,
+            "delivery_uncertain",
+            actor="worker",
+            event_type="delivery_uncertain",
+            event_message="SMTP provider result is uncertain; automatic replay is blocked.",
+            extra_updates={
+                "delivery_status": "delivery_uncertain",
+                "delivery_result": "",
+                "delivery_error": error,
+                "smtp_provider": "smtp_injected",
+                "final_result": "Email delivery result is uncertain and requires manual verification before replay.",
+                "last_error_category": "provider_uncertain",
+                "manual_handover_required": True,
+                "next_recommended_action": "Check provider outbox/logs before any replay; do not resend automatically.",
+                "domain_result": {
+                    "ok": False,
+                    "error": error,
+                    "uncertain": True,
+                    "failure_observation": failure_observation,
+                    "recovery_observation": failure_observation,
+                },
+            },
+            details={"error": error, "injected": True, "uncertain": True, "recovery_observation": failure_observation},
+        )
+        if task:
+            dlq = _create_mail_dlq_for_task(
+                task,
+                operation="send_email_smtp",
+                error=error,
+                attempt_count=int(self.request.retries or 0),
+                safe_replay_allowed=False,
+                recovery_hint="manual_verify_provider_outbox_before_replay",
+            )
+            task = update_task(
+                task_id,
+                status="dead_letter",
+                delivery_status="delivery_uncertain",
+                domain_result={
+                    **dict(task.get("domain_result") or {}),
+                    "dlq_entry": dlq,
+                },
+            ) or task
+            _publish_snapshot(task, "delivery_uncertain", "SMTP provider result is uncertain; automatic replay is blocked.")
+        return {"ok": False, "status": "delivery_uncertain", "error": error}
+
     try:
         tool_result = call_mcp_tool(
             "send_email_smtp",
@@ -690,6 +825,7 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
 
     payload = tool_result.get("result") if tool_result.get("ok") else {"ok": False, "error": tool_result.get("error", "")}
     success = bool(payload.get("ok"))
+    uncertain_result = bool(payload.get("uncertain") or payload.get("status") == "delivery_uncertain")
     provider = str(payload.get("provider") or "smtp")
     sent_at = str(payload.get("sent_at") or "")
     error = str(payload.get("error") or "")
@@ -701,7 +837,7 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
         else f"Redacted summary sent to {task['destination_email']} with {attachments_sent} attachment(s)."
     ) if success else ""
 
-    if success:
+    if success and not uncertain_result:
         task = set_task_status(
             task_id,
             "sent",
@@ -722,6 +858,62 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
         if task:
             _publish_snapshot(task, "sent", "Outbound email was sent successfully.")
         return {"ok": True, "status": "sent"}
+
+    if uncertain_result:
+        error = error or "SMTP provider returned an uncertain delivery result."
+        failure_observation = dict(payload.get("failure_observation") or make_failure_observation(
+            service="smtp",
+            operation="send_email_smtp",
+            error=error,
+            fallback_strategy="mark_delivery_uncertain_and_require_manual_verification",
+            retry_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
+            actor_context=_actor_context_from_task(task),
+        ))
+        task = set_task_status(
+            task_id,
+            "delivery_uncertain",
+            actor="worker",
+            event_type="delivery_uncertain",
+            event_message="SMTP provider returned an uncertain delivery result.",
+            extra_updates={
+                "delivery_status": "delivery_uncertain",
+                "delivery_result": "",
+                "delivery_error": error,
+                "smtp_provider": provider,
+                "final_result": f"Email delivery uncertain: {error}",
+                "last_error_category": "provider_uncertain",
+                "manual_handover_required": True,
+                "next_recommended_action": "Check provider outbox/logs before any replay; do not resend automatically.",
+                "domain_result": {
+                    "ok": False,
+                    "error": error,
+                    "uncertain": True,
+                    "failure_observation": failure_observation,
+                    "recovery_observation": failure_observation,
+                },
+            },
+            details={"error": error, "uncertain": True, "recovery_observation": failure_observation},
+        )
+        if task:
+            dlq = _create_mail_dlq_for_task(
+                task,
+                operation="send_email_smtp",
+                error=error,
+                attempt_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
+                safe_replay_allowed=False,
+                recovery_hint="manual_verify_provider_outbox_before_replay",
+            )
+            task = update_task(
+                task_id,
+                status="dead_letter",
+                delivery_status="delivery_uncertain",
+                domain_result={
+                    **dict(task.get("domain_result") or {}),
+                    "dlq_entry": dlq,
+                },
+            ) or task
+            _publish_snapshot(task, "delivery_uncertain", "SMTP provider returned an uncertain delivery result.")
+        return {"ok": False, "status": "delivery_uncertain", "error": error}
 
     if error_category == "provider_temporary" and self.request.retries < self.max_retries:
         task = set_task_status(
@@ -787,6 +979,27 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
         details={"error": error},
     )
     if task:
+        dlq = _create_mail_dlq_for_task(
+            task,
+            operation="send_email_smtp",
+            error=error,
+            attempt_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
+            safe_replay_allowed=error_category == "provider_temporary",
+            recovery_hint=(
+                "retry_send_with_same_idempotency_key"
+                if error_category == "provider_temporary"
+                else "manual_handover_or_repair_configuration"
+            ),
+        )
+        task = update_task(
+            task_id,
+            status="dead_letter",
+            delivery_status="dead_letter",
+            domain_result={
+                **dict(task.get("domain_result") or {}),
+                "dlq_entry": dlq,
+            },
+        ) or task
         _publish_snapshot(task, "send_failed", "Outbound email failed to send.")
     return {"ok": False, "status": "send_failed", "error": error}
 

@@ -227,6 +227,7 @@ def normalize_fault_injection(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = dict(raw or {})
     return {
         "force_smtp_fail": bool(raw.get("force_smtp_fail", False)),
+        "force_smtp_uncertain": bool(raw.get("force_smtp_uncertain", False)),
         "force_model_timeout": bool(raw.get("force_model_timeout", False)),
         "force_retrieval_empty": bool(raw.get("force_retrieval_empty", False)),
         "force_rule_only_mode": bool(raw.get("force_rule_only_mode", False)),

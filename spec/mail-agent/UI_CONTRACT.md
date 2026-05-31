@@ -11,6 +11,8 @@ This file extends `spec/AGENT_UI_SPEC.md` for Mail Agent V2.
 
 ## Surface Separation
 
+Implementation status: M6 is implemented and Docker-regressed. `8511` keeps the user workspace, while `8512` is the independent governance console.
+
 ### `8511`: User Workspace
 
 The user workspace contains:
@@ -42,6 +44,17 @@ The governance console contains:
 - Trace, latency, token, and cost diagnostics
 
 Prometheus remains the metrics backend. Grafana is deferred.
+
+Current route: `http://localhost:8512/`.
+
+Current governance APIs:
+
+- `GET /admin/task-stats`
+- `GET /admin/mail-provider-health`
+- `GET /admin/queue-health`
+- `GET /admin/mail-dlq`
+- `POST /admin/mail-dlq/{dlq_id}/replay`
+- `GET /admin/mail-harness-summary`
 
 ## Required User Workspace Panels
 

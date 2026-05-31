@@ -8,100 +8,11 @@ from pydantic import BaseModel, Field
 Mode = Literal["auto", "react", "plan_execute", "reflection"]
 
 
-class ChatRequest(BaseModel):
-    session_id: str = Field(min_length=1)
-    problem_id: str
-    question: str = Field(min_length=1)
-    mode: Mode = "auto"
-
-
-class PlanRequest(ChatRequest):
-    pass
-
-
-class ExecuteRequest(BaseModel):
-    session_id: str = Field(min_length=1)
-    request_id: str = Field(min_length=1)
-    approved_plan: bool = True
-
-
-class Citation(BaseModel):
-    source_type: str
-    title: str
-    snippet: str
-    chunk_id: str
-
-
-class RetrievalPreview(BaseModel):
-    retrieval_hits: int
-    snippets: list[Citation]
-
-
-class ChatResponse(BaseModel):
-    session_id: str
-    answer: str
-    citations: list[Citation]
-    trace_id: str
-    latency_ms: float
-    token_in: int
-    token_out: int
-    estimated_cost: float
-    mode_used: Mode
-    query_type: str
-    draft_answer: str | None = None
-    reflection_notes: str | None = None
-    final_answer: str | None = None
-    plan_steps: str | None = None
-    retrieval_preview: RetrievalPreview | None = None
-    requires_confirmation: bool = False
-    memory_hits: int = 0
-    used_conversation_memory: bool = False
-    conversation_summary_written: bool = False
-
-
-class PlanResponse(BaseModel):
-    session_id: str
-    trace_id: str
-    mode_suggested: Mode
-    query_type: str
-    retrieval_preview: RetrievalPreview
-    plan_steps: str
-    requires_confirmation: bool = True
-    memory_hits: int = 0
-    used_conversation_memory: bool = False
-
-
-class ProblemSummary(BaseModel):
-    problem_id: str
-    title: str
-    difficulty: str
-    topic: str
-    tags: list[str]
-
-
-class IngestResponse(BaseModel):
-    documents_written: int
-    collection_name: str
-
-
 class HealthResponse(BaseModel):
     status: str
     chroma_ok: bool
-    problems_loaded: int
+    knowledge_chunks_loaded: int
     langsmith_enabled: bool
-
-
-class ProblemRecord(BaseModel):
-    problem_id: str
-    title: str
-    difficulty: str
-    topic: str
-    tags: list[str]
-    statement: str
-    examples: list[str]
-    constraints: list[str]
-    solution_code: str
-    editor_note: dict[str, str]
 
 
 class RunMetrics(BaseModel):
@@ -273,12 +184,20 @@ class InboundMailMessage(BaseModel):
     message_id: str
     mailbox: str = "INBOX"
     uid: str = ""
+    thread_id: str = ""
+    provider_thread_id: str = ""
     sender: str = ""
     recipients: str = ""
     subject: str = ""
     received_at: str = ""
     snippet: str = ""
     summary: str = ""
+    body_text: str = ""
+    body_html_sanitized: str = ""
+    body_preview: str = ""
+    labels: list[str] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    headers_json: dict[str, Any] = Field(default_factory=dict)
     risk_hint: str = ""
     raw_size: int = 0
     is_seen: bool = False
@@ -454,60 +373,6 @@ class ConversationTurn(BaseModel):
     workspace_id: str = ""
 
 
-class SensitiveWorkflowCreateRequest(BaseModel):
-    session_id: str = Field(min_length=1)
-    conversation_id: str | None = None
-    message: str = Field(min_length=1)
-    business_context: str = ""
-    recipient_type: str = ""
-    context_budget: int = Field(default=600, ge=100, le=5_000)
-    destination_email: str = ""
-    source_filename: str = ""
-    source_content_type: str = ""
-    requested_action: str = "summarize_and_send"
-
-
-class SensitiveWorkflowApprovalRequest(BaseModel):
-    actor: str = Field(default="local_reviewer", min_length=1)
-    reason: str = ""
-
-
-class SensitiveWorkflowResponse(BaseModel):
-    workflow_id: str
-    session_id: str
-    conversation_id: str = ""
-    workflow_type: str = "dlp_outbound_approval"
-    status: str
-    message: str
-    redacted_text: str
-    business_context: str = ""
-    recipient_type: str = ""
-    destination_email: str = ""
-    source_filename: str = ""
-    source_content_type: str = ""
-    source_text_preview: str = ""
-    requested_action: str = "summarize_and_send"
-    risk_level: str
-    risk_reasons: list[str] = Field(default_factory=list)
-    redactions: list[dict[str, Any]] = Field(default_factory=list)
-    proposed_action: str = ""
-    final_result: str = ""
-    draft_summary: str = ""
-    simulated_delivery_result: str = ""
-    delivery_status: str = "not_sent"
-    delivery_result: str = ""
-    delivery_error: str = ""
-    sent_at: str = ""
-    smtp_provider: str = ""
-    approval_required: bool = False
-    approved_by: str = ""
-    rejected_by: str = ""
-    rejection_reason: str = ""
-    created_at: str
-    updated_at: str
-    audit_events: list[dict[str, Any]] = Field(default_factory=list)
-
-
 class DlpTaskCreateRequest(BaseModel):
     session_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)
@@ -541,6 +406,8 @@ class DlpTaskCreateRequest(BaseModel):
     user_id: str = ""
     workspace_id: str = ""
     roles: list[str] = Field(default_factory=list)
+    mail_draft_id: str = ""
+    idempotency_key: str = ""
 
 
 class DlpTaskApprovalRequest(BaseModel):
@@ -596,6 +463,8 @@ class DlpTaskResponse(BaseModel):
     domain_action: str = ""
     domain_payload: dict[str, Any] = Field(default_factory=dict)
     domain_result: dict[str, Any] = Field(default_factory=dict)
+    mail_draft_id: str = ""
+    idempotency_key: str = ""
     risk_level: str = ""
     approval_required: bool = False
     destination_email: str = ""

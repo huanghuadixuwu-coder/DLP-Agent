@@ -43,9 +43,9 @@ Build an internal mental model covering these **10 Knowledge Domains**, each con
 | D1.5 | 配置驱动架构：环境变量、邮箱配置、SMTP/IMAP 参数管理 | `app/config.py`, `.env.example`, `技术文档.md` |
 | **D2** | **DLP 安全检测与审批工作流** | |
 | D2.1 | DLP 检测引擎：敏感信息识别、风险等级评估、脱敏处理机制 | `app/dlp_entry.py`, `app/dlp_runtime.py`, `app/privacy_lab.py` |
-| D2.2 | 审批状态机：任务流转、人工审批、驳回处理的状态机设计 | `app/dlp_scenarios.py`, `app/workflow_store.py`, `app/sensitive_workflow.py` |
+| D2.2 | 审批状态机：任务流转、人工审批、驳回处理的状态机设计 | `app/dlp_scenarios.py`, `app/task_store.py`, `app/task_worker.py` |
 | D2.3 | 敏感信息类型：手机号、身份证、API Key、客户名单等检测规则 | `app/disambiguation_lab.py`, `app/dlp_entry.py` |
-| D2.4 | 治理化任务管理：任务创建、状态更新、审计日志记录 | `app/task_events.py`, `app/session_store.py`, `app/upload_analysis.py` |
+| D2.4 | 治理化任务管理：任务创建、状态更新、审计日志记录 | `app/task_events.py`, `app/task_store.py`, `app/upload_analysis.py` |
 | D2.5 | 邮件事件通知：notification_outbox、daily_mail_digest、new_mail_received 事件机制 | `app/inbound_mail_store.py`, `app/reminder_store.py` |
 | **D3** | **EnterpriseRAG 核心架构** | |
 | D3.1 | EnterpriseRAG 服务层：query_planner、retrieval_orchestrator、answer_composer 协同 | `app/enterprise_rag/core/service.py`, `app/enterprise_rag/core/query_planner.py` |
@@ -54,22 +54,22 @@ Build an internal mental model covering these **10 Knowledge Domains**, each con
 | D3.4 | 证据打包机制：EvidencePack构建、citation生成、missing_evidence 分析 | `app/enterprise_rag/core/evidence_pack.py`, `app/enterprise_rag/core/types.py` |
 | D3.5 | 答案生成引擎：compose_enterprise_answer 支持的事实覆盖、引用生成 | `app/enterprise_rag/core/answer_composer.py` |
 | **D4** | **混合检索与重排序系统** | |
-| D4.1 | Dense检索实现：Chroma向量库、BGE-M3嵌入模型、语义相似度计算 | `app/vectorstore.py`, `app/enterprise_rag/libs/embedding/` |
+| D4.1 | Dense检索实现：Chroma向量库、BGE-M3嵌入模型、语义相似度计算 | `app/vectorstore.py`, `app/enterprise_rag/ingestion/hf_loader.py` |
 | D4.2 | Sparse检索实现：SQLite FTS5、BM25、关键词匹配与索引构建 | `app/enterprise_rag/libs/sparse_index.py`, `app/enterprise_rag/libs/text_cleaning.py` |
 | D4.3 | 检索融合策略：候选合并、heuristic评分、diversification 策略 | `app/enterprise_rag/core/retrieval_orchestrator.py`, `app/enterprise_rag/libs/scoring.py` |
-| D4.4 | 轻量级重排序：lexical rerank、source_type优先级、候选质量评估 | `app/enterprise_rag/libs/reranker/`, `app/enterprise_rag/libs/scoring.py` |
+| D4.4 | 轻量级重排序：lexical rerank、source_type优先级、候选质量评估 | `app/enterprise_rag/libs/reranker.py`, `app/enterprise_rag/libs/scoring.py` |
 | **D5** | **Memory 系统与上下文管理** | |
 | D5.1 | Hermes记忆系统：workspace_memory、transcript、user_memory 的三级存储 | `app/hermes_memory.py`, `app/hermes_dynamic_memory.py` |
 | D5.2 | 上下文构建：build_runtime_context_bundle 会话记忆与工作空间记忆检索 | `app/hermes_memory.py`, `app/enterprise_rag/core/service.py` |
 | D5.3 | 记忆压缩策略：compact_text、summary merge、记忆结构化 | `app/conversation_memory.py`, `app/raw_vs_langgraph.py` |
-| D5.4 | 会话管理：ConversationStore、SessionStore 的状态持久化 | `app/conversation_store.py`, `app/session_store.py` |
+| D5.4 | 会话管理：ConversationStore、Hermes transcript 的状态持久化 | `app/conversation_store.py`, `app/session_transcript.py` |
 | D5.5 | 动态记忆策略：memory_policy、缓存失效、热更新机制 | `app/enterprise_rag/core/memory_policy.py` |
 | **D6** | **编排层与任务规划** | |
 | D6.1 | 统一编排入口：planner.py 的复合任务分解与能力路由 | `app/orchestration/planner.py`, `app/orchestration/fast_router.py` |
-| D6.2 | 能力注册表：Agent能力发现、动态加载、API映射机制 | `app/orchestration/registry.py`, `app/unified_agent.py` |
+| D6.2 | 能力注册表：Agent能力发现、动态加载、API映射机制 | `app/orchestration/registry.py`, `app/orchestration/tool_discovery.py` |
 | D6.3 | 任务执行器：executor.py 的子任务调度、结果聚合、错误处理 | `app/orchestration/executor.py`, `app/orchestration/aggregator.py` |
 | D6.4 | 渲染层设计：final_renderer 的结果格式化、对话上下文管理 | `app/orchestration/final_renderer.py`, `app/graph.py` |
-| D6.5 | Agent路由策略：hybrid_router 的能力选择、负载均衡、故障转移 | `app/hybrid_router.py`, `app/orchestration/policies.py` |
+| D6.5 | Agent路由策略：Fast Router 与 ReAct 路由、故障转移 | `app/orchestration/fast_router.py`, `app/orchestration/policies.py` |
 | **D7** | **企业知识库 Ingestion** | |
 | D7.1 | EnterpriseRAG 数据接入：loader、normalizer、chunker、indexer 流程 | `app/enterprise_rag/ingestion/`, `app/enterprise_rag/ingestion/indexer.py` |
 | D7.2 | 元数据标准化：normalize_source_type、business_domain、timestamp 标准化 | `app/enterprise_rag/libs/metadata.py`, `app/enterprise_rag/libs/text_cleaning.py` |
@@ -78,20 +78,20 @@ Build an internal mental model covering these **10 Knowledge Domains**, each con
 | D7.5 | 证据覆盖分析：doc recall、answer facts coverage、missing evidence 评估 | `app/enterprise_rag/eval/`, `app/enterprise_rag/eval/metrics.py` |
 | **D8** | **MCP 工具集成与 API 设计** | |
 | D8.1 | MCP 客户端架构：mcp_client.py 的工具发现、调用、结果处理 | `app/mcp_client.py`, `app/mcp_tools.py` |
-| D8.2 | 邮件工具实现：send_email_163 的 SMTP 集成、163 邮箱配置 | `app/mcp/interview-agent-tools/`, `app/email_sender.py` |
+| D8.2 | 邮件工具实现：send_email_163 的 SMTP 集成、163 邮箱配置 | `mcp/interview-agent-tools/`, `app/email_sender.py` |
 | D8.3 | API 接口设计：RESTful API、WebSocket 实时通信、异步处理 | `app/main.py`, `技术文档.md` |
-| D8.4 | 前端界面：Streamlit App 的聊天界面、文件上传、任务监控 | `web/streamlit_app.py`, `app/observability/dashboard/` |
-| D8.5 | 工具注册表：unified_tools 的能力注册、参数校验、执行封装 | `app/unified_tools.py`, `app/agent_cli.py` |
+| D8.4 | 前端界面：Streamlit App 的聊天界面、文件上传、任务监控 | `web/streamlit_app.py`, `web/governance_console.py` |
+| D8.5 | 工具注册表：decorator discovery、参数校验、执行封装 | `app/orchestration/tool_discovery.py`, `app/orchestration/tools/` |
 | **D9** | **监控、观测与工程化** | |
-| D9.1 | 可观测性系统：metrics、tracing、logging 的三维度监控 | `app/metrics.py`, `app/observability/`, `app/orchestration/tracing.py` |
-| D9.2 | 业务指标监控：邮件处理量、DLP 检测率、RAG 检索成功率 | `app/metrics.py`, `app/observability/dashboard/` |
+| D9.1 | 可观测性系统：metrics、tracing、logging 的三维度监控 | `app/metrics.py`, `app/observability.py`, `app/orchestration/tracing.py` |
+| D9.2 | 业务指标监控：邮件处理量、DLP 检测率、RAG 检索成功率 | `app/metrics.py`, `web/governance_console.py` |
 | D9.3 | 性能追踪系统：TraceContext、request_id、性能瓶颈分析 | `app/orchestration/tracing.py`, `app/enterprise_rag/core/service.py` |
 | D9.4 | 容器化部署：Docker、docker-compose、环境变量管理 | `Dockerfile`, `docker-compose.yml`, `.env.example` |
-| D9.5 | 日志与审计：操作日志、安全审计、错误追踪 | `app/observability/logger.py`, `app/task_events.py` |
+| D9.5 | 日志与审计：操作日志、安全审计、错误追踪 | `app/observability.py`, `app/task_events.py` |
 | **D10** | **集成测试与生产运维** | |
 | D10.1 | 回归测试策略：EnterpriseRAG-Bench、DLP 场景、邮件协作集成测试 | `scripts/`, `app/enterprise_rag/eval/` |
 | D10.2 | 数据集验证：公开办公数据集、Enron邮件、QMSum会议数据 | `技术文档.md`, `enterprise_rag_bench_documents_sample.csv` |
-| D10.3 | 配置管理：环境隔离、动态配置、热更新机制 | `app/config.py`, `app/observability/` |
+| D10.3 | 配置管理：环境隔离、动态配置、热更新机制 | `app/config.py`, `app/observability.py` |
 | D10.4 | 容错与降级：服务降级、熔断机制、优雅关闭 | `app/main.py`, `app/orchestration/policies.py` |
 | D10.5 | 生产部署架构：多进程、异步队列、健康检查 | `docker-compose.yml`, `app/task_queue.py`, `app/task_worker.py` |
 

@@ -35,6 +35,90 @@ class MailProviderResponse:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def to_observation(
+        self,
+        *,
+        observation_type: str = "mail_provider_result",
+        actor_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        status = self.status or ("completed" if self.ok else "failed")
+        success_statuses = {"completed", "sent", "deduplicated", "healthy", "degraded"}
+        failure_statuses = {
+            "auth_expired",
+            "blocked",
+            "delivery_deferred",
+            "delivery_uncertain",
+            "failed",
+            "not_found",
+            "permission_denied",
+            "provider_not_configured",
+            "rate_limited",
+            "unsupported",
+        }
+        success = bool(self.ok or status in success_statuses) and status not in failure_statuses
+        side_effects: list[dict[str, Any]] = []
+        if self.operation in {"send_message", "apply_label"}:
+            side_effects.append(
+                {
+                    "operation": self.operation,
+                    "executed": bool(self.ok and status not in {"confirmation_required", "unsupported"}),
+                    "uncertain": self.uncertain,
+                    "provider": self.provider,
+                }
+            )
+        constraints: list[dict[str, Any]] = []
+        provider_write_supported = self.data.get("provider_write_supported")
+        if provider_write_supported is False:
+            constraints.append(
+                {
+                    "constraint": "provider_write_supported",
+                    "value": False,
+                    "operation": self.operation,
+                }
+            )
+        if self.error_code:
+            constraints.append(
+                {
+                    "constraint": "provider_error",
+                    "error_code": self.error_code,
+                    "retryable": self.retryable,
+                    "uncertain": self.uncertain,
+                }
+            )
+        recovery = self.recovery_observation or {}
+        if not success and not recovery:
+            recovery = {
+                "observation_type": "dependency_failure",
+                "status": status,
+                "service": self.provider,
+                "operation": self.operation,
+                "error_code": self.error_code,
+                "retryable": self.retryable,
+                "fallback_strategy": "surface_provider_observation_to_renderer",
+            }
+        return {
+            "observation_type": observation_type,
+            "status": status,
+            "source": self.provider,
+            "source_tool": self.provider,
+            "grounding_kind": "tool",
+            "success": success,
+            "summary": self.error_message or f"{self.provider}.{self.operation}: {status}",
+            "provenance": {
+                "provider": self.provider,
+                "operation": self.operation,
+                "error_code": self.error_code,
+            },
+            "confidence": 1.0 if success else 0.0,
+            "missing_fields": [],
+            "constraints": constraints,
+            "side_effects": side_effects,
+            "citations": [],
+            "actor_context": actor_context or {},
+            "payload": self.to_dict(),
+            "recovery_observation": recovery,
+        }
+
 
 @runtime_checkable
 class MailProvider(Protocol):

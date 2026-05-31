@@ -9,7 +9,7 @@ from langchain_core.documents import Document
 
 from app.conversation_store import get_related_merged_conversations, get_turns
 from app.actor_context import actor_from_mapping
-from app.vectorstore import get_vectorstore, upsert_documents
+from app.vectorstore import get_conversation_memory_vectorstore, upsert_conversation_memory_documents
 
 
 FOLLOW_UP_HINTS = ("之前", "上次", "刚才", "我们讨论过", "合并", "历史", "前面", "remember", "previous", "earlier")
@@ -179,12 +179,12 @@ def build_merged_summary_document(
 
 def write_turn_summary(**kwargs: Any) -> bool:
     doc = build_turn_summary_document(**kwargs)
-    return upsert_documents([doc]) == 1
+    return upsert_conversation_memory_documents([doc]) == 1
 
 
 def write_merged_summary(**kwargs: Any) -> bool:
     doc = build_merged_summary_document(**kwargs)
-    return upsert_documents([doc]) == 1
+    return upsert_conversation_memory_documents([doc]) == 1
 
 
 def is_memory_follow_up(question: str) -> bool:
@@ -277,7 +277,7 @@ def retrieve_turn_memory(
     top_k: int = 3,
     actor_context: dict[str, Any] | None = None,
 ) -> list[Document]:
-    vectorstore = get_vectorstore()
+    vectorstore = get_conversation_memory_vectorstore()
     filt = {
         "$and": [
             {"domain": {"$eq": "conversation"}},
@@ -302,7 +302,7 @@ def retrieve_merged_memory(
     if not related_ids:
         return []
 
-    vectorstore = get_vectorstore()
+    vectorstore = get_conversation_memory_vectorstore()
     filt = {
         "$and": [
             {"domain": {"$eq": "conversation"}},

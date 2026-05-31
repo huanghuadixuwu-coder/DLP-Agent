@@ -35,7 +35,19 @@ class Settings(BaseSettings):
 
     chroma_host: str = Field(default="localhost", alias="CHROMA_HOST")
     chroma_port: int = Field(default=8000, alias="CHROMA_PORT")
-    chroma_collection: str = Field(default="leetcode_rag_v1", alias="CHROMA_COLLECTION")
+    chroma_collection: str = Field(default="leetcode_rag_bge_m3_v1", alias="CHROMA_COLLECTION")
+    conversation_memory_chroma_collection: str = Field(
+        default="conversation_memory_bge_m3_v1",
+        alias="CONVERSATION_MEMORY_CHROMA_COLLECTION",
+    )
+    conversation_memory_collection_version: str = Field(
+        default="bge-m3-1024-v1",
+        alias="CONVERSATION_MEMORY_COLLECTION_VERSION",
+    )
+    conversation_memory_embedding_dimension: int = Field(
+        default=1024,
+        alias="CONVERSATION_MEMORY_EMBEDDING_DIMENSION",
+    )
     enterprise_chroma_collection: str = Field(default="enterprise_rag_bench_v2", alias="ENTERPRISE_CHROMA_COLLECTION")
     workspace_memory_chroma_collection: str = Field(default="workspace_memory_v1", alias="WORKSPACE_MEMORY_CHROMA_COLLECTION")
     enterprise_collection_version: str = Field(default="enterprise_rag_bench_v2", alias="ENTERPRISE_COLLECTION_VERSION")

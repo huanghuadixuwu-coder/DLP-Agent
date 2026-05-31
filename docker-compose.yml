@@ -64,6 +64,24 @@ services:
       - .:/app
       - ./external-models:/app/external-models
 
+  governance-web:
+    image: leetcode-rag-agent-enterprise-web
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: streamlit run web/governance_console.py --server.port 8501 --server.address 0.0.0.0
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8512:8501"
+    depends_on:
+      - api
+    volumes:
+      - .:/app
+      - ./external-models:/app/external-models
+
   postgres:
     image: postgres:16-alpine
     environment:

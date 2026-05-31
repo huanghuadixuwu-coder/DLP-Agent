@@ -12,7 +12,6 @@ TOKENS_INPUT_TOTAL = Counter("agent_tokens_input_total", "Total input tokens.")
 TOKENS_OUTPUT_TOTAL = Counter("agent_tokens_output_total", "Total output tokens.")
 ESTIMATED_COST_TOTAL = Counter("agent_estimated_cost_total", "Estimated model cost in CNY.")
 RETRIEVAL_HITS_TOTAL = Counter("agent_retrieval_hits_total", "Total retrieved document hits.")
-REFLECTION_RUNS_TOTAL = Counter("agent_reflection_runs_total", "Total reflection executions.")
 MEMORY_HITS_TOTAL = Counter("agent_memory_hits_total", "Total conversation memory hits.")
 CONVERSATION_MEMORY_USED_TOTAL = Counter("agent_conversation_memory_used_total", "Total requests that used conversation memory.")
 CONVERSATION_SUMMARY_WRITES_TOTAL = Counter("agent_conversation_summary_writes_total", "Total conversation summaries written to Chroma.")
@@ -40,18 +39,18 @@ TURN_SUMMARY_WRITES_TOTAL = Counter("agent_turn_summary_writes_total", "Total tu
 MERGED_SUMMARY_WRITES_TOTAL = Counter("agent_merged_summary_writes_total", "Total merged summaries written to Chroma.")
 MEMORY_RETRIEVAL_HITS_TOTAL = Counter("agent_memory_retrieval_hits_total", "Total memory retrieval hits.", ["source_type"])
 ANSWER_COLLAPSES_TOTAL = Counter("agent_answer_collapses_total", "Total long answers collapsed in the UI.")
-WORKFLOW_CREATED_TOTAL = Counter("agent_workflow_created_total", "Total HITL workflows created.")
-WORKFLOW_PENDING_APPROVALS_TOTAL = Counter(
-    "agent_workflow_pending_approvals_total",
-    "Total workflows that entered pending approval.",
-)
-WORKFLOW_APPROVED_TOTAL = Counter("agent_workflow_approved_total", "Total workflows approved by humans.")
-WORKFLOW_REJECTED_TOTAL = Counter("agent_workflow_rejected_total", "Total workflows rejected by humans.")
-WORKFLOW_RISK_TOTAL = Counter("agent_workflow_risk_total", "Total workflow risk decisions.", ["risk_level"])
-WORKFLOW_EMAIL_SENT_TOTAL = Counter("agent_workflow_email_sent_total", "Total workflow emails sent.")
-WORKFLOW_EMAIL_FAILED_TOTAL = Counter("agent_workflow_email_failed_total", "Total workflow email send failures.")
 TASKS_CREATED_TOTAL = Counter("agent_tasks_created_total", "Total asynchronous DLP tasks created.")
 TASK_RETRIES_TOTAL = Counter("agent_task_retries_total", "Total asynchronous task retries.", ["task_type"])
+MAIL_DLQ_CREATED_TOTAL = Counter(
+    "agent_mail_dlq_created_total",
+    "Total mail dead-letter queue entries created.",
+    ["operation", "safe_replay_allowed"],
+)
+MAIL_DLQ_REPLAY_TOTAL = Counter(
+    "agent_mail_dlq_replay_total",
+    "Total mail dead-letter queue replay attempts.",
+    ["operation", "result"],
+)
 TASKS_INFLIGHT = Gauge("agent_tasks_inflight", "Current asynchronous DLP tasks in non-terminal states.")
 TASK_STATUS_TOTAL = Gauge("agent_task_status_total", "Current DLP tasks grouped by status.", ["status"])
 TASK_LATENCY_MS = Gauge("agent_task_latency_ms", "Average terminal task latency in milliseconds.")
@@ -176,10 +175,6 @@ def record_failure() -> None:
     LAST_REQUEST_SUCCESS.set(0)
 
 
-def record_reflection() -> None:
-    REFLECTION_RUNS_TOTAL.inc()
-
-
 def record_lab_request(lab: str) -> None:
     LAB_REQUESTS_TOTAL.labels(lab=lab).inc()
 
@@ -269,34 +264,23 @@ def record_answer_collapse() -> None:
     ANSWER_COLLAPSES_TOTAL.inc()
 
 
-def record_workflow_created(risk_level: str, approval_required: bool) -> None:
-    WORKFLOW_CREATED_TOTAL.inc()
-    WORKFLOW_RISK_TOTAL.labels(risk_level=risk_level).inc()
-    if approval_required:
-        WORKFLOW_PENDING_APPROVALS_TOTAL.inc()
-
-
-def record_workflow_approved() -> None:
-    WORKFLOW_APPROVED_TOTAL.inc()
-
-
-def record_workflow_rejected() -> None:
-    WORKFLOW_REJECTED_TOTAL.inc()
-
-
-def record_workflow_email_sent(success: bool) -> None:
-    if success:
-        WORKFLOW_EMAIL_SENT_TOTAL.inc()
-    else:
-        WORKFLOW_EMAIL_FAILED_TOTAL.inc()
-
-
 def record_task_created() -> None:
     TASKS_CREATED_TOTAL.inc()
 
 
 def record_task_retry(task_type: str) -> None:
     TASK_RETRIES_TOTAL.labels(task_type=task_type).inc()
+
+
+def record_mail_dlq_created(operation: str, safe_replay_allowed: bool) -> None:
+    MAIL_DLQ_CREATED_TOTAL.labels(
+        operation=operation or "unknown",
+        safe_replay_allowed=str(bool(safe_replay_allowed)).lower(),
+    ).inc()
+
+
+def record_mail_dlq_replay(operation: str, result: str) -> None:
+    MAIL_DLQ_REPLAY_TOTAL.labels(operation=operation or "unknown", result=result or "unknown").inc()
 
 
 def record_dlp_scenario_replay(scenario_id: str) -> None:

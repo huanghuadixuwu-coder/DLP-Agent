@@ -1,6 +1,6 @@
 # Enterprise Agent ToDo
 
-更新时间：2026-05-25
+更新时间：2026-05-31
 当前有效运行目录：`E:\leetcode-rag-agent-enterprise`
 验收基线：只以 Docker 容器内结果为准，不以本机 Python 作为完成标准。
 
@@ -44,7 +44,7 @@
 - `[x]` 附件正文隔离、body source policy、DLP 审批和 SMTP worker 状态机已落地。
 - `[x]` policy hot update 已支持 active policy version 与 fallback static rules。
 - `[x]` SMTP 失败、DLP 高风险阻断、worker 入队失败已纳入 recovery observation 回归。
-- `[-]` 仍需继续降低少数 fallback / legacy 文案路径，保持 observation-first。
+- `[x]` 已删除旧 V1 Agent、旧 sensitive workflow 和 8511 legacy 治理面板，主链继续保持 observation-first。
 - `[ ]` 增加更多等价新问法回归，避免邮件草稿和确认路径依赖固定表达。
 
 ## 5. Memory / ReAct
@@ -52,6 +52,7 @@
 - `[x]` structured turn memory、pending reflection candidate、memory safety boundary 已落地。
 - `[x]` memory 只能补上下文、偏好、项目约定；企业事实仍必须由 EnterpriseRAG citations 支撑。
 - `[x]` pending memory review 后端最小能力已落地。
+- `[x]` conversation memory 已拆分到 `conversation_memory_bge_m3_v1`，旧 512 维 runtime memory 已按 content hash 幂等迁移到 `bge-m3` 1024 维索引。
 - `[ ]` 补 UI/Admin 层的 pending memory approve/reject/expire 审计展示。
 
 ## 6. Dynamic Tool Discovery & Dispatch
@@ -110,17 +111,22 @@
 - `[x]` `docker compose exec -T api python scripts/mail_harness_regression.py`
 - `[x]` `docker compose exec -T api python scripts/mail_provider_failure_regression.py`
 - `[x]` `docker compose exec -T api python scripts/mail_concurrency_regression.py`
+- `[x]` `docker compose exec -T api python scripts/mail_persistent_draft_regression.py`
+- `[x]` `docker compose exec -T api python scripts/mail_m6_ui_governance_regression.py`
+- `[x]` `docker compose exec -T api python scripts/migrate_conversation_memory_collection.py`
+- `[x]` `docker compose exec -T api python scripts/conversation_memory_migration_regression.py`
 
 ## 12. 下一步优先级
 1. `[-]` Mail Agent V2 规格清理与边界锁定：采用渐进式披露规格包，Mail Agent core 与 Workspace/Document Agent 边界已锁定。
 2. `[x]` Mail Harness 第一阶段：fake provider、状态回放、失败注入、重复发送防护、并发隔离。
-3. `[ ]` Persistent Mail Draft：将 pending draft 从 conversation debug 迁移到持久 draft state。
-4. `[ ]` Mail provider abstraction：保留当前 IMAP/SMTP，新增 fake provider contract。
+3. `[x]` Persistent Mail Draft：将 pending draft 从 conversation debug 迁移到 PostgreSQL draft state，并绑定 confirmation idempotency key。
+4. `[x]` Mail provider abstraction：保留当前 IMAP/SMTP，新增 fake provider contract。
 5. `[ ]` 用当前真实 `.env` 凭据人工演练一次跨域闭环：创建真实腾讯会议 -> 真实 SMTP 发送邀请邮件；必要时先用测试收件箱。
 6. `[ ]` 接入或明确选择真实 calendar provider；没有 provider 时继续保持 provider boundary，不伪造空闲时间。
 7. `[ ]` 扩大 EnterpriseRAG benchmark 与 Agent trace evaluation 样本。
-8. `[ ]` 清理剩余 legacy/fallback 文案路径，继续收口 observation-first。
+8. `[x]` 清理旧 V1 Agent、旧 sensitive workflow、旧 LeetCode API 和 8511 legacy 治理面板；保留 Labs/MCP 与未来 Domain Agent 接口。
 9. `[ ]` 增加真实 provider retry / circuit breaker / manual handover 的更大样本回归。
+10. `[x]` 修复 conversation memory collection 的 embedding 维度迁移：拆分独立 `conversation_memory_bge_m3_v1` collection，旧索引只读迁移并保留回滚路径。
 
 ## 13. Mail Agent V2
 - `[-]` 已完成规格清理与边界锁定，正式入口为 `spec/MAIL_AGENT_V2_SPEC.md`。
@@ -151,11 +157,54 @@
 - `[x]` 新增 `mail_concurrency_regression.py`，覆盖多用户、多租户、同 draft 并发 patch。
 - `[x]` Docker 内验证当前 IMAP/SMTP 路径不退化：IMAP sync、inline draft/confirm、mock SMTP send、forced SMTP failure recovery 均通过；真实 SMTP 多邮件演练保留为显式人工动作。
 
-### 13.3 UI Surface Separation
+### 13.3 Persistent Draft State
+- `[x]` 新增 PostgreSQL `mail_drafts` store，草稿不再只依赖 conversation debug 恢复。
+- `[x]` draft / clarification / confirmation / patch 路径统一持久化 `draft_id`、版本与 actor scope。
+- `[x]` confirmation 绑定稳定 `idempotency_key`，重复确认复用同一个 DLP task。
+- `[x]` 新增 `mail_persistent_draft_regression.py`，覆盖页面刷新后 patch 与重复确认去重。
+
+### 13.4 UI Surface Separation
 - `[x]` UI 边界已锁定：`8511` 为普通用户工作台，`8512` 为治理与运维台。
 - `[x]` Grafana 暂缓；Prometheus 继续作为指标采集后端。
 - `[x]` 风险分层已锁定：`low` 自动发送、`medium` 发件人二次确认、`high` 治理升级、`critical` 默认阻断。
-- `[ ]` 从 `8511` 移除 high-risk 例外审批/驳回按钮、raw tool calls、trace JSON、token/cost、队列和故障注入视图。
-- `[ ]` `8511` 保留 inbox/thread、draft review、显式确认、发件人外发安全确认、简化任务进度和 renderer 生成的失败提示。
-- `[ ]` 新增 `8512` 治理台：high-risk 例外审批/驳回、审计时间线、provider/queue health、recovery observation、DLQ replay、Harness 结果、trace 和成本诊断。
-- `[ ]` Docker 内验证：`medium` 可在 `8511` 二次确认，`high` 只能在 `8512` 例外审批，`critical` 默认阻断。
+- `[x]` 从 `8511` 移除 high-risk 例外审批/驳回按钮、raw tool calls、trace JSON、token/cost、队列和故障注入视图。
+- `[x]` `8511` 保留 inbox/thread、draft review、显式确认、发件人外发安全确认、简化任务进度和 renderer 生成的失败提示。
+- `[x]` 新增 `8512` 治理台：high-risk 例外审批/驳回、审计时间线、provider/queue health、recovery observation、DLQ replay、Harness 结果、trace 和成本诊断。
+- `[x]` Docker 内验证：`medium` 可在 `8511` 二次确认，`high` 只能在 `8512` 例外审批，`critical` 默认阻断。
+### 13.4.1 M6 UI Integration Completion
+- `[x]` M6 completed: `8511` removed high-risk exception approve/reject controls from the active user task panel and moved raw tool calls / trace / token-cost diagnostics out of the user-facing panel.
+- `[x]` `8511` keeps inbox/thread status, draft review, explicit confirmation, simplified task progress, and renderer/user-facing recovery guidance.
+- `[x]` Added independent `8512` governance console with high-risk approval/rejection, task timeline, provider health, queue health, recovery observation, DLQ replay, and harness catalog panels.
+- `[x]` Added governance APIs: `/admin/task-stats`, `/admin/mail-provider-health`, `/admin/mail-dlq`, `/admin/mail-dlq/{dlq_id}/replay`, `/admin/mail-harness-summary`.
+- `[x]` Docker regression passed: `docker compose exec -T api python scripts/mail_m6_ui_governance_regression.py`.
+
+### 13.5 Provider Abstraction
+- `[x]` M3 Provider Abstraction completed: current IMAP/SMTP path is wrapped by `CurrentImapSmtpMailProvider`.
+- `[x]` Provider responses can emit typed health / failure observations through `MailProviderResponse.to_observation(...)`.
+- `[x]` Fake provider and current provider pass the same Docker contract regression: `docker compose exec -T api python scripts/mail_provider_contract_regression.py`.
+- `[x]` Contract regression keeps external current-provider sync/send disabled by default and verifies `provider_not_configured` / `confirmation_required` observations instead of pretending success.
+
+### 13.6 HTML / Thread / Label / Attachment Normalization
+- `[x]` M4 completed: inbound mail store persists `body_text / body_html_sanitized / body_preview / thread_id / provider_thread_id / labels / attachments / headers_json`.
+- `[x]` IMAP parser extracts safe visible text from HTML, stores sanitized HTML, and strips script/event/javascript URL patterns.
+- `[x]` Attachment handling stores metadata only: filename, content type, size, provider attachment id, and source policy; attachment body does not enter mail body.
+- `[x]` Thread fallback derives stable local `thread_id`, while `provider_thread_id` is preserved from References/In-Reply-To when available.
+- `[x]` Current provider exposes normalized fields and returns explicit `provider_write_supported=false` observation for unsupported label writes.
+- `[x]` Docker regression passed: `docker compose exec -T api python scripts/mail_m4_normalization_regression.py`.
+
+### 13.7 Reliability and DLQ
+- `[x]` M5 completed: added `mail_dead_letter_queue` storage for failed mail operations.
+- `[x]` DLQ entries record task id, operation, payload digest, last error, attempt count, safe replay flag, recovery hint, actor context, and payload snapshot.
+- `[x]` Replay-safe checkpoint can move safe DLQ entries back to `queued_for_send` without changing the original idempotency key.
+- `[x]` SMTP uncertain result enters DLQ with `safe_replay_allowed=false` and blocks automatic replay until manual provider outbox verification.
+- `[x]` Retry exhaustion can mark mail tasks as `dead_letter` and create a DLQ entry.
+- `[x]` Prometheus exposes `agent_mail_dlq_created_total` and `agent_mail_dlq_replay_total`.
+- `[x]` Docker regression passed: `docker compose exec -T api python scripts/mail_m5_reliability_regression.py`.
+
+### 13.8 Legacy Cleanup
+- `[x]` 删除旧 `unified_agent.py / hybrid_router.py / unified_tools.py` LangGraph V1 栈。
+- `[x]` 删除旧 `sensitive_workflow.py / workflow_store.py` SQLite workflow 栈和 `/workflows/sensitive-outbound*` 接口。
+- `[x]` 删除旧 `/problems /ingest /plan /execute /chat` LeetCode API 与 8511 初始化按钮。
+- `[x]` `app/graph.py` 收敛为共享 `get_llm()` client 工厂。
+- `[x]` 统一语料 seed 仅保留 Labs/DLP 证据，不再写入 LeetCode problem 文档。
+- `[x]` Docker 内重新验证 M1-M6、动态工具发现和跨域 DAG 闭环。

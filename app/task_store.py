@@ -12,8 +12,8 @@ from psycopg.rows import dict_row
 from app.config import get_settings
 
 
-TERMINAL_TASK_STATUSES = {"sent", "rejected", "send_failed", "failed", "completed"}
-RECOVERABLE_TASK_STATUSES = {"needs_clarification", "input_invalid", "delivery_deferred"}
+TERMINAL_TASK_STATUSES = {"sent", "rejected", "send_failed", "failed", "completed", "dead_letter"}
+RECOVERABLE_TASK_STATUSES = {"needs_clarification", "input_invalid", "delivery_deferred", "dead_letter"}
 JSON_TASK_FIELDS = {
     "risk_reasons",
     "redactions",
@@ -33,6 +33,8 @@ TASK_COLUMN_MIGRATIONS = [
     ("domain_action", "TEXT NOT NULL DEFAULT ''"),
     ("domain_payload", "TEXT NOT NULL DEFAULT '{}'"),
     ("domain_result", "TEXT NOT NULL DEFAULT '{}'"),
+    ("mail_draft_id", "TEXT NOT NULL DEFAULT ''"),
+    ("idempotency_key", "TEXT NOT NULL DEFAULT ''"),
     ("request_message", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_subject", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_body", "TEXT NOT NULL DEFAULT ''"),
@@ -80,6 +82,15 @@ def _connect() -> psycopg.Connection:
     return psycopg.connect(settings.postgres_dsn, row_factory=dict_row)
 
 
+def _decode_json(value: Any, default: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value or json.dumps(default))
+        except json.JSONDecodeError:
+            return default
+    return default if value is None else value
+
+
 def _decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if not row:
         return None
@@ -103,6 +114,18 @@ def _decode_event(row: dict[str, Any]) -> dict[str, Any]:
         item["details_json"] = json.loads(value or "{}")
     elif value is None:
         item["details_json"] = {}
+    return item
+
+
+def _decode_dlq(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    item = dict(row)
+    for key in ("actor_context", "payload_snapshot", "replay_result"):
+        item[key] = _decode_json(item.get(key), {})
+    item["safe_replay_allowed"] = bool(item.get("safe_replay_allowed"))
+    item["replay_count"] = int(item.get("replay_count") or 0)
+    item["attempt_count"] = int(item.get("attempt_count") or 0)
     return item
 
 
@@ -132,6 +155,8 @@ def init_task_store() -> None:
                     domain_action TEXT NOT NULL DEFAULT '',
                     domain_payload TEXT NOT NULL DEFAULT '{}',
                     domain_result TEXT NOT NULL DEFAULT '{}',
+                    mail_draft_id TEXT NOT NULL DEFAULT '',
+                    idempotency_key TEXT NOT NULL DEFAULT '',
                     risk_level TEXT NOT NULL DEFAULT '',
                     approval_required BOOLEAN NOT NULL DEFAULT FALSE,
                     destination_email TEXT NOT NULL DEFAULT '',
@@ -201,17 +226,44 @@ def init_task_store() -> None:
                     FOREIGN KEY(task_id) REFERENCES dlp_tasks(task_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS mail_dead_letter_queue (
+                    dlq_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    safe_replay_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+                    recovery_hint TEXT NOT NULL DEFAULT '',
+                    actor_context TEXT NOT NULL DEFAULT '{}',
+                    payload_snapshot TEXT NOT NULL DEFAULT '{}',
+                    replay_count INTEGER NOT NULL DEFAULT 0,
+                    replay_status TEXT NOT NULL DEFAULT 'pending',
+                    replay_result TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_dlp_tasks_status ON dlp_tasks(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_dlp_tasks_session ON dlp_tasks(session_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_dlp_tasks_risk ON dlp_tasks(risk_level, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_dlp_task_events_task ON dlp_task_events(task_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_dlp_task_approvals_task ON dlp_task_approvals(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_mail_dlq_task ON mail_dead_letter_queue(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_mail_dlq_status ON mail_dead_letter_queue(replay_status, updated_at);
                 """
             )
             for column_name, column_definition in TASK_COLUMN_MIGRATIONS:
                 conn.execute(f"ALTER TABLE dlp_tasks ADD COLUMN IF NOT EXISTS {column_name} {column_definition}")
             conn.execute("ALTER TABLE dlp_tasks ALTER COLUMN destination_email SET DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dlp_tasks_scenario ON dlp_tasks(scenario_id, updated_at)")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_dlp_tasks_idempotency_key
+                ON dlp_tasks(idempotency_key)
+                WHERE idempotency_key <> ''
+                """
+            )
             conn.commit()
 
         _TASK_STORE_INITIALIZED = True
@@ -252,6 +304,8 @@ def create_dlp_task(
     domain_action: str = "",
     domain_payload: dict[str, Any] | None = None,
     domain_result: dict[str, Any] | None = None,
+    mail_draft_id: str = "",
+    idempotency_key: str = "",
     tenant_id: str = "",
     user_id: str = "",
     workspace_id: str = "",
@@ -264,14 +318,15 @@ def create_dlp_task(
             """
             INSERT INTO dlp_tasks (
                 task_id, task_type, tenant_id, user_id, workspace_id, session_id, conversation_id, priority, status,
-                domain_action, domain_payload, domain_result,
+                domain_action, domain_payload, domain_result, mail_draft_id, idempotency_key,
                 destination_email, requested_action, message_raw, request_message,
                 delivery_subject, delivery_body, delivery_plan_kind, resolved_source_kind, attachment_strategy, attachment_content,
                 attachment_filename, attachment_content_type, attachment_blob_id, source_filename,
                 source_content_type, source_parse_status, source_parse_error, entry_issue_type,
                 missing_fields, clarification_question, lab_run, scenario_id, scenario_name,
                 fault_injection, expected_outcome, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key <> '' DO NOTHING
             """,
             (
                 task_id,
@@ -286,6 +341,8 @@ def create_dlp_task(
                 domain_action,
                 json.dumps(domain_payload or {}, ensure_ascii=False),
                 json.dumps(domain_result or {}, ensure_ascii=False),
+                mail_draft_id,
+                idempotency_key,
                 destination_email,
                 requested_action,
                 message_raw,
@@ -316,6 +373,10 @@ def create_dlp_task(
             ),
         )
         conn.commit()
+    if idempotency_key:
+        existing = get_dlp_task_by_idempotency_key(idempotency_key)
+        if existing and str(existing.get("task_id") or "") != task_id:
+            return existing
     add_task_event(
         task_id,
         status,
@@ -330,6 +391,8 @@ def create_dlp_task(
             "task_type": task_type,
             "domain_action": domain_action,
             "domain_payload": domain_payload or {},
+            "mail_draft_id": mail_draft_id,
+            "idempotency_key": idempotency_key,
             "destination_email": destination_email,
             "tenant_id": tenant_id,
             "user_id": user_id,
@@ -357,6 +420,18 @@ def get_dlp_task(task_id: str) -> dict[str, Any] | None:
     init_task_store()
     with _connect() as conn:
         row = conn.execute("SELECT * FROM dlp_tasks WHERE task_id = %s", (task_id,)).fetchone()
+    return _decode_task(row)
+
+
+def get_dlp_task_by_idempotency_key(idempotency_key: str) -> dict[str, Any] | None:
+    if not str(idempotency_key or "").strip():
+        return None
+    init_task_store()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM dlp_tasks WHERE idempotency_key = %s",
+            (idempotency_key,),
+        ).fetchone()
     return _decode_task(row)
 
 
@@ -443,6 +518,182 @@ def get_task_events(task_id: str) -> list[dict[str, Any]]:
             (task_id,),
         ).fetchall()
     return [_decode_event(row) for row in rows]
+
+
+def create_mail_dlq_entry(
+    *,
+    task_id: str,
+    operation: str,
+    payload_digest: str = "",
+    last_error: str = "",
+    attempt_count: int = 0,
+    safe_replay_allowed: bool = False,
+    recovery_hint: str = "",
+    actor_context: dict[str, Any] | None = None,
+    payload_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    init_task_store()
+    existing = get_mail_dlq_entry_for_task(task_id, operation=operation, replay_status="pending")
+    if existing:
+        return existing
+    dlq_id = _new_id("dlq")
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO mail_dead_letter_queue (
+                dlq_id, task_id, operation, payload_digest, last_error, attempt_count,
+                safe_replay_allowed, recovery_hint, actor_context, payload_snapshot,
+                replay_count, replay_status, replay_result, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'pending', '{}', %s, %s)
+            """,
+            (
+                dlq_id,
+                task_id,
+                operation,
+                payload_digest,
+                last_error,
+                int(attempt_count or 0),
+                bool(safe_replay_allowed),
+                recovery_hint,
+                json.dumps(actor_context or {}, ensure_ascii=False),
+                json.dumps(payload_snapshot or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    add_task_event(
+        task_id,
+        "dead_letter_created",
+        "system",
+        {
+            "dlq_id": dlq_id,
+            "operation": operation,
+            "safe_replay_allowed": bool(safe_replay_allowed),
+            "recovery_hint": recovery_hint,
+            "last_error": last_error,
+        },
+    )
+    return get_mail_dlq_entry(dlq_id) or {}
+
+
+def get_mail_dlq_entry(dlq_id: str) -> dict[str, Any] | None:
+    init_task_store()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM mail_dead_letter_queue WHERE dlq_id = %s", (dlq_id,)).fetchone()
+    return _decode_dlq(row)
+
+
+def get_mail_dlq_entry_for_task(task_id: str, *, operation: str = "", replay_status: str = "") -> dict[str, Any] | None:
+    init_task_store()
+    clauses = ["task_id = %s"]
+    params: list[Any] = [task_id]
+    if operation:
+        clauses.append("operation = %s")
+        params.append(operation)
+    if replay_status:
+        clauses.append("replay_status = %s")
+        params.append(replay_status)
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM mail_dead_letter_queue WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+    return _decode_dlq(row)
+
+
+def list_mail_dlq_entries(*, replay_status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    init_task_store()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if replay_status:
+        clauses.append("replay_status = %s")
+        params.append(replay_status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM mail_dead_letter_queue {where} ORDER BY updated_at DESC LIMIT %s",
+            params,
+        ).fetchall()
+    return [_decode_dlq(row) for row in rows if row]
+
+
+def mark_mail_dlq_replay(dlq_id: str, *, status: str, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    init_task_store()
+    entry = get_mail_dlq_entry(dlq_id)
+    if not entry:
+        return None
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE mail_dead_letter_queue
+            SET replay_count = replay_count + 1,
+                replay_status = %s,
+                replay_result = %s,
+                updated_at = %s
+            WHERE dlq_id = %s
+            """,
+            (status, json.dumps(result or {}, ensure_ascii=False), now, dlq_id),
+        )
+        conn.commit()
+    add_task_event(
+        str(entry["task_id"]),
+        "dead_letter_replay_marked",
+        "system",
+        {"dlq_id": dlq_id, "replay_status": status, "result": result or {}},
+    )
+    return get_mail_dlq_entry(dlq_id)
+
+
+def replay_mail_dlq_entry(dlq_id: str, *, actor: str = "system") -> dict[str, Any]:
+    entry = get_mail_dlq_entry(dlq_id)
+    if not entry:
+        return {"ok": False, "status": "not_found", "error": "Unknown dlq_id"}
+    if not entry.get("safe_replay_allowed"):
+        updated = mark_mail_dlq_replay(
+            dlq_id,
+            status="blocked",
+            result={"ok": False, "error": "DLQ entry is not safe for automatic replay."},
+        )
+        return {"ok": False, "status": "blocked", "entry": updated}
+    task = get_dlp_task(str(entry["task_id"]))
+    if not task:
+        updated = mark_mail_dlq_replay(
+            dlq_id,
+            status="blocked",
+            result={"ok": False, "error": "Original task is missing."},
+        )
+        return {"ok": False, "status": "blocked", "entry": updated}
+    if task.get("status") not in {"dead_letter", "send_failed", "delivery_deferred"}:
+        updated = mark_mail_dlq_replay(
+            dlq_id,
+            status="blocked",
+            result={"ok": False, "error": f"Task status is not replay-safe: {task.get('status')}"},
+        )
+        return {"ok": False, "status": "blocked", "entry": updated, "task": task}
+    task = set_task_status(
+        str(task["task_id"]),
+        "queued_for_send",
+        actor=actor,
+        event_type="dead_letter_replay_queued",
+        event_message="DLQ replay moved the task back to the send queue checkpoint.",
+        extra_updates={
+            "delivery_status": "queued_for_send",
+            "delivery_error": "",
+            "manual_handover_required": False,
+            "next_recommended_action": "Enqueue email send worker with the existing idempotency key.",
+        },
+        details={"dlq_id": dlq_id, "operation": entry.get("operation"), "payload_digest": entry.get("payload_digest")},
+    )
+    updated = mark_mail_dlq_replay(
+        dlq_id,
+        status="replay_queued",
+        result={"ok": True, "task_id": str((task or {}).get("task_id") or ""), "status": "queued_for_send"},
+    )
+    return {"ok": True, "status": "replay_queued", "entry": updated, "task": task}
 
 
 def add_task_approval(task_id: str, action: str, actor: str, reason: str = "") -> dict[str, Any]:

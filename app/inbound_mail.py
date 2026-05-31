@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import imaplib
 import re
 from datetime import datetime, timedelta, timezone
@@ -168,39 +169,47 @@ def _extract_visible_html_text(raw_html: str) -> str:
     return _normalize_mail_text(parser.text())
 
 
-def _best_body_text(message) -> str:
+def _sanitize_html_fragment(raw_html: str, *, limit: int = 20000) -> str:
+    cleaned = re.sub(r"(?is)<(script|style|iframe|object|embed|svg|meta|link|head).*?>.*?</\1>", "", raw_html or "")
+    cleaned = re.sub(r"(?is)<(script|style|iframe|object|embed|svg|meta|link|head)[^>]*?/?>", "", cleaned)
+    cleaned = re.sub(r"\s+on[a-z]+\s*=\s*(['\"]).*?\1", "", cleaned)
+    cleaned = re.sub(r"\s+on[a-z]+\s*=\s*[^\s>]+", "", cleaned)
+    cleaned = re.sub(r"(?i)(href|src)\s*=\s*(['\"])\s*javascript:.*?\2", r"\1=\"#\"", cleaned)
+    cleaned = re.sub(r"(?i)(href|src)\s*=\s*javascript:[^\s>]+", r"\1=\"#\"", cleaned)
+    return cleaned.strip()[:limit]
+
+
+def _message_body_parts(message) -> tuple[str, str]:
     plain_parts: list[str] = []
     html_parts: list[str] = []
-    if message.is_multipart():
-        for part in message.walk():
-            content_disposition = str(part.get("Content-Disposition", "")).lower()
-            if "attachment" in content_disposition:
-                continue
-            content_type = part.get_content_type()
-            try:
-                payload = part.get_content()
-            except Exception:
-                continue
-            if content_type == "text/plain":
-                plain_parts.append(str(payload))
-            elif content_type == "text/html":
-                html_parts.append(str(payload))
-    else:
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        content_disposition = str(part.get("Content-Disposition", "")).lower()
+        if "attachment" in content_disposition:
+            continue
+        content_type = part.get_content_type()
         try:
-            payload = message.get_content()
+            payload = part.get_content()
         except Exception:
-            payload = ""
-        content_type = message.get_content_type()
+            continue
         if content_type == "text/plain":
             plain_parts.append(str(payload))
         elif content_type == "text/html":
             html_parts.append(str(payload))
-
     plain_text = _normalize_mail_text("\n".join(plain_parts))
+    raw_html = "\n".join(html_parts)
+    sanitized_html = _sanitize_html_fragment(raw_html)
+    if not plain_text and raw_html:
+        plain_text = _extract_visible_html_text(raw_html)
+    return plain_text, sanitized_html
+
+
+def _best_body_text(message) -> str:
+    plain_text, sanitized_html = _message_body_parts(message)
     if plain_text:
         return plain_text
 
-    html_text = _extract_visible_html_text("\n".join(html_parts))
+    html_text = _extract_visible_html_text(sanitized_html)
     if html_text:
         return html_text
 
@@ -276,6 +285,87 @@ def _classify_risk_hint(text: str) -> str:
     return str(result.get("risk_level", "low"))
 
 
+def _normalize_subject_for_thread(value: str) -> str:
+    cleaned = str(value or "").strip().lower()
+    cleaned = re.sub(r"^(\s*(re|fw|fwd|答复|回复)\s*[:：]\s*)+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned or "(no subject)"
+
+
+def _extract_references(value: str) -> str:
+    ids = [item.strip("<> \t") for item in re.split(r"\s+", value or "") if item.strip()]
+    return ids[-1] if ids else ""
+
+
+def _infer_thread_id(parsed, mailbox: str, uid: str, sender: str, recipients: str, subject: str) -> tuple[str, str]:
+    provider_thread_id = _extract_references(str(parsed.get("References") or "")) or str(parsed.get("In-Reply-To") or "").strip("<> ")
+    if provider_thread_id:
+        seed = provider_thread_id
+    else:
+        participants = "|".join(sorted(_split_email_values(f"{sender},{recipients}"))[:8])
+        seed = "|".join([mailbox, _normalize_subject_for_thread(subject), participants])
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    return f"thread_{digest}", provider_thread_id
+
+
+def _split_email_values(value: str) -> list[str]:
+    addresses = [email.strip().lower() for _, email in getaddresses([value or ""]) if email.strip()]
+    if addresses:
+        return addresses
+    return [item.strip().lower() for item in re.split(r"[,;]\s*", value or "") if item.strip()]
+
+
+def _labels_from_flags(flags_blob: str, mailbox: str) -> list[str]:
+    labels = {str(mailbox or "INBOX").strip().lower()}
+    if "\\Seen" in flags_blob:
+        labels.add("seen")
+    else:
+        labels.add("unread")
+    if "\\Flagged" in flags_blob:
+        labels.add("flagged")
+    if "\\Answered" in flags_blob:
+        labels.add("answered")
+    return sorted(label for label in labels if label)
+
+
+def _attachment_metadata(message) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for index, part in enumerate(message.walk() if message.is_multipart() else []):
+        content_disposition = str(part.get("Content-Disposition", "")).lower()
+        filename = part.get_filename()
+        if "attachment" not in content_disposition and not filename:
+            continue
+        payload = b""
+        try:
+            decoded = part.get_payload(decode=True)
+            if isinstance(decoded, bytes):
+                payload = decoded
+        except Exception:
+            payload = b""
+        provider_attachment_id = str(part.get("Content-ID") or part.get("Content-Location") or f"part-{index}").strip("<> ")
+        attachments.append(
+            {
+                "attachment_id": f"attachment_{hashlib.sha1((provider_attachment_id + str(filename or index)).encode('utf-8')).hexdigest()[:12]}",
+                "filename": str(filename or f"attachment-{index}.bin"),
+                "content_type": str(part.get_content_type() or "application/octet-stream"),
+                "size_bytes": len(payload),
+                "provider_attachment_id": provider_attachment_id,
+                "content_ref": "",
+                "inline": "inline" in content_disposition,
+                "source_policy": {"body_source": "metadata_only", "attachment_source": "attachment_only"},
+            }
+        )
+    return attachments
+
+
+def _headers_snapshot(parsed) -> dict[str, Any]:
+    return {
+        "message_id": str(parsed.get("Message-ID") or "").strip(),
+        "in_reply_to": str(parsed.get("In-Reply-To") or "").strip(),
+        "references": str(parsed.get("References") or "").strip()[-1000:],
+        "content_type": str(parsed.get_content_type() or ""),
+    }
+
+
 def _parse_fetched_message(mailbox: str, uid: str, response_parts: list[Any]) -> dict[str, Any] | None:
     raw_bytes = b""
     flags_blob = ""
@@ -290,23 +380,36 @@ def _parse_fetched_message(mailbox: str, uid: str, response_parts: list[Any]) ->
     if not raw_bytes:
         return None
     parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-    text = _text_from_message(parsed)
+    text, sanitized_html = _message_body_parts(parsed)
+    if not text:
+        text = _text_from_message(parsed)
     sender = _decode_addresses(str(parsed.get("From") or ""))
     subject = str(parsed.get("Subject") or "").strip()
     snippet = _summarize_text(text, 800)
     message_id = str(parsed.get("Message-ID") or "").strip().strip("<>")
     if not message_id:
         message_id = f"{mailbox}:{uid}"
+    recipients = _decode_addresses(str(parsed.get("To") or ""))
+    thread_id, provider_thread_id = _infer_thread_id(parsed, mailbox, uid, sender, recipients, subject)
+    body_preview = _summarize_text(text, 240)
     return {
         "message_id": message_id,
         "mailbox": mailbox,
         "uid": uid,
+        "thread_id": thread_id,
+        "provider_thread_id": provider_thread_id,
         "sender": sender,
-        "recipients": _decode_addresses(str(parsed.get("To") or "")),
+        "recipients": recipients,
         "subject": subject,
         "received_at": _message_datetime(str(parsed.get("Date") or "")),
         "snippet": snippet,
         "summary": _generate_mail_summary(subject, sender, text),
+        "body_text": text,
+        "body_html_sanitized": sanitized_html,
+        "body_preview": body_preview,
+        "labels": _labels_from_flags(flags_blob, mailbox),
+        "attachments": _attachment_metadata(parsed),
+        "headers_json": _headers_snapshot(parsed),
         "risk_hint": _classify_risk_hint(text),
         "raw_size": len(raw_bytes),
         "is_seen": "\\Seen" in flags_blob,
