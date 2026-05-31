@@ -8,17 +8,20 @@ import uuid
 
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time, timezone
 from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from redis import Redis
 
+from app.actor_context import ActorContext, build_actor_context, permission_observation, require_permission
+from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
+from app.backpressure import check_rate_limit
 from app.config import get_settings
 from app.conversation_memory import build_memory_context, compact_text, infer_title, write_merged_summary, write_turn_summary
 from app.conversation_store import (
@@ -36,9 +39,11 @@ from app.conversation_store import (
 from app.corpus import list_problem_summaries, problem_lookup
 from app.dlp_entry import classify_dlp_entry, extract_destination_email as dlp_extract_destination_email, looks_like_outbound_action as dlp_looks_like_outbound_action
 from app.dlp_scenarios import build_status_path, evaluate_scenario_task, get_dlp_scenario, list_dlp_scenarios, normalize_fault_injection
+from app.email_sender import send_email_smtp
 from app.enterprise_rag.core.service import answer_enterprise_question
 from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
 from app.enterprise_rag.eval.casebook import build_casebook
+from app.enterprise_rag.ingestion.manifest_store import load_manifest
 from app.enterprise_rag.ingestion.indexer import ingest_enterprise_rag_bench
 from app.graph import execute_confirmed_plan, get_llm, preview_plan, run_agent
 from app.hermes_memory import init_workspace_memory_index
@@ -87,6 +92,7 @@ from app.metrics import (
     record_workflow_created,
     record_workflow_email_sent,
     record_workflow_rejected,
+    record_queue_backlog,
     refresh_task_metrics,
     render_metrics,
 )
@@ -151,14 +157,30 @@ from app.observability import configure_observability
 from app.orchestration import orchestrate_agent_request
 from app.orchestration.fast_router import route_agent_request
 from app.orchestration.final_renderer import render_final_answer, render_mail_authoring
+from app.orchestration.multi_agent_planner import plan_multi_agent_dag_request
+from app.orchestration.observations import make_typed_observation
 from app.orchestration.registry import build_tool_executor_map
+from app.orchestration.trace_evaluator import attach_trace_evaluation
 from app.orchestration.types import OrchestrationContext
-from app.privacy_lab import scan_sensitive_message
+from app.privacy_lab import load_active_privacy_policy, scan_sensitive_message
 from app.raw_vs_langgraph import compare_raw_llm_and_langgraph
+from app.resilience import make_failure_observation
 from app.session_store import append_turn, delete_plan, load_plan, save_plan
 from app.sensitive_workflow import run_sensitive_outbound_workflow
 from app.task_events import build_task_event, publish_task_event, task_event_iterator
-from app.task_queue import EMAIL_QUEUE, MAIL_QUEUE, RISK_QUEUE, enqueue_daily_mail_digest, enqueue_dlp_risk_task, enqueue_email_send_task, enqueue_inbound_mail_sync
+from app.task_queue import (
+    EMAIL_QUEUE,
+    MAIL_QUEUE,
+    RISK_QUEUE,
+    enqueue_daily_mail_digest,
+    enqueue_dlp_risk_task,
+    enqueue_email_send_task,
+    enqueue_enterprise_benchmark,
+    enqueue_enterprise_ingest,
+    enqueue_meeting_task,
+    enqueue_inbound_mail_sync,
+    get_queue_health,
+)
 from app.task_store import (
     add_task_event,
     approve_task,
@@ -194,12 +216,119 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _permission_denied(actor: ActorContext, action: str, resource: str = "") -> HTTPException:
+    decision = require_permission(actor, action, resource)
+    return HTTPException(status_code=403, detail=permission_observation(actor, decision))
+
+
+def _ensure_permission(actor: ActorContext, action: str, resource: str = "") -> dict[str, Any]:
+    decision = require_permission(actor, action, resource)
+    if not decision.allowed:
+        raise _permission_denied(actor, action, resource)
+    return decision.to_dict()
+
+
+def _ensure_rate_limit(actor: ActorContext, resource: str) -> dict[str, Any]:
+    decision = check_rate_limit(actor, resource)
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "observation_type": "rate_limited",
+                "ok": False,
+                "actor_context": actor.to_dict(),
+                "rate_limit_decision": decision.to_dict(),
+            },
+        )
+    return decision.to_dict()
+
+
+def _attach_landing_context(
+    response: UnifiedAgentResponse,
+    *,
+    actor: ActorContext,
+    permission_decision: dict[str, Any],
+    rate_limit_decision: dict[str, Any],
+    queue_status: dict[str, Any] | None = None,
+    task_mode: str = "sync",
+) -> UnifiedAgentResponse:
+    response.actor_context = actor.to_dict()
+    response.permission_decision = dict(permission_decision or {})
+    response.rate_limit_decision = dict(rate_limit_decision or {})
+    response.queue_status = dict(queue_status or {})
+    response.task_mode = task_mode
+    return response
+
+
+def _refresh_queue_metrics() -> dict[str, Any]:
+    health = get_queue_health()
+    try:
+        record_queue_backlog({str(queue): int(count) for queue, count in dict(health.get("queues") or {}).items()})
+    except Exception:
+        logger.debug("Queue metrics refresh failed", exc_info=True)
+    return health
+
+
+def _mark_task_enqueue_failed(
+    task: dict[str, Any],
+    *,
+    service: str,
+    operation: str,
+    error: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observation = make_failure_observation(
+        service=service,
+        operation=operation,
+        error=error,
+        fallback_strategy="mark_task_failed_and_return_recovery_observation",
+        retry_count=0,
+        actor_context=actor_context,
+        severity="high",
+    )
+    task_id = str(task.get("task_id") or "")
+    updated = update_task(
+        task_id,
+        status="failed",
+        delivery_status="failed",
+        delivery_error=error,
+        final_result="The task could not be queued for asynchronous worker execution.",
+        last_error_category="transient_infra",
+        manual_handover_required=True,
+        next_recommended_action="Check Redis/Celery worker health, then retry the governed action.",
+        domain_result={
+            **dict(task.get("domain_result") or {}),
+            "ok": False,
+            "error": error,
+            "recovery_observation": observation,
+        },
+    ) or task
+    add_task_event(
+        task_id,
+        "enqueue_failed",
+        "api",
+        {"message": "Task enqueue failed; returning recovery observation.", "error": error, "operation": operation},
+    )
+    publish_task_event(
+        build_task_event(
+            task_id=task_id,
+            status="failed",
+            event_type="enqueue_failed",
+            message="Task enqueue failed; worker did not receive the job.",
+            delivery_status="failed",
+            delivery_error=error,
+        )
+    )
+    return updated
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_observability()
     init_conversation_store()
     init_workflow_store()
     init_task_store()
+    init_auth_store()
     init_inbound_mail_store()
     init_workspace_memory_index()
     init_hermes_dynamic_memory_store()
@@ -456,6 +585,28 @@ def _sanitize_recent_content(text: str) -> str:
     return "" if cleaned in OUTBOUND_NON_CONTENT_ANSWERS else cleaned
 
 
+INLINE_MAIL_BODY_PATTERNS = (
+    re.compile(r"(?:文段|正文|内容|文本)(?:是|为)?[:：]\s*(.+)$", re.IGNORECASE | re.DOTALL),
+    re.compile(r"(?:send|email|mail)\s+(?:this\s+)?(?:text|content)[:：]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
+)
+
+
+def _extract_inline_mail_body(message: str) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    for pattern in INLINE_MAIL_BODY_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        body = str(match.group(1) or "").strip()
+        body = body.strip().strip("“”\"'`")
+        body = body.strip()
+        if body:
+            return body
+    return ""
+
+
 def _collect_outbound_candidates(
     payload: UnifiedAgentRequest,
     conversation_id: str,
@@ -495,6 +646,15 @@ def _collect_outbound_candidates(
                 "supports_attachment": supports_attachment,
                 "upload_blob_id": upload_blob_id,
             }
+        )
+
+    inline_mail_body = _extract_inline_mail_body(str(payload.message or ""))
+    if inline_mail_body:
+        _append_candidate(
+            kind="user_inline_text",
+            content=inline_mail_body,
+            label="用户本轮明确提供的正文",
+            content_type="text/plain",
         )
 
     current_upload_text = _sanitize_recent_content(str(payload.uploaded_text or ""))
@@ -593,6 +753,17 @@ def _build_outbound_resolution(
 def _task_answer_text(task: dict[str, Any]) -> str:
     status = str(task.get("status", ""))
     task_id = str(task.get("task_id", ""))
+    task_type = str(task.get("task_type") or "")
+    if task_type.startswith("domain_"):
+        action = str(task.get("domain_action") or "domain action")
+        if status == "queued":
+            return f"已创建受控异步任务 `{task_id}`，将执行 `{action}`。系统会通过队列执行并记录结果。"
+        if status == "processing":
+            return f"任务 `{task_id}` 正在执行 `{action}`。"
+        if status == "completed":
+            return str(task.get("final_result") or task.get("delivery_result") or f"任务 `{task_id}` 已完成。")
+        if status == "failed":
+            return str(task.get("final_result") or f"任务 `{task_id}` 执行失败，请查看任务台错误详情。")
     if status in {"needs_clarification", "input_invalid"}:
         return str(task.get("clarification_question") or "我已保留你的外发请求，但还需要补充信息后才能继续处理。")
     if status == "queued":
@@ -631,7 +802,7 @@ def _mail_provider_capabilities() -> dict[str, bool]:
     }
 
 
-def _build_task_status_observation(task: dict[str, Any]) -> dict[str, Any]:
+def _build_task_status_observation(task: dict[str, Any], actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
     answer_hint = _task_answer_text(task)
     payload = {
         "task_id": str(task.get("task_id") or ""),
@@ -649,15 +820,16 @@ def _build_task_status_observation(task: dict[str, Any]) -> dict[str, Any]:
         },
         "task": task,
     }
-    return {
-        "observation_type": "task_status_result",
-        "source": "task_queue",
-        "grounding_kind": "tool",
-        "summary": compact_text(answer_hint, 220),
-        "payload": payload,
-        "citations": [],
-        "confidence": 0.98,
-    }
+    return make_typed_observation(
+        observation_type="task_status_result",
+        source="task_queue",
+        grounding_kind="tool",
+        summary=compact_text(answer_hint, 220),
+        payload=payload,
+        citations=[],
+        confidence=0.98,
+        actor_context=actor_context,
+    )
 
 
 def _build_mail_plan_observation(
@@ -668,6 +840,7 @@ def _build_mail_plan_observation(
     draft_mode: str = "",
     observation_type: str = "mail_plan_result",
     extra_payload: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_body = str(mail_plan.get("resolved_body") or "")
     resolved_subject = str(mail_plan.get("resolved_subject") or "")
@@ -699,15 +872,16 @@ def _build_mail_plan_observation(
     }
     if extra_payload:
         payload.update(extra_payload)
-    return {
-        "observation_type": observation_type,
-        "source": source,
-        "grounding_kind": "tool",
-        "summary": compact_text(summary or resolved_body or resolved_subject or "已生成邮件计划。", 220),
-        "payload": payload,
-        "citations": [],
-        "confidence": 0.95,
-    }
+    return make_typed_observation(
+        observation_type=observation_type,
+        source=source,
+        grounding_kind="tool",
+        summary=compact_text(summary or resolved_body or resolved_subject or "已生成邮件计划。", 220),
+        payload=payload,
+        citations=[],
+        confidence=0.95,
+        actor_context=actor_context,
+    )
 
 
 def _build_mailbox_summary_observation(
@@ -716,16 +890,18 @@ def _build_mailbox_summary_observation(
     summary_text: str,
     payload: dict[str, Any],
     confidence: float = 0.92,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "observation_type": "mailbox_summary_result",
-        "source": source,
-        "grounding_kind": "tool",
-        "summary": compact_text(summary_text, 220),
-        "payload": payload,
-        "citations": [],
-        "confidence": confidence,
-    }
+    return make_typed_observation(
+        observation_type="mailbox_summary_result",
+        source=source,
+        grounding_kind="tool",
+        summary=compact_text(summary_text, 220),
+        payload=payload,
+        citations=[],
+        confidence=confidence,
+        actor_context=actor_context,
+    )
 
 
 def _build_compound_observation(
@@ -733,14 +909,10 @@ def _build_compound_observation(
     question: str,
     observations: list[dict[str, Any]],
     subtasks: list[dict[str, Any]],
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summaries = [compact_text(str(item.get("summary") or ""), 120) for item in observations if str(item.get("summary") or "").strip()]
-    return {
-        "observation_type": "compound_result",
-        "source": "compound_plan_execute",
-        "grounding_kind": "mixed",
-        "summary": compact_text("；".join(summaries[:4]) or question, 240),
-        "payload": {
+    payload = {
             "question": question,
             "subtasks": subtasks,
             "observation_summaries": [
@@ -752,10 +924,17 @@ def _build_compound_observation(
                 for item in observations
             ],
             "grounding_sources": [str(item.get("source") or "") for item in observations if str(item.get("source") or "").strip()],
-        },
-        "citations": [citation for item in observations for citation in list(item.get("citations") or [])][:8],
-        "confidence": 0.9,
     }
+    return make_typed_observation(
+        observation_type="compound_result",
+        source="compound_plan_execute",
+        grounding_kind="mixed",
+        summary=compact_text("；".join(summaries[:4]) or question, 240),
+        payload=payload,
+        citations=[citation for item in observations for citation in list(item.get("citations") or [])][:8],
+        confidence=0.9,
+        actor_context=actor_context,
+    )
 
 
 def _build_task_agent_response(
@@ -906,7 +1085,10 @@ def _should_apply_recoverable_supplement(task: dict[str, Any] | None, payload: U
     return str(task.get("entry_issue_type", "")) == "file_parse_failed"
 
 
-def _create_async_dlp_task(payload: DlpTaskCreateRequest) -> dict:
+def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[str, Any] | None = None) -> dict:
+    actor = build_actor_context(payload=payload, session_id=payload.session_id, conversation_id=payload.conversation_id)
+    if actor_context:
+        actor = ActorContext(**{**actor.to_dict(), **dict(actor_context or {})})
     combined_message = (payload.review_content or "").strip() or (payload.resolved_outbound_content or "").strip() or _task_message(
         payload.message,
         payload.uploaded_text,
@@ -997,21 +1179,33 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest) -> dict:
         scenario_name=payload.scenario_name,
         fault_injection=fault_injection,
         expected_outcome=dict(payload.expected_outcome or {}),
+        tenant_id=actor.tenant_id,
+        user_id=actor.user_id,
+        workspace_id=actor.workspace_id,
     )
     record_task_created()
     if payload.lab_run and payload.scenario_id:
         record_dlp_scenario_replay(payload.scenario_id)
     if status == "queued":
-        enqueue_dlp_risk_task(str(task["task_id"]))
-        publish_task_event(
-            build_task_event(
-                task_id=str(task["task_id"]),
-                status=str(task["status"]),
-                event_type="queued",
-                message="Task queued for asynchronous DLP processing.",
-                delivery_status=str(task.get("delivery_status", "not_sent")),
+        try:
+            enqueue_dlp_risk_task(str(task["task_id"]))
+            publish_task_event(
+                build_task_event(
+                    task_id=str(task["task_id"]),
+                    status=str(task["status"]),
+                    event_type="queued",
+                    message="Task queued for asynchronous DLP processing.",
+                    delivery_status=str(task.get("delivery_status", "not_sent")),
+                )
             )
-        )
+        except Exception as exc:
+            task = _mark_task_enqueue_failed(
+                task,
+                service="celery",
+                operation="enqueue_dlp_risk_task",
+                error=str(exc),
+                actor_context=actor.to_dict(),
+            )
     else:
         publish_task_event(
             build_task_event(
@@ -1114,9 +1308,388 @@ def _get_latest_pending_mail_confirmation(conversation_id: str) -> dict[str, Any
     return {}
 
 
+def _get_latest_pending_domain_confirmation(conversation_id: str) -> dict[str, Any]:
+    for turn in reversed(get_turns(conversation_id, limit=12)):
+        if str(turn.get("role") or "").lower() != "assistant":
+            continue
+        debug_payload = dict(turn.get("debug_payload") or {})
+        confirmation_payload = dict(debug_payload.get("confirmation_payload") or {})
+        tool_name = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "")
+        if confirmation_payload and tool_name.startswith(("meeting_", "calendar_")):
+            return confirmation_payload
+    return {}
+
+
+def _get_latest_pending_confirmation(conversation_id: str) -> dict[str, Any]:
+    for turn in reversed(get_turns(conversation_id, limit=12)):
+        if str(turn.get("role") or "").lower() != "assistant":
+            continue
+        debug_payload = dict(turn.get("debug_payload") or {})
+        confirmation_payload = dict(debug_payload.get("confirmation_payload") or {})
+        if not confirmation_payload:
+            continue
+        mail_plan = dict(confirmation_payload.get("mail_plan") or {})
+        if mail_plan and str(mail_plan.get("mail_action_type") or "").startswith(("send_", "compose_")):
+            return {"kind": "mail", "payload": confirmation_payload}
+        tool_name = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "")
+        if tool_name.startswith(("meeting_", "calendar_")):
+            return {"kind": "domain", "payload": confirmation_payload}
+    return {}
+
+
+def _create_domain_task_from_confirmation(
+    *,
+    session_id: str,
+    conversation_id: str,
+    request_message: str,
+    confirmation_payload: dict[str, Any],
+    actor_context: dict[str, Any],
+) -> dict[str, Any]:
+    action = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "").strip()
+    tool_input = dict(confirmation_payload.get("tool_input") or {})
+    idempotency_key = str(confirmation_payload.get("idempotency_key") or tool_input.get("idempotency_key") or "").strip()
+    if not action.startswith("meeting_"):
+        raise HTTPException(status_code=400, detail={"error": "unsupported_domain_confirmation", "action": action})
+    if idempotency_key:
+        for existing in list_dlp_tasks(
+            session_id=session_id,
+            tenant_id=str(actor_context.get("tenant_id") or ""),
+            workspace_id=str(actor_context.get("workspace_id") or ""),
+        ):
+            if str(existing.get("task_type") or "") != "domain_meeting":
+                continue
+            payload = dict(existing.get("domain_payload") or {})
+            if isinstance(payload.get("tool_input"), dict):
+                payload = dict(payload.get("tool_input") or {})
+            if str(payload.get("idempotency_key") or "") == idempotency_key:
+                return existing
+    domain_payload = {
+        **tool_input,
+        "_confirmed_action": action,
+        "_dag_plan": dict(confirmation_payload.get("dag_plan") or {}),
+        "_confirmation_payload": {
+            "risk": str(confirmation_payload.get("risk") or ""),
+            "confirmation_required": bool(confirmation_payload.get("confirmation_required", True)),
+        },
+    }
+
+    task = create_dlp_task(
+        task_type="domain_meeting",
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message_raw=request_message,
+        request_message=request_message,
+        destination_email="",
+        requested_action=action,
+        status="queued",
+        domain_action=action,
+        domain_payload=domain_payload,
+        tenant_id=str(actor_context.get("tenant_id") or ""),
+        user_id=str(actor_context.get("user_id") or ""),
+        workspace_id=str(actor_context.get("workspace_id") or ""),
+    )
+    try:
+        enqueue_meeting_task(str(task["task_id"]))
+    except Exception as exc:
+        task = _mark_task_enqueue_failed(
+            task,
+            service="celery",
+            operation="enqueue_meeting_task",
+            error=str(exc),
+            actor_context=actor_context,
+        )
+    return task
+
+
 def _get_latest_pending_mail_draft(conversation_id: str) -> dict[str, Any]:
     confirmation_payload = _get_latest_pending_mail_confirmation(conversation_id)
-    return dict(confirmation_payload.get("mail_plan") or {})
+    if confirmation_payload.get("mail_plan"):
+        return dict(confirmation_payload.get("mail_plan") or {})
+    for turn in reversed(get_turns(conversation_id, limit=12)):
+        if str(turn.get("role") or "").lower() != "assistant":
+            continue
+        debug_payload = dict(turn.get("debug_payload") or {})
+        mail_plan = dict((debug_payload.get("task_plan") or {}).get("mail_plan") or {})
+        if mail_plan and str(mail_plan.get("mail_action_type") or "").startswith(("send_", "compose_")):
+            return mail_plan
+    return {}
+
+
+def _latest_completed_meeting_task(
+    *,
+    session_id: str,
+    conversation_id: str,
+    actor_context: dict[str, Any],
+) -> dict[str, Any]:
+    for task in list_dlp_tasks(
+        session_id=session_id,
+        tenant_id=str(actor_context.get("tenant_id") or ""),
+        workspace_id=str(actor_context.get("workspace_id") or ""),
+        status="completed",
+    ):
+        if str(task.get("task_type") or "") != "domain_meeting":
+            continue
+        if str(task.get("conversation_id") or "") != conversation_id:
+            continue
+        if str(task.get("domain_action") or "") != "meeting_create_tencent_meeting":
+            continue
+        return task
+    return {}
+
+
+def _meeting_result_details(task: dict[str, Any]) -> dict[str, Any]:
+    domain_result = dict(task.get("domain_result") or {})
+    result = dict(domain_result.get("result") or {})
+    details = {
+        "meeting_id": str(result.get("meeting_id") or ""),
+        "meeting_code": str(result.get("meeting_code") or ""),
+        "meeting_url": str(result.get("meeting_url") or result.get("join_url") or ""),
+        "subject": str(result.get("subject") or ""),
+        "start_time": str(result.get("start_time") or ""),
+        "end_time": str(result.get("end_time") or ""),
+        "summary": str(result.get("summary") or result.get("content_text") or task.get("final_result") or ""),
+        "provider": str(result.get("provider") or "tencent_meeting_mcp"),
+    }
+    if details["meeting_id"] and details["meeting_url"]:
+        return details
+    parsed = _parse_meeting_content_text(str(result.get("content_text") or ""))
+    for key, value in parsed.items():
+        if not details.get(key):
+            details[key] = value
+    normalized = dict(result.get("normalized_request") or {})
+    if not details["subject"]:
+        details["subject"] = str(normalized.get("topic") or "")
+    if not details["start_time"]:
+        details["start_time"] = str(normalized.get("start_time") or "")
+    if not details["end_time"]:
+        details["end_time"] = str(normalized.get("end_time") or "")
+    return details
+
+
+def _parse_meeting_content_text(content_text: str) -> dict[str, str]:
+    if not content_text:
+        return {}
+    try:
+        outer = json.loads(content_text)
+    except Exception:
+        return {}
+    payload = outer
+    body = outer.get("body") if isinstance(outer, dict) else None
+    if isinstance(body, str):
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = outer
+    if not isinstance(payload, dict):
+        return {}
+    meetings = payload.get("meeting_info_list")
+    meeting = meetings[0] if isinstance(meetings, list) and meetings and isinstance(meetings[0], dict) else payload
+    return {
+        "meeting_id": str(meeting.get("meeting_id") or ""),
+        "meeting_code": str(meeting.get("meeting_code") or ""),
+        "meeting_url": str(meeting.get("join_url") or meeting.get("meeting_url") or ""),
+        "subject": str(meeting.get("subject") or ""),
+        "start_time": str(meeting.get("start_time") or ""),
+        "end_time": str(meeting.get("end_time") or ""),
+    }
+
+
+def _meeting_invitation_draft_result(task: dict[str, Any]) -> dict[str, Any]:
+    domain_result = dict(task.get("domain_result") or {})
+    for item in reversed(list(domain_result.get("post_confirm_results") or [])):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("action") or "") == "mail_invitation_draft":
+            return dict(item.get("result") or {})
+    return {}
+
+
+def _mail_plan_from_meeting_task(
+    *,
+    task: dict[str, Any],
+    conversation_id: str,
+    request_message: str,
+    recipient: str = "",
+) -> dict[str, Any]:
+    details = _meeting_result_details(task)
+    draft_result = _meeting_invitation_draft_result(task)
+    draft_state = dict(draft_result.get("draft_state") or {})
+    meeting = dict(draft_state.get("meeting") or {})
+    for key, value in details.items():
+        if value and not meeting.get(key):
+            meeting[key] = value
+    subject = str(draft_state.get("subject") or meeting.get("subject") or details.get("subject") or "腾讯会议邀请")
+    if "会议邀请" not in subject:
+        subject = f"{subject} - 会议邀请"
+    meeting_text = json.dumps(
+        {
+            "topic": meeting.get("topic") or meeting.get("subject") or details.get("subject") or "",
+            "meeting_id": meeting.get("meeting_id") or details.get("meeting_id") or "",
+            "meeting_code": meeting.get("meeting_code") or details.get("meeting_code") or "",
+            "meeting_url": meeting.get("meeting_url") or details.get("meeting_url") or "",
+            "start_time": meeting.get("start_time") or details.get("start_time") or "",
+            "end_time": meeting.get("end_time") or details.get("end_time") or "",
+            "provider_summary": meeting.get("provider_summary") or details.get("summary") or "",
+        },
+        ensure_ascii=False,
+    )
+    recipients = [recipient] if recipient else []
+    missing_fields = [] if recipients else ["recipient"]
+    return {
+        "draft_id": f"meeting-{task.get('task_id')}",
+        "conversation_id": conversation_id,
+        "status": "pending_confirmation" if recipients else "draft",
+        "draft_state": "confirm" if recipients else "draft",
+        "patch_kind": "",
+        "mail_action_type": "send_meeting_invitation",
+        "target_object": "meeting_invitation",
+        "resolved_recipients": recipients,
+        "resolved_subject": subject,
+        "resolved_body": "",
+        "resolved_attachments": [],
+        "source_refs": [str(task.get("task_id") or ""), "meeting_result"],
+        "requires_confirmation": bool(recipients),
+        "unsupported_reason": "",
+        "unsupported_code": "",
+        "missing_fields": missing_fields,
+        "review_content": meeting_text,
+        "request_message": request_message,
+        "selected_candidate": {
+            "kind": "meeting_invitation",
+            "label": subject,
+            "filename": "",
+            "content_type": "application/json",
+            "content": meeting_text,
+        },
+        "attachment_candidate": None,
+        "resolution_rule": "meeting_result_invitation",
+        "body_constraints": {
+            "source_policy": "meeting_result_only",
+            "send_requires_dlp": True,
+            "send_requires_confirmation": True,
+        },
+        "body_sources": [
+            {
+                "kind": "meeting_result",
+                "role": "meeting_invitation_details",
+                "policy": "summarize_only",
+                "task_id": str(task.get("task_id") or ""),
+            }
+        ],
+        "source_policy": {
+            "meeting_result": "meeting_result_only",
+            "attachment_source": "attachment_only",
+            "body_source": "user_explicit_or_meeting_result",
+        },
+        "meeting_result": details,
+        "domain_task_id": str(task.get("task_id") or ""),
+    }
+
+
+def _extract_email_from_message(message: str) -> str:
+    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", message or "", re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+def _looks_like_meeting_result_followup(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(
+        token in lowered or token in (message or "")
+        for token in ("会议结果", "会议链接", "创建好了吗", "结果", "meeting result", "meeting link", "created meeting", "what happened")
+    )
+
+
+def _looks_like_meeting_invitation_continuation(message: str) -> bool:
+    text = message or ""
+    lowered = text.lower()
+    if _extract_email_from_message(text):
+        return True
+    return any(
+        token in lowered or token in text
+        for token in (
+            "发给",
+            "发送给",
+            "邮件给",
+            "邀请",
+            "通知",
+            "send to",
+            "email to",
+            "invite",
+            "send invitation",
+        )
+    )
+
+
+def _build_meeting_result_response(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    display_message: str,
+    task: dict[str, Any],
+    actor_context: dict[str, Any],
+) -> UnifiedAgentResponse:
+    details = _meeting_result_details(task)
+    pending_mail_draft = _mail_plan_from_meeting_task(
+        task=task,
+        conversation_id=conversation_id,
+        request_message=message,
+        recipient="",
+    )
+    observation = make_typed_observation(
+        observation_type="meeting_result",
+        source="domain_meeting_task",
+        summary="A completed meeting creation task is available for the current conversation.",
+        payload={
+            "task_id": str(task.get("task_id") or ""),
+            "task_status": str(task.get("status") or ""),
+            "domain_action": str(task.get("domain_action") or ""),
+            "meeting": details,
+            "pending_mail_draft": pending_mail_draft,
+            "next_actions": ["show_meeting_result", "patch_invitation_recipients", "send_invitation_after_dlp"],
+            "missing_fields": list(pending_mail_draft.get("missing_fields") or []),
+        },
+        provenance={
+            "source": "task_store",
+            "task_id": str(task.get("task_id") or ""),
+            "task_type": str(task.get("task_type") or ""),
+        },
+        confidence=0.95,
+        actor_context=actor_context,
+    )
+    route_decision = {
+        "routing_source": "meeting_result_continuation",
+        "intent": "meeting_result",
+        "confidence": 0.96,
+        "router_reason": "The current conversation has a completed meeting task and the user asked for the meeting result.",
+    }
+    result = {
+        "intent": "meeting_result",
+        "observations": [observation],
+        "tool_observations": [observation],
+        "tool_calls": [
+            {
+                "tool_name": "domain_meeting_task",
+                "success": True,
+                "status": "completed",
+                "error": "",
+                "result": {"meeting": details, "pending_mail_draft": pending_mail_draft},
+            }
+        ],
+        "task_plan": {"pending_mail_draft": pending_mail_draft},
+        "termination_reason": "meeting_result_ready",
+        "final_answer_source": "meeting_result_renderer",
+    }
+    return _build_fast_path_response(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message=message,
+        display_message=display_message,
+        route_decision=route_decision,
+        result=result,
+        latency_ms=0.0,
+        actor_context=actor_context,
+    )
 
 
 def _render_mail_plan_with_llm(
@@ -1128,6 +1701,7 @@ def _render_mail_plan_with_llm(
     candidates: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     rendered_plan = dict(mail_plan or {})
+    started = perf_counter()
     render_result = render_mail_authoring(
         question=message,
         render_mode=render_mode,
@@ -1135,6 +1709,7 @@ def _render_mail_plan_with_llm(
         observations=observations,
         candidates=candidates,
     )
+    render_result["latency_ms"] = round((perf_counter() - started) * 1000.0, 2)
     body_for_sending = str(render_result.get("body_for_sending") or "").strip()
     if body_for_sending:
         rendered_plan["resolved_body"] = body_for_sending
@@ -1144,6 +1719,11 @@ def _render_mail_plan_with_llm(
             dict(rendered_plan.get("attachment_candidate") or {}) or None,
         )
     return rendered_plan, render_result
+
+
+def _mail_render_latency_ms(render_result: dict[str, Any]) -> float:
+    latency = float(render_result.get("latency_ms") or 0.0)
+    return round(max(latency, 0.01), 2)
 
 
 def _build_mail_clarification_response(
@@ -1161,6 +1741,7 @@ def _build_mail_clarification_response(
         render_mode="clarification",
         candidates=list(candidates or []),
     )
+    latency_ms = _mail_render_latency_ms(render_result)
     clarification_question = str(render_result.get("clarification_question") or render_result.get("user_message") or "").strip()
     mail_observation = _build_mail_plan_observation(
         rendered_plan,
@@ -1203,7 +1784,7 @@ def _build_mail_clarification_response(
         "merged_memory_hits": 0,
         "reflection_notes": None,
         "task_plan": {"mail_plan": rendered_plan, "candidates": list(candidates or [])},
-        "node_latencies_ms": {"total": 0.0},
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
         "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
@@ -1245,7 +1826,7 @@ def _build_mail_clarification_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
-        latency_ms=0.0,
+        latency_ms=latency_ms,
         tool_observations=[mail_observation],
         token_in=int(render_result.get("token_in", 0)),
         token_out=int(render_result.get("token_out", 0)),
@@ -1266,6 +1847,7 @@ def _build_mail_confirmation_response(
         mail_plan=mail_plan,
         render_mode="confirmation",
     )
+    latency_ms = _mail_render_latency_ms(render_result)
     confirmation_payload = {
         "action_name": "send_mail_plan",
         "title": "请确认邮件发送计划",
@@ -1317,7 +1899,7 @@ def _build_mail_confirmation_response(
         "confirmation_payload": confirmation_payload,
         "final_answer_source": "mail_confirmation",
         "termination_reason": "needs_confirmation",
-        "node_latencies_ms": {"total": 0.0},
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
         "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
@@ -1364,7 +1946,7 @@ def _build_mail_confirmation_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
-        latency_ms=0.0,
+        latency_ms=latency_ms,
         token_in=int(render_result.get("token_in", 0)),
         token_out=int(render_result.get("token_out", 0)),
         estimated_cost=float(render_result.get("estimated_cost", 0.0)),
@@ -1385,6 +1967,7 @@ def _build_mail_patch_response(
         mail_plan=mail_plan,
         render_mode="patch",
     )
+    latency_ms = _mail_render_latency_ms(render_result)
     confirmation_payload = {
         "action_name": "send_mail_plan",
         "title": "请确认更新后的邮件发送计划",
@@ -1438,7 +2021,7 @@ def _build_mail_patch_response(
         "confirmation_payload": confirmation_payload,
         "final_answer_source": "mail_patch_confirmation",
         "termination_reason": "needs_confirmation",
-        "node_latencies_ms": {"total": 0.0},
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
         "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
@@ -1485,7 +2068,7 @@ def _build_mail_patch_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
-        latency_ms=0.0,
+        latency_ms=latency_ms,
         token_in=int(render_result.get("token_in", 0)),
         token_out=int(render_result.get("token_out", 0)),
         estimated_cost=float(render_result.get("estimated_cost", 0.0)),
@@ -1505,6 +2088,7 @@ def _build_mail_draft_response(
         mail_plan=mail_plan,
         render_mode="draft",
     )
+    latency_ms = _mail_render_latency_ms(render_result)
     draft_observation = _build_mail_plan_observation(
         rendered_plan,
         source="mail_authoring_plan",
@@ -1547,7 +2131,7 @@ def _build_mail_draft_response(
         "reflection_notes": None,
         "task_plan": {"mail_plan": rendered_plan},
         "final_answer_source": "mail_authoring",
-        "node_latencies_ms": {"total": 0.0},
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
         "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
@@ -1591,7 +2175,7 @@ def _build_mail_draft_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
-        latency_ms=0.0,
+        latency_ms=latency_ms,
         token_in=int(render_result.get("token_in", 0)),
         token_out=int(render_result.get("token_out", 0)),
         estimated_cost=float(render_result.get("estimated_cost", 0.0)),
@@ -1611,6 +2195,7 @@ def _build_mail_unsupported_response(
         mail_plan=mail_plan,
         render_mode="unsupported",
     )
+    latency_ms = _mail_render_latency_ms(render_result)
     answer = str(render_result.get("user_message") or "")
     mail_observation = _build_mail_plan_observation(
         rendered_plan,
@@ -1657,7 +2242,7 @@ def _build_mail_unsupported_response(
         "reflection_notes": None,
         "task_plan": {"mail_plan": rendered_plan},
         "final_answer_source": "mail_capability_guardrail_fallback" if render_result.get("used_fallback") else "mail_capability_guardrail_renderer",
-        "node_latencies_ms": {"total": 0.0},
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
         "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
@@ -1701,7 +2286,7 @@ def _build_mail_unsupported_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
-        latency_ms=0.0,
+        latency_ms=latency_ms,
         token_in=int(render_result.get("token_in", 0)),
         token_out=int(render_result.get("token_out", 0)),
         estimated_cost=float(render_result.get("estimated_cost", 0.0)),
@@ -1717,6 +2302,7 @@ def _build_fast_path_response(
     route_decision: dict[str, Any],
     result: dict[str, Any],
     latency_ms: float,
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     observations = list(result.get("observations") or result.get("tool_observations") or [])
     renderer = {"answer": str(result.get("answer") or ""), "token_in": 0, "token_out": 0, "estimated_cost": 0.0, "used_fallback": False}
@@ -1727,7 +2313,12 @@ def _build_fast_path_response(
             observations=observations,
             working_memory=list(result.get("working_memory") or []),
             conservative=bool(result.get("conservative", False)),
+            pending_confirmation=dict(result.get("pending_confirmation") or {}),
+            actor_context=dict(actor_context or result.get("actor_context") or {}),
         )
+        if isinstance(renderer.get("failure_observation"), dict):
+            observations.append(dict(renderer["failure_observation"]))
+            result.setdefault("tool_observations", []).append(dict(renderer["failure_observation"]))
     synthetic_result = {
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -1770,6 +2361,8 @@ def _build_fast_path_response(
             "router_intent": str(route_decision.get("intent") or ""),
             "required_grounding": str(route_decision.get("required_grounding") or "none"),
             "recommended_tool": str(route_decision.get("recommended_tool") or ""),
+            "verifier_verdict": dict(renderer.get("verifier_verdict") or {}),
+            "verifier_rewrite_applied": bool(renderer.get("verifier_rewrite_applied", False)),
         },
         "subtask_results": list(result.get("tool_calls") or []),
         "aggregation_strategy": "fast_path",
@@ -1790,6 +2383,7 @@ def _build_fast_path_response(
         "token_out": int(result.get("token_out", 0)) + int(renderer.get("token_out", 0)),
         "estimated_cost": float(result.get("estimated_cost", 0.0)) + float(renderer.get("estimated_cost", 0.0)),
     }
+    synthetic_result = attach_trace_evaluation(synthetic_result, actor_context=actor_context)
     turn_id, memory_written = _write_unified_conversation_memory(synthetic_result, conversation_id)
     record_request(
         mode="fast_path",
@@ -2024,6 +2618,7 @@ def _execute_fast_path(
     display_message: str,
     upload_context: dict[str, Any],
     route_decision: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     started = perf_counter()
     intent = str(route_decision.get("intent") or "mixed")
@@ -2036,6 +2631,7 @@ def _execute_fast_path(
         safe_message=payload.message,
         display_message=display_message or payload.message,
         upload_context=dict(upload_context or {}),
+        actor_context=dict(actor_context or {}),
     )
 
     if intent == "upload_analysis":
@@ -2054,15 +2650,16 @@ def _execute_fast_path(
             context,
             {},
         )
-        observation = {
-            "observation_type": "upload_analysis_result",
-            "source": "uploaded_content_analyze",
-            "grounding_kind": "none",
-            "summary": compact_text(str(payload_dict.get("answer") or ""), 220),
-            "payload": payload_dict,
-            "citations": [],
-            "confidence": 0.9,
-        }
+        observation = make_typed_observation(
+            observation_type="upload_analysis_result",
+            source="uploaded_content_analyze",
+            grounding_kind="tool",
+            summary=compact_text(str(payload_dict.get("answer") or ""), 220),
+            payload=payload_dict,
+            citations=[],
+            confidence=0.9,
+            actor_context=actor_context,
+        )
         result = {
             "intent": "uploaded_content_analyze",
             "tool_calls": [{"tool_name": "uploaded_content_analyze", "success": True, "status": "completed", "result": payload_dict}],
@@ -2081,19 +2678,21 @@ def _execute_fast_path(
             route_decision=route_decision,
             result=result,
             latency_ms=(perf_counter() - started) * 1000.0,
+            actor_context=actor_context,
         )
 
     if intent == "persona":
         payload_dict = executors["persona_or_chitchat"]({"message": payload.message}, context, {})
-        observation = {
-            "observation_type": "persona_result",
-            "source": "persona_or_chitchat",
-            "grounding_kind": "none",
-            "summary": compact_text(str(payload_dict.get("answer") or ""), 220),
-            "payload": payload_dict,
-            "citations": [],
-            "confidence": 0.86,
-        }
+        observation = make_typed_observation(
+            observation_type="persona_result",
+            source="persona_or_chitchat",
+            grounding_kind="tool",
+            summary=compact_text(str(payload_dict.get("answer") or ""), 220),
+            payload=payload_dict,
+            citations=[],
+            confidence=0.86,
+            actor_context=actor_context,
+        )
         result = {
             "intent": "persona_or_chitchat",
             "tool_calls": [{"tool_name": "persona_or_chitchat", "success": True, "status": "completed", "result": payload_dict}],
@@ -2111,6 +2710,7 @@ def _execute_fast_path(
             route_decision=route_decision,
             result=result,
             latency_ms=(perf_counter() - started) * 1000.0,
+            actor_context=actor_context,
         )
 
     if intent == "enterprise_fact":
@@ -2119,16 +2719,18 @@ def _execute_fast_path(
             top_k=8,
             session_id=payload.session_id,
             conversation_id=conversation_id,
+            actor_context=actor_context,
         )
-        observation = {
-            "observation_type": "enterprise_rag_result",
-            "source": "enterprise_rag_query",
-            "grounding_kind": "retrieval",
-            "summary": compact_text(str(payload_dict.get("answer") or ""), 240),
-            "payload": payload_dict,
-            "citations": list(payload_dict.get("citations") or []),
-            "confidence": float(payload_dict.get("confidence", 0.0) or 0.0),
-        }
+        observation = make_typed_observation(
+            observation_type="enterprise_rag_result",
+            source="enterprise_rag_query",
+            grounding_kind="retrieval",
+            summary=compact_text(str(payload_dict.get("answer") or ""), 240),
+            payload=payload_dict,
+            citations=list(payload_dict.get("citations") or []),
+            confidence=float(payload_dict.get("confidence", 0.0) or 0.0),
+            actor_context=actor_context,
+        )
         result = {
             "intent": "enterprise_rag_query",
             "tool_calls": [{"tool_name": "enterprise_rag_query", "success": True, "status": "completed", "result": payload_dict}],
@@ -2153,21 +2755,23 @@ def _execute_fast_path(
             route_decision=route_decision,
             result=result,
             latency_ms=(perf_counter() - started) * 1000.0,
+            actor_context=actor_context,
         )
 
     if intent == "mail_status":
         if recommended_tool == "outbound_mail_summary":
             since, until = _local_day_window()
             summary = {"since": since, "until": until, **get_sent_mail_stats(since=since, until=until, session_id=payload.session_id)}
-            observation = {
-                "observation_type": "mail_status_result",
-                "source": "outbound_mail_summary",
-                "grounding_kind": "tool",
-                "summary": "已获取当前时间范围内的外发统计。",
-                "payload": summary,
-                "citations": [],
-                "confidence": 0.92,
-            }
+            observation = make_typed_observation(
+                observation_type="mail_status_result",
+                source="outbound_mail_summary",
+                grounding_kind="tool",
+                summary="已获取当前时间范围内的外发统计。",
+                payload=summary,
+                citations=[],
+                confidence=0.92,
+                actor_context=actor_context,
+            )
             result = {
                 "intent": "outbound_mail_assistant",
                 "tool_calls": [{"tool_name": "outbound_mail_summary", "success": True, "status": "completed", "result": summary}],
@@ -2179,66 +2783,42 @@ def _execute_fast_path(
             }
         elif recommended_tool == "governance_task_context_fetch":
             task = get_latest_recoverable_task(payload.session_id, conversation_id)
-            if task:
-                answer = f"当前最近的治理任务状态是：`{task.get('status', 'unknown')}`。风险级别：`{task.get('risk_level', 'unknown')}`。任务 ID：`{task.get('task_id', '')}`。"
-            else:
-                answer = "当前会话里没有待恢复或待处理的治理任务。"
+            observation = make_typed_observation(
+                observation_type="task_status_result",
+                source="governance_task_context_fetch",
+                grounding_kind="tool",
+                summary="已获取当前会话最近的治理任务状态。" if task else "当前会话没有可恢复或待处理的治理任务。",
+                payload={"task": task or {}},
+                citations=[],
+                confidence=0.9,
+                actor_context=actor_context,
+            )
             result = {
                 "intent": "governance_task_status",
                 "tool_calls": [{"tool_name": "governance_task_context_fetch", "success": True, "status": "completed", "result": {"task": task or {}}}],
-                "tool_observations": [
-                    {
-                        "observation_type": "task_status_result",
-                        "source": "governance_task_context_fetch",
-                        "grounding_kind": "tool",
-                        "summary": "已获取当前会话最近的治理任务状态。" if task else "当前会话没有可恢复或待处理的治理任务。",
-                        "payload": {"task": task or {}},
-                        "citations": [],
-                        "confidence": 0.9,
-                    }
-                ],
-                "observations": [
-                    {
-                        "observation_type": "task_status_result",
-                        "source": "governance_task_context_fetch",
-                        "grounding_kind": "tool",
-                        "summary": "已获取当前会话最近的治理任务状态。" if task else "当前会话没有可恢复或待处理的治理任务。",
-                        "payload": {"task": task or {}},
-                        "citations": [],
-                        "confidence": 0.9,
-                    }
-                ],
+                "tool_observations": [observation],
+                "observations": [observation],
                 "working_memory": ["已获取当前会话最近的治理任务状态。" if task else "当前会话没有可恢复或待处理的治理任务。"],
                 "final_answer_source": "fast_mail_status_renderer",
                 "termination_reason": "direct_answer",
             }
         else:
             summary = get_inbound_mail_summary()
+            observation = make_typed_observation(
+                observation_type="mail_status_result",
+                source="inbound_mail_summary",
+                grounding_kind="tool",
+                summary="已获取当前收件箱摘要和同步状态。",
+                payload={"summary": summary, "sync_state": latest_sync_state()},
+                citations=[],
+                confidence=0.92,
+                actor_context=actor_context,
+            )
             result = {
                 "intent": "inbound_mail_assistant",
                 "tool_calls": [{"tool_name": "inbound_mail_summary", "success": True, "status": "completed", "result": summary}],
-                "tool_observations": [
-                    {
-                        "observation_type": "mail_status_result",
-                        "source": "inbound_mail_summary",
-                        "grounding_kind": "tool",
-                        "summary": "已获取当前收件箱摘要和同步状态。",
-                        "payload": {"summary": summary, "sync_state": latest_sync_state()},
-                        "citations": [],
-                        "confidence": 0.92,
-                    }
-                ],
-                "observations": [
-                    {
-                        "observation_type": "mail_status_result",
-                        "source": "inbound_mail_summary",
-                        "grounding_kind": "tool",
-                        "summary": "已获取当前收件箱摘要和同步状态。",
-                        "payload": {"summary": summary, "sync_state": latest_sync_state()},
-                        "citations": [],
-                        "confidence": 0.92,
-                    }
-                ],
+                "tool_observations": [observation],
+                "observations": [observation],
                 "working_memory": ["已获取当前收件箱摘要和同步状态。"],
                 "final_answer_source": "fast_mail_status_renderer",
                 "termination_reason": "direct_answer",
@@ -2251,6 +2831,7 @@ def _execute_fast_path(
             route_decision=route_decision,
             result=result,
             latency_ms=(perf_counter() - started) * 1000.0,
+            actor_context=actor_context,
         )
 
     if intent == "contextual_memory":
@@ -2268,6 +2849,7 @@ def _execute_fast_path(
             route_decision=route_decision,
             result=result,
             latency_ms=(perf_counter() - started) * 1000.0,
+            actor_context=actor_context,
         )
 
     raise ValueError(f"Unsupported fast path intent: {intent}")
@@ -2369,7 +2951,22 @@ def _supplement_dlp_task(task: dict[str, Any], payload: DlpTaskSupplementRequest
                 delivery_status=str(updated_task.get("delivery_status", "not_sent")),
             )
         )
-        enqueue_dlp_risk_task(str(task["task_id"]))
+        try:
+            enqueue_dlp_risk_task(str(task["task_id"]))
+        except Exception as exc:
+            updated_task = _mark_task_enqueue_failed(
+                updated_task,
+                service="celery",
+                operation="enqueue_dlp_risk_task",
+                error=str(exc),
+                actor_context={
+                    "tenant_id": str(updated_task.get("tenant_id") or ""),
+                    "user_id": str(updated_task.get("user_id") or ""),
+                    "workspace_id": str(updated_task.get("workspace_id") or ""),
+                    "session_id": str(updated_task.get("session_id") or ""),
+                    "conversation_id": str(updated_task.get("conversation_id") or ""),
+                },
+            )
     else:
         publish_task_event(
             build_task_event(
@@ -2464,15 +3061,15 @@ def _build_inbound_mail_agent_response(
     normalized_observations = list(observations or [])
     if not normalized_observations:
         normalized_observations = [
-            {
-                "observation_type": "mail_read_result" if "reply" in tool_name else "mail_status_result",
-                "source": tool_name,
-                "grounding_kind": "tool",
-                "summary": compact_text(answer, 220),
-                "payload": payload,
-                "citations": [],
-                "confidence": 0.94,
-            }
+            make_typed_observation(
+                observation_type="mail_read_result" if "reply" in tool_name else "mail_status_result",
+                source=tool_name,
+                grounding_kind="tool",
+                summary=compact_text(answer, 220),
+                payload=payload,
+                citations=[],
+                confidence=0.94,
+            )
         ]
     renderer = render_final_answer(
         question=message,
@@ -2481,6 +3078,8 @@ def _build_inbound_mail_agent_response(
         working_memory=[str(item.get("summary") or "") for item in normalized_observations if str(item.get("summary") or "").strip()],
         conservative=False,
     )
+    if isinstance(renderer.get("failure_observation"), dict):
+        normalized_observations.append(dict(renderer["failure_observation"]))
     result = {
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -2692,7 +3291,11 @@ def plan_compound_tasks(message: str) -> _CompoundTaskPlan:
     return _CompoundTaskPlan(subtasks=subtasks)
 
 
-def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id: str) -> UnifiedAgentResponse | None:
+def _handle_compound_agent_request(
+    payload: UnifiedAgentRequest,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse | None:
     task_plan = plan_compound_tasks(payload.message)
     if len(task_plan.subtasks) < 2:
         return None
@@ -2730,6 +3333,7 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
             result = answer_enterprise_question(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
+                actor_context=actor_context,
             )
             observations.append(
                 {
@@ -2761,7 +3365,11 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
     )
 
 
-def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id: str) -> UnifiedAgentResponse | None:
+def _handle_compound_agent_request(
+    payload: UnifiedAgentRequest,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse | None:
     task_plan = plan_compound_tasks(payload.message)
     if len(task_plan.subtasks) < 2:
         return None
@@ -2778,6 +3386,7 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
                     source="outbound_mail_summary",
                     summary_text="已获取当前时间范围内的外发统计。",
                     payload=result,
+                    actor_context=actor_context,
                 )
             )
         elif subtask.capability == "inbound_mail_summary":
@@ -2789,23 +3398,26 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
                     source="inbound_mail_summary",
                     summary_text="已获取当前收件箱摘要和同步状态。",
                     payload=result,
+                    actor_context=actor_context,
                 )
             )
         elif subtask.capability == "enterprise_rag_query":
             result = answer_enterprise_question(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
+                actor_context=actor_context,
             )
             observations.append(
-                {
-                    "observation_type": "enterprise_rag_result",
-                    "source": "enterprise_rag_query",
-                    "grounding_kind": "retrieval",
-                    "summary": compact_text(str(result.get("answer") or ""), 240),
-                    "payload": result,
-                    "citations": list(result.get("citations") or []),
-                    "confidence": float(result.get("confidence", 0.0) or 0.0),
-                }
+                make_typed_observation(
+                    observation_type="enterprise_rag_result",
+                    source="enterprise_rag_query",
+                    grounding_kind="retrieval",
+                    summary=compact_text(str(result.get("answer") or ""), 240),
+                    payload=result,
+                    citations=list(result.get("citations") or []),
+                    confidence=float(result.get("confidence", 0.0) or 0.0),
+                    actor_context=actor_context,
+                )
             )
         else:
             result = {"error": f"Unsupported capability: {subtask.capability}"}
@@ -2819,6 +3431,7 @@ def _handle_compound_agent_request(payload: UnifiedAgentRequest, conversation_id
             question=payload.message,
             observations=observations,
             subtasks=[asdict(subtask) for subtask in task_plan.subtasks],
+            actor_context=actor_context,
         )
     )
 
@@ -2851,7 +3464,8 @@ def _handle_async_outbound_agent_request(
     outbound_message: str,
     display_message: str,
     upload_context: dict[str, Any] | None = None,
-    ) -> UnifiedAgentResponse:
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse:
     resolution = _build_outbound_resolution(payload, conversation_id, dict(upload_context or {}))
     if not resolution.get("ok"):
         return _build_rule_clarification_response(
@@ -2891,8 +3505,12 @@ def _handle_async_outbound_agent_request(
         uploaded_file_base64=payload.uploaded_file_base64,
         source_parse_status=payload.source_parse_status,
         source_parse_error=payload.source_parse_error,
+        tenant_id=str((actor_context or {}).get("tenant_id") or ""),
+        user_id=str((actor_context or {}).get("user_id") or ""),
+        workspace_id=str((actor_context or {}).get("workspace_id") or ""),
+        roles=list((actor_context or {}).get("roles") or []),
     )
-    task = _create_async_dlp_task(task_payload)
+    task = _create_async_dlp_task(task_payload, actor_context=actor_context)
     return _build_task_agent_response(
         session_id=payload.session_id,
         conversation_id=conversation_id,
@@ -2909,6 +3527,7 @@ def _create_dlp_task_from_mail_plan(
     conversation_id: str,
     request_message: str,
     mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     attachment = dict((mail_plan.get("resolved_attachments") or [{}])[0] or {}) if mail_plan.get("resolved_attachments") else {}
     selected_candidate = dict(mail_plan.get("selected_candidate") or {})
@@ -2934,7 +3553,12 @@ def _create_dlp_task_from_mail_plan(
             uploaded_content_type=str(selected_candidate.get("content_type") or attachment.get("content_type") or ""),
             uploaded_text=str(selected_candidate.get("content") or ""),
             requested_action=str(mail_plan.get("mail_action_type") or "send_message"),
-        )
+            tenant_id=str((actor_context or {}).get("tenant_id") or ""),
+            user_id=str((actor_context or {}).get("user_id") or ""),
+            workspace_id=str((actor_context or {}).get("workspace_id") or ""),
+            roles=list((actor_context or {}).get("roles") or []),
+        ),
+        actor_context=actor_context,
     )
 
 
@@ -3107,14 +3731,26 @@ def _record_success_metrics(result: dict) -> None:
     )
 
 
-def _ensure_conversation(session_id: str, conversation_id: str | None) -> tuple[dict, bool]:
+def _ensure_conversation(
+    session_id: str,
+    conversation_id: str | None,
+    actor_context: dict[str, Any] | None = None,
+) -> tuple[dict, bool]:
+    actor = ActorContext(**dict(actor_context or {})) if actor_context else ActorContext(session_id=session_id)
     if conversation_id:
         existing = get_conversation(conversation_id)
         if existing:
             if existing["session_id"] != session_id:
                 raise HTTPException(status_code=403, detail="conversation_id does not belong to this session_id")
+            if not actor.is_local_dev:
+                if str(existing.get("tenant_id") or "") != actor.tenant_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this tenant_id")
+                if str(existing.get("user_id") or "") != actor.user_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this user_id")
+                if str(existing.get("workspace_id") or "") != actor.workspace_id:
+                    raise HTTPException(status_code=403, detail="conversation_id does not belong to this workspace_id")
             return existing, False
-    created = create_conversation(session_id)
+    created = create_conversation(session_id, actor_context=actor.to_dict())
     record_conversation_created()
     return created, True
 
@@ -3161,6 +3797,12 @@ def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
         "final_answer_source": str(result.get("final_answer_source", "")),
         "memory_reads": result.get("memory_reads", []) or [],
         "tool_observations": result.get("tool_observations", []) or [],
+        "actor_context": result.get("actor_context", {}) or {},
+        "permission_decision": result.get("permission_decision", {}) or {},
+        "rate_limit_decision": result.get("rate_limit_decision", {}) or {},
+        "queue_status": result.get("queue_status", {}) or {},
+        "memory_boundary": "context_only",
+        "enterprise_citation_required": True,
         "latency_ms": float(result.get("node_latencies_ms", {}).get("total", 0.0)),
         "token_in": int(result.get("token_in", 0)),
         "token_out": int(result.get("token_out", 0)),
@@ -3169,7 +3811,11 @@ def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
     }
 
 
-def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tuple[str | None, bool]:
+def _write_unified_conversation_memory(
+    result: dict,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> tuple[str | None, bool]:
     answer = str(result.get("answer", "")).strip()
     if not answer:
         return None, False
@@ -3189,6 +3835,7 @@ def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tu
         tool_calls=result.get("tool_calls", []),
         citations=result.get("citations", []),
         debug_payload=debug_payload,
+        actor_context=actor_context or result.get("actor_context") or {},
     )
     record_conversation_turns()
 
@@ -3221,12 +3868,8 @@ def _write_unified_conversation_memory(result: dict, conversation_id: str) -> tu
             intent=str(result.get("intent", "")),
             citations=result.get("citations", []),
             upload_context=result.get("upload_context", {}) or {},
+            actor_context=actor_context or result.get("actor_context") or {},
             dynamic_memory={
-                "summary": str(dynamic_memory_result.get("summary") or ""),
-                "intent": str(dynamic_memory_result.get("intent") or result.get("intent") or ""),
-                "entities": dynamic_memory_result.get("entities") or [],
-                "files_uploaded": dynamic_memory_result.get("files_uploaded") or [],
-                "risk_level": str(dynamic_memory_result.get("risk_level") or "low"),
                 "user_goal": question,
                 "outcome": answer_summary,
                 "failure_reason": _summarize_memory_failure_for_doc(result),
@@ -3332,19 +3975,151 @@ def health() -> HealthResponse:
     )
 
 
+@app.post("/auth/exmail/request-code")
+def auth_exmail_request_code(payload: dict[str, Any]) -> dict[str, Any]:
+    email = str((payload or {}).get("email") or "").strip().lower()
+    try:
+        code_payload = create_login_code(email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    send_result = send_email_smtp(
+        to_email=email,
+        subject="Enterprise Agent login verification code",
+        body=(
+            "Your Enterprise Agent verification code is: "
+            f"{code_payload['code']}\n\n"
+            "This code expires in 10 minutes. If you did not request it, ignore this email."
+        ),
+    )
+    if not send_result.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "verification_email_send_failed",
+                "email_masked": mask_email(email),
+                "provider": send_result.get("provider"),
+                "reason": send_result.get("error"),
+                "failure_observation": send_result.get("failure_observation"),
+            },
+        )
+    return {
+        "ok": True,
+        "email_masked": code_payload["email_masked"],
+        "expires_in_seconds": code_payload["expires_in_seconds"],
+        "delivery": {
+            "provider": send_result.get("provider"),
+            "sent_at": send_result.get("sent_at"),
+            "from_email_masked": send_result.get("from_email_masked"),
+        },
+    }
+
+
+@app.post("/auth/exmail/verify-code")
+def auth_exmail_verify_code(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        result = verify_login_code(
+            str((payload or {}).get("email") or ""),
+            str((payload or {}).get("code") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    return {"ok": True, **result}
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    token = request.headers.get("x-auth-session") or request.headers.get("X-Auth-Session") or ""
+    session = resolve_session_token(token)
+    if not session:
+        raise HTTPException(status_code=401, detail={"error": "invalid_or_expired_session"})
+    return {"ok": True, "user": session}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request) -> dict[str, Any]:
+    token = request.headers.get("x-auth-session") or request.headers.get("X-Auth-Session") or ""
+    revoked = revoke_session_token(token)
+    return {"ok": True, "revoked": revoked}
+
+
+@app.get("/admin/queue-health")
+def admin_queue_health(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "queue_health")
+    queue_status = _refresh_queue_metrics()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "queue_status": queue_status,
+    }
+
+
+@app.get("/admin/policy-version")
+def admin_policy_version(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "policy.read", "privacy_policy")
+    policy = load_active_privacy_policy()
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "policy": asdict(policy),
+    }
+
+
+@app.get("/admin/memory-candidates")
+def admin_memory_candidates(
+    request: Request,
+    session_id: str,
+    conversation_id: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
+    permission_decision = _ensure_permission(actor, "admin.read", "memory_candidates")
+    candidates = get_structured_turn_summaries(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        limit=max(1, min(limit, 100)),
+    )
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "candidates": candidates,
+    }
+
+
+@app.get("/admin/rag-manifest")
+def admin_rag_manifest(request: Request, limit: int = 20) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "rag_manifest")
+    manifest = load_manifest()
+    if isinstance(manifest.get("runs"), list):
+        manifest = {**manifest, "runs": list(manifest.get("runs") or [])[-max(1, min(limit, 100)) :]}
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "manifest": manifest,
+    }
+
+
 @app.get("/problems", response_model=list[ProblemSummary])
 def problems() -> list[ProblemSummary]:
     return list_problem_summaries()
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-def conversations(session_id: str) -> list[ConversationSummary]:
-    return [ConversationSummary(**item) for item in list_conversations(session_id)]
+def conversations(request: Request, session_id: str) -> list[ConversationSummary]:
+    actor = build_actor_context(request=request, session_id=session_id)
+    return [ConversationSummary(**item) for item in list_conversations(session_id, actor_context=actor.to_dict())]
 
 
 @app.post("/conversations", response_model=ConversationSummary)
-def create_conversation_api(payload: ConversationCreateRequest) -> ConversationSummary:
-    conversation = create_conversation(payload.session_id, payload.title)
+def create_conversation_api(payload: ConversationCreateRequest, request: Request) -> ConversationSummary:
+    actor = build_actor_context(request=request, payload=payload, session_id=payload.session_id)
+    conversation = create_conversation(payload.session_id, payload.title, actor_context=actor.to_dict())
     record_conversation_created()
     return ConversationSummary(**conversation)
 
@@ -3458,11 +4233,24 @@ def get_conversation_summary_api(conversation_id: str) -> dict:
 
 @app.get("/tasks", response_model=list[DlpTaskResponse])
 def list_dlp_tasks_api(
+    request: Request,
     session_id: str | None = None,
     status: str | None = None,
     risk_level: str | None = None,
 ) -> list[DlpTaskResponse]:
-    return [_task_response(item) for item in list_dlp_tasks(session_id=session_id, status=status, risk_level=risk_level)]
+    actor = build_actor_context(request=request, session_id=session_id or "")
+    _ensure_permission(actor, "task.read", "dlp_tasks")
+    return [
+        _task_response(item)
+        for item in list_dlp_tasks(
+            session_id=session_id,
+            status=status,
+            risk_level=risk_level,
+            tenant_id=None if actor.is_local_dev else actor.tenant_id,
+            user_id=None if actor.is_local_dev else actor.user_id,
+            workspace_id=None if actor.is_local_dev else actor.workspace_id,
+        )
+    ]
 
 
 @app.post("/mail/inbound/sync", response_model=InboundMailSyncResponse)
@@ -3507,30 +4295,76 @@ def outbound_mail_summary_api(
 
 
 @app.post("/enterprise-rag/query", response_model=EnterpriseRagQueryResponse)
-def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest) -> EnterpriseRagQueryResponse:
-    return EnterpriseRagQueryResponse(
-        **answer_enterprise_question(
-            payload.question,
-            source_types=payload.source_types,
-            top_k=payload.top_k,
-            session_id=payload.session_id,
-            conversation_id=payload.conversation_id,
-        )
+def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest, request: Request) -> EnterpriseRagQueryResponse:
+    actor = build_actor_context(
+        request=request,
+        payload=payload,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id,
     )
+    permission_decision = _ensure_permission(actor, "rag.query", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_query")
+    queue_status = _refresh_queue_metrics()
+    result = answer_enterprise_question(
+        payload.question,
+        source_types=payload.source_types,
+        top_k=payload.top_k,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id,
+        actor_context=actor.to_dict(),
+    )
+    result.update(
+        {
+            "actor_context": actor.to_dict(),
+            "permission_decision": permission_decision,
+            "rate_limit_decision": rate_limit_decision,
+            "queue_status": queue_status,
+            "task_mode": "sync",
+        }
+    )
+    return EnterpriseRagQueryResponse(**result)
 
 
 @app.post("/enterprise-rag/ingest", response_model=EnterpriseRagIngestResponse)
-def enterprise_rag_ingest_api(payload: EnterpriseRagIngestRequest) -> EnterpriseRagIngestResponse:
-    try:
+def enterprise_rag_ingest_api(payload: EnterpriseRagIngestRequest, request: Request) -> EnterpriseRagIngestResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    permission_decision = _ensure_permission(actor, "rag.ingest", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_ingest")
+    queue_status = _refresh_queue_metrics()
+    if payload.async_mode:
+        task_id = enqueue_enterprise_ingest({**payload.dict(), "actor_context": actor.to_dict()})
         return EnterpriseRagIngestResponse(
-            **ingest_enterprise_rag_bench(
-                mode=payload.mode,
-                documents_path=payload.documents_path,
-                questions_path=payload.questions_path,
-                limit=payload.limit,
-                reset=payload.reset,
-            )
+            dataset="enterprise_rag_bench",
+            mode=payload.mode,
+            documents_path=payload.documents_path or "",
+            questions_path=payload.questions_path or "",
+            reset=payload.reset,
+            actor_context=actor.to_dict(),
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode="async",
+            task_id=task_id,
         )
+    try:
+        result = ingest_enterprise_rag_bench(
+            mode=payload.mode,
+            documents_path=payload.documents_path,
+            questions_path=payload.questions_path,
+            limit=payload.limit,
+            reset=payload.reset,
+            actor_context=actor.to_dict(),
+        )
+        result.update(
+            {
+                "actor_context": actor.to_dict(),
+                "permission_decision": permission_decision,
+                "rate_limit_decision": rate_limit_decision,
+                "queue_status": queue_status,
+                "task_mode": "sync",
+            }
+        )
+        return EnterpriseRagIngestResponse(**result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3545,18 +4379,49 @@ def enterprise_rag_casebook_api(questions_path: str | None = None, limit: int = 
 
 @app.get("/enterprise-rag/benchmark", response_model=EnterpriseRagBenchmarkResponse)
 def enterprise_rag_benchmark_api(
+    request: Request,
     questions_path: str | None = None,
     limit: int = 20,
     top_k: int = 8,
+    async_mode: bool = False,
 ) -> EnterpriseRagBenchmarkResponse:
-    try:
-        return EnterpriseRagBenchmarkResponse(
-            **run_benchmark_sample(
-                questions_path=questions_path,
-                limit=max(1, min(limit, 100)),
-                top_k=max(1, min(top_k, 30)),
-            )
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "rag.benchmark", "enterprise_rag")
+    rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_benchmark")
+    queue_status = _refresh_queue_metrics()
+    if async_mode:
+        task_id = enqueue_enterprise_benchmark(
+            {
+                "questions_path": questions_path,
+                "limit": max(1, min(limit, 100)),
+                "top_k": max(1, min(top_k, 30)),
+                "actor_context": actor.to_dict(),
+            }
         )
+        return EnterpriseRagBenchmarkResponse(
+            actor_context=actor.to_dict(),
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode="async",
+            task_id=task_id,
+        )
+    try:
+        result = run_benchmark_sample(
+            questions_path=questions_path,
+            limit=max(1, min(limit, 100)),
+            top_k=max(1, min(top_k, 30)),
+        )
+        result.update(
+            {
+                "actor_context": actor.to_dict(),
+                "permission_decision": permission_decision,
+                "rate_limit_decision": rate_limit_decision,
+                "queue_status": queue_status,
+                "task_mode": "sync",
+            }
+        )
+        return EnterpriseRagBenchmarkResponse(**result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3643,7 +4508,17 @@ def get_dlp_task_api(task_id: str) -> DlpTaskResponse:
 
 
 @app.post("/tasks/{task_id}/approve", response_model=DlpTaskResponse)
-def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTaskResponse:
+def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    _ensure_permission(actor, "task.approve", task_id)
+    existing_task = get_dlp_task(task_id)
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    if not actor.is_local_dev and (
+        str(existing_task.get("tenant_id") or "") != actor.tenant_id
+        or str(existing_task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     task = approve_task(task_id, payload.actor)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
@@ -3658,12 +4533,31 @@ def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTa
                 delivery_status=str(task.get("delivery_status", "not_sent")),
             )
         )
-        enqueue_email_send_task(task_id)
+        try:
+            enqueue_email_send_task(task_id)
+        except Exception as exc:
+            task = _mark_task_enqueue_failed(
+                task,
+                service="celery",
+                operation="enqueue_email_send_task",
+                error=str(exc),
+                actor_context=actor.to_dict(),
+            )
     return _task_response(task)
 
 
 @app.post("/tasks/{task_id}/reject", response_model=DlpTaskResponse)
-def reject_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest) -> DlpTaskResponse:
+def reject_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    _ensure_permission(actor, "task.approve", task_id)
+    existing_task = get_dlp_task(task_id)
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    if not actor.is_local_dev and (
+        str(existing_task.get("tenant_id") or "") != actor.tenant_id
+        or str(existing_task.get("workspace_id") or "") != actor.workspace_id
+    ):
+        raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
     task = reject_task(task_id, payload.actor, payload.reason)
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
@@ -3743,7 +4637,10 @@ def get_sensitive_workflow_api(workflow_id: str) -> SensitiveWorkflowResponse:
 def approve_sensitive_workflow_api(
     workflow_id: str,
     payload: SensitiveWorkflowApprovalRequest,
+    request: Request,
 ) -> SensitiveWorkflowResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.approve", workflow_id)
     workflow = approve_sensitive_workflow(workflow_id, payload.actor)
     if not workflow:
         raise HTTPException(status_code=404, detail="Unknown workflow_id")
@@ -3756,7 +4653,10 @@ def approve_sensitive_workflow_api(
 def reject_sensitive_workflow_api(
     workflow_id: str,
     payload: SensitiveWorkflowApprovalRequest,
+    request: Request,
 ) -> SensitiveWorkflowResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.approve", workflow_id)
     workflow = reject_sensitive_workflow(workflow_id, payload.actor, payload.reason)
     if not workflow:
         raise HTTPException(status_code=404, detail="Unknown workflow_id")
@@ -3765,7 +4665,9 @@ def reject_sensitive_workflow_api(
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(force: bool = False) -> IngestResponse:
+def ingest(request: Request, force: bool = False) -> IngestResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "rag.ingest", "leetcode_corpus")
     written = ingest_if_needed(force=force)
     settings = get_settings()
     return IngestResponse(documents_written=written, collection_name=settings.chroma_collection)
@@ -3860,12 +4762,34 @@ def chat(payload: ChatRequest) -> ChatResponse:
 
 
 @app.post("/agent/chat", response_model=UnifiedAgentResponse)
-def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
+def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentResponse:
     if payload.problem_id:
         _validate_problem(payload.problem_id)
 
-    conversation, _ = _ensure_conversation(payload.session_id, payload.conversation_id)
+    actor = build_actor_context(
+        request=request,
+        payload=payload,
+        session_id=payload.session_id,
+        conversation_id=payload.conversation_id or "",
+    )
+    permission_decision = _ensure_permission(actor, "agent.chat", "agent_chat")
+    rate_limit_decision = _ensure_rate_limit(actor, "agent_chat")
+    queue_status = _refresh_queue_metrics()
+
+    conversation, _ = _ensure_conversation(payload.session_id, payload.conversation_id, actor.to_dict())
     conversation_id = str(conversation["conversation_id"])
+    actor = replace(actor, conversation_id=conversation_id)
+    actor_context = actor.to_dict()
+
+    def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
+        return _attach_landing_context(
+            response,
+            actor=actor,
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode=task_mode,
+        )
 
     outbound_message = _build_outbound_message(payload.message, payload.uploaded_text, payload.uploaded_filename)
     display_message = _build_display_message(payload.message, payload.uploaded_filename, payload.source_parse_status)
@@ -3876,26 +4800,112 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
             f"{upload_context.get('filename')} (沿用上次上传)",
             str(upload_context.get("parse_status") or "parsed"),
         )
-    if looks_like_send_confirmation(payload.message):
-        pending_confirmation = _get_latest_pending_mail_confirmation(conversation_id)
+    completed_meeting_task = _latest_completed_meeting_task(
+        session_id=payload.session_id,
+        conversation_id=conversation_id,
+        actor_context=actor_context,
+    )
+    if completed_meeting_task and _looks_like_meeting_result_followup(payload.message):
+        return finalize(_build_meeting_result_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            task=completed_meeting_task,
+            actor_context=actor_context,
+        ))
+    if completed_meeting_task and _looks_like_meeting_invitation_continuation(payload.message):
+        recipient = _extract_email_from_message(payload.message)
+        meeting_mail_plan = _mail_plan_from_meeting_task(
+            task=completed_meeting_task,
+            conversation_id=conversation_id,
+            request_message=payload.message,
+            recipient=recipient,
+        )
+        patched_mail_plan = patch_pending_mail_plan(
+            message=payload.message,
+            request_message=payload.message,
+            mail_plan=meeting_mail_plan,
+        )
+        if patched_mail_plan.get("needs_clarification"):
+            return finalize(_build_mail_clarification_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                display_message=display_message,
+                mail_plan=dict(patched_mail_plan.get("mail_plan") or meeting_mail_plan),
+                candidates=[],
+            ))
+        if patched_mail_plan.get("ok"):
+            patched_plan = dict(patched_mail_plan.get("mail_plan") or meeting_mail_plan)
+            if patched_plan.get("resolved_recipients") and not patched_plan.get("missing_fields"):
+                return finalize(_build_mail_confirmation_response(
+                    session_id=payload.session_id,
+                    conversation_id=conversation_id,
+                    message=payload.message,
+                    display_message=display_message,
+                    mail_plan=patched_plan,
+                ))
+            return finalize(_build_mail_patch_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                display_message=display_message,
+                mail_plan=patched_plan,
+                patch_kind=str(patched_mail_plan.get("patch_kind") or "meeting_invitation_continuation"),
+            ))
+        return finalize(_build_mail_clarification_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            mail_plan=meeting_mail_plan,
+            candidates=[],
+        ))
+    multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
+    if looks_like_send_confirmation(payload.message) and multi_agent_dag_plan is None:
+        latest_confirmation = _get_latest_pending_confirmation(conversation_id)
+        if latest_confirmation.get("kind") == "domain":
+            pending_domain_confirmation = dict(latest_confirmation.get("payload") or {})
+            action = str(pending_domain_confirmation.get("tool_name") or pending_domain_confirmation.get("action_name") or "")
+            permission_action = "meeting.write" if action.startswith("meeting_") else "calendar.write"
+            _ensure_permission(actor, permission_action, action)
+            task = _create_domain_task_from_confirmation(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                request_message=payload.message,
+                confirmation_payload=pending_domain_confirmation,
+                actor_context=actor_context,
+            )
+            return finalize(_build_task_agent_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                outbound_message=payload.message,
+                display_message=display_message,
+                task=task,
+                routing_reason="Confirmed a pending domain-agent action and queued it for governed async execution.",
+            ))
+        pending_confirmation = dict(latest_confirmation.get("payload") or {}) if latest_confirmation.get("kind") == "mail" else {}
         pending_mail_plan = dict(pending_confirmation.get("mail_plan") or {})
         if pending_mail_plan:
+            _ensure_permission(actor, "mail.send", "pending_mail_confirmation")
             task = _create_dlp_task_from_mail_plan(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 request_message=str(pending_mail_plan.get("request_message") or payload.message),
                 mail_plan=pending_mail_plan,
+                actor_context=actor_context,
             )
-            return _build_task_agent_response(
+            return finalize(_build_task_agent_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 outbound_message=str(pending_mail_plan.get("resolved_body") or payload.message),
                 display_message=display_message,
                 task=task,
                 routing_reason="Confirmed a pending mail plan and created a governed DLP task.",
-            )
+            ))
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
-    if _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
+    if multi_agent_dag_plan is None and _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
         supplemented = _supplement_dlp_task(
             recoverable_task,
             DlpTaskSupplementRequest(
@@ -3910,15 +4920,15 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                 source_parse_error=payload.source_parse_error,
             ),
         )
-        return _build_task_agent_response(
+        return finalize(_build_task_agent_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             outbound_message=outbound_message or str(supplemented.get("message_raw", "")),
             display_message=display_message,
             task=supplemented,
             routing_reason="Applied supplemental information to a governed DLP task.",
-        )
-    if looks_like_pending_draft_edit_request(payload.message):
+        ))
+    if looks_like_pending_draft_edit_request(payload.message) and multi_agent_dag_plan is None:
         pending_mail_plan = _get_latest_pending_mail_draft(conversation_id)
         if pending_mail_plan:
             patched_mail_plan = patch_pending_mail_plan(
@@ -3927,96 +4937,127 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                 mail_plan=pending_mail_plan,
             )
             if patched_mail_plan.get("needs_clarification"):
-                return _build_mail_clarification_response(
+                return finalize(_build_mail_clarification_response(
                     session_id=payload.session_id,
                     conversation_id=conversation_id,
                     message=payload.message,
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     candidates=[],
-                )
+                ))
             if patched_mail_plan.get("ok"):
-                return _build_mail_patch_response(
+                return finalize(_build_mail_patch_response(
                     session_id=payload.session_id,
                     conversation_id=conversation_id,
                     message=payload.message,
                     display_message=display_message,
                     mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
                     patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
-                )
-        return _build_mail_clarification_response(
+                ))
+        return finalize(_build_mail_clarification_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             message=payload.message,
             display_message=display_message,
             mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
             candidates=[],
-        )
-    if looks_like_mail_action_request(payload.message) and not (
+        ))
+    if multi_agent_dag_plan is None and looks_like_mail_action_request(payload.message) and not (
         _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
     ):
         mail_action_plan = _build_mail_action_plan(payload, conversation_id, dict(upload_context or {}))
         if mail_action_plan.get("needs_clarification"):
-            return _build_mail_clarification_response(
+            return finalize(_build_mail_clarification_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
                 candidates=list(mail_action_plan.get("candidates") or []),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "unsupported":
-            return _build_mail_unsupported_response(
+            return finalize(_build_mail_unsupported_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "draft_only":
-            return _build_mail_draft_response(
+            return finalize(_build_mail_draft_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
         if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "confirmation_required":
-            return _build_mail_confirmation_response(
+            return finalize(_build_mail_confirmation_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 message=payload.message,
                 display_message=display_message,
                 mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
-            )
+            ))
     upload_decision = classify_upload_request(message=payload.message, upload_context=upload_context)
-    if upload_decision.route == "outbound":
-        return _handle_async_outbound_agent_request(payload, conversation_id, outbound_message, display_message, upload_context)
+    if upload_decision.route == "outbound" and multi_agent_dag_plan is None:
+        _ensure_permission(actor, "mail.send", "outbound_mail")
+        return finalize(
+            _handle_async_outbound_agent_request(
+                payload,
+                conversation_id,
+                outbound_message,
+                display_message,
+                upload_context,
+                actor_context=actor_context,
+            )
+        )
     if (
         upload_decision.route in {"none", "analyze"}
+        and multi_agent_dag_plan is None
         and not (_looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message))
         and (_looks_like_outbound_action(payload.message) or _looks_like_contextual_outbound_request(payload.message))
     ):
-        return _handle_async_outbound_agent_request(payload, conversation_id, outbound_message, display_message, upload_context)
+        _ensure_permission(actor, "mail.send", "outbound_mail")
+        return finalize(
+            _handle_async_outbound_agent_request(
+                payload,
+                conversation_id,
+                outbound_message,
+                display_message,
+                upload_context,
+                actor_context=actor_context,
+            )
+        )
 
-    compound_response = _handle_compound_agent_request(payload, conversation_id)
+    compound_response = _handle_compound_agent_request(payload, conversation_id, actor_context=actor_context)
     if compound_response is not None:
-        return compound_response
+        return finalize(compound_response)
 
     route_decision = route_agent_request(
         message=payload.message,
         safe_message=payload.message,
         upload_context=upload_context,
     )
+    if multi_agent_dag_plan is not None:
+        route_decision = {
+            **route_decision,
+            "route_mode": "slow",
+            "intent": "multi_agent_dag",
+            "required_grounding": "tool",
+            "recommended_tool": "dag_executor",
+            "router_reason": multi_agent_dag_plan.planner_reason,
+        }
     if str(route_decision.get("route_mode") or "slow") == "fast":
         try:
-            return _execute_fast_path(
+            return finalize(_execute_fast_path(
                 payload=payload,
                 conversation_id=conversation_id,
                 display_message=display_message,
                 upload_context=upload_context,
                 route_decision=route_decision,
-            )
+                actor_context=actor_context,
+            ))
         except Exception:
             logger.exception("Fast path execution failed; degrading to slow path")
             route_decision = {**route_decision, "route_mode": "slow", "degraded_from": "router"}
@@ -4036,6 +5077,7 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
             recommended_tool=str(route_decision.get("recommended_tool") or ""),
             router_reason=str(route_decision.get("router_reason") or ""),
             degraded_from=str(route_decision.get("degraded_from") or "none"),
+            actor_context=actor_context,
         )
     except Exception:
         logger.exception("Orchestration request failed; falling back to unified agent")
@@ -4048,25 +5090,31 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
                     "route_mode": "fast",
                     "degraded_from": "react_think",
                 }
-                return _execute_fast_path(
+                return finalize(_execute_fast_path(
                     payload=payload,
                     conversation_id=conversation_id,
                     display_message=display_message,
                     upload_context=upload_context,
                     route_decision=fallback_route_decision,
-                )
+                    actor_context=actor_context,
+                ))
             except Exception:
                 logger.exception("Safe fast fallback failed after orchestration failure")
-        return _build_rule_clarification_response(
+        return finalize(_build_rule_clarification_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             message=payload.message,
             display_message=display_message,
-            clarification_question="当前规划阶段失败了。为了避免直接返回错误，你可以把问题再聚焦一点，或让我先基于当前内容给出保守回答。",
+            clarification_question="The planning stage failed before a grounded answer could be produced. Please narrow the question and try again.",
             routing_reason="The orchestration path failed before a grounded answer could be safely produced.",
-        )
+        ))
 
-    turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id)
+    result["actor_context"] = actor_context
+    result["permission_decision"] = permission_decision
+    result["rate_limit_decision"] = rate_limit_decision
+    result["queue_status"] = queue_status
+    result = attach_trace_evaluation(result, actor_context=actor_context)
+    turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id, actor_context=actor_context)
     latency_ms = float(result["node_latencies_ms"]["total"])
     context_budget = result.get("context_budget", {}) or {}
     used_budget = context_budget.get("used") or context_budget.get("packed_tokens")
@@ -4156,6 +5204,11 @@ def agent_chat(payload: UnifiedAgentRequest) -> UnifiedAgentResponse:
         token_in=int(result.get("token_in", 0)),
         token_out=int(result.get("token_out", 0)),
         estimated_cost=float(result.get("estimated_cost", 0.0)),
+        actor_context=actor_context,
+        permission_decision=permission_decision,
+        rate_limit_decision=rate_limit_decision,
+        queue_status=queue_status,
+        task_mode="sync",
     )
 
 

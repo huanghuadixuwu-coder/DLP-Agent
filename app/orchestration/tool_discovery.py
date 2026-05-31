@@ -5,6 +5,7 @@ import pkgutil
 from dataclasses import asdict
 from typing import Any, Callable
 
+from app.actor_context import actor_from_mapping, permission_observation, require_permission
 from app.orchestration.types import OrchestrationContext, ToolDefinition
 
 
@@ -155,6 +156,20 @@ def dispatch_tool_call(
         return {"ok": False, "action": tool_name, "result": {}, "error": "parameters must be an object", "observation_type": definition.returns_observation_type, "side_effectful": definition.side_effectful, "requires_confirmation": definition.requires_confirmation}
     if (definition.side_effectful or definition.requires_confirmation) and not allow_side_effects:
         return {"ok": False, "action": tool_name, "result": {}, "error": "confirmation_required", "observation_type": definition.returns_observation_type, "side_effectful": definition.side_effectful, "requires_confirmation": definition.requires_confirmation}
+    if definition.side_effectful:
+        actor = actor_from_mapping(getattr(context, "actor_context", {}) if context is not None else {})
+        permission_action = _permission_action_for_tool(tool_name)
+        decision = require_permission(actor, permission_action, tool_name)
+        if not decision.allowed:
+            return {
+                "ok": False,
+                "action": tool_name,
+                "result": permission_observation(actor, decision),
+                "error": "permission_denied",
+                "observation_type": "permission_denied",
+                "side_effectful": definition.side_effectful,
+                "requires_confirmation": definition.requires_confirmation,
+            }
     handler = executors.get(tool_name)
     if not handler:
         return {"ok": False, "action": tool_name, "result": {}, "error": f"no executor found for action: {tool_name}", "observation_type": definition.returns_observation_type, "side_effectful": definition.side_effectful, "requires_confirmation": definition.requires_confirmation}
@@ -165,6 +180,22 @@ def dispatch_tool_call(
         return {"ok": not bool(error), "action": tool_name, "result": result, "error": error, "observation_type": definition.returns_observation_type, "side_effectful": definition.side_effectful, "requires_confirmation": definition.requires_confirmation}
     except Exception as exc:
         return {"ok": False, "action": tool_name, "result": {}, "error": str(exc), "observation_type": definition.returns_observation_type, "side_effectful": definition.side_effectful, "requires_confirmation": definition.requires_confirmation}
+
+
+def _permission_action_for_tool(tool_name: str) -> str:
+    if "mail" in tool_name or "email" in tool_name:
+        return "mail.send"
+    if tool_name.startswith("calendar_") or "calendar" in tool_name:
+        return "calendar.write"
+    if tool_name.startswith("meeting_") or "meeting" in tool_name:
+        return "meeting.write"
+    if "approve" in tool_name or "reject" in tool_name:
+        return "task.approve"
+    if "ingest" in tool_name:
+        return "rag.ingest"
+    if "benchmark" in tool_name:
+        return "rag.benchmark"
+    return "admin.read"
 
 
 def manifest_as_dicts(registry: dict[str, ToolDefinition] | None = None) -> list[dict[str, Any]]:

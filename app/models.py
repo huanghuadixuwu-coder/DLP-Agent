@@ -188,6 +188,10 @@ class UnifiedAgentRequest(BaseModel):
     uploaded_file_base64: str = ""
     source_parse_status: str = "not_provided"
     source_parse_error: str = ""
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class UnifiedAgentResponse(BaseModel):
@@ -252,6 +256,11 @@ class UnifiedAgentResponse(BaseModel):
     token_in: int = 0
     token_out: int = 0
     estimated_cost: float = 0.0
+    actor_context: dict[str, Any] = Field(default_factory=dict)
+    permission_decision: dict[str, Any] = Field(default_factory=dict)
+    rate_limit_decision: dict[str, Any] = Field(default_factory=dict)
+    queue_status: dict[str, Any] = Field(default_factory=dict)
+    task_mode: str = "sync"
 
 
 class InboundMailSyncRequest(BaseModel):
@@ -301,6 +310,10 @@ class EnterpriseRagQueryRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=30)
     session_id: str = ""
     conversation_id: str = ""
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class EnterpriseRagQueryResponse(BaseModel):
@@ -321,6 +334,11 @@ class EnterpriseRagQueryResponse(BaseModel):
     transcript_hits: int = 0
     user_model_used: bool = False
     memory_context: dict[str, Any] = Field(default_factory=dict)
+    actor_context: dict[str, Any] = Field(default_factory=dict)
+    permission_decision: dict[str, Any] = Field(default_factory=dict)
+    rate_limit_decision: dict[str, Any] = Field(default_factory=dict)
+    queue_status: dict[str, Any] = Field(default_factory=dict)
+    task_mode: str = "sync"
 
 
 class EnterpriseRagIngestRequest(BaseModel):
@@ -329,6 +347,11 @@ class EnterpriseRagIngestRequest(BaseModel):
     questions_path: str | None = None
     limit: int = Field(default=200, ge=1, le=100_000)
     reset: bool = False
+    async_mode: bool = False
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class EnterpriseRagIngestResponse(BaseModel):
@@ -342,6 +365,12 @@ class EnterpriseRagIngestResponse(BaseModel):
     enterprise_collection: str = ""
     sparse_index: str = ""
     reset: bool = False
+    actor_context: dict[str, Any] = Field(default_factory=dict)
+    permission_decision: dict[str, Any] = Field(default_factory=dict)
+    rate_limit_decision: dict[str, Any] = Field(default_factory=dict)
+    queue_status: dict[str, Any] = Field(default_factory=dict)
+    task_mode: str = "sync"
+    task_id: str = ""
 
 
 class EnterpriseRagBenchmarkResponse(BaseModel):
@@ -349,6 +378,12 @@ class EnterpriseRagBenchmarkResponse(BaseModel):
     average_doc_recall: float = 0.0
     average_answer_fact_coverage: float = 0.0
     average_evidence_fact_coverage: float = 0.0
+    actor_context: dict[str, Any] = Field(default_factory=dict)
+    permission_decision: dict[str, Any] = Field(default_factory=dict)
+    rate_limit_decision: dict[str, Any] = Field(default_factory=dict)
+    queue_status: dict[str, Any] = Field(default_factory=dict)
+    task_mode: str = "sync"
+    task_id: str = ""
 
 
 class InboundMailSyncResponse(BaseModel):
@@ -381,6 +416,10 @@ class NotificationOutboxItem(BaseModel):
 class ConversationCreateRequest(BaseModel):
     session_id: str = Field(min_length=1)
     title: str | None = None
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class ConversationSummary(BaseModel):
@@ -392,6 +431,9 @@ class ConversationSummary(BaseModel):
     updated_at: str
     is_merged: bool = False
     source_conversation_ids: list[str] = Field(default_factory=list)
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
 
 
 class ConversationTurn(BaseModel):
@@ -407,6 +449,9 @@ class ConversationTurn(BaseModel):
     citations: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str
     debug_payload: dict[str, Any] = Field(default_factory=dict)
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
 
 
 class SensitiveWorkflowCreateRequest(BaseModel):
@@ -492,11 +537,19 @@ class DlpTaskCreateRequest(BaseModel):
     scenario_name: str = ""
     fault_injection: dict[str, Any] = Field(default_factory=dict)
     expected_outcome: dict[str, Any] = Field(default_factory=dict)
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class DlpTaskApprovalRequest(BaseModel):
     actor: str = Field(default="local_reviewer", min_length=1)
     reason: str = ""
+    tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    roles: list[str] = Field(default_factory=list)
 
 
 class DlpTaskSupplementRequest(BaseModel):
@@ -534,10 +587,15 @@ class DlpTaskResponse(BaseModel):
     task_id: str
     task_type: str = "dlp_outbound"
     tenant_id: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
     session_id: str
     conversation_id: str = ""
     priority: int = 0
     status: str
+    domain_action: str = ""
+    domain_payload: dict[str, Any] = Field(default_factory=dict)
+    domain_result: dict[str, Any] = Field(default_factory=dict)
     risk_level: str = ""
     approval_required: bool = False
     destination_email: str = ""

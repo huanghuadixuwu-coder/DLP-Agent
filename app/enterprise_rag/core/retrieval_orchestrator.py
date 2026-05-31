@@ -7,25 +7,30 @@ from langchain_core.documents import Document
 
 from app.enterprise_rag.core.evidence_pack import build_evidence_pack
 from app.enterprise_rag.core.query_planner import expand_retrieval_plan
+from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID
 from app.enterprise_rag.core.types import ENTERPRISE_DOMAIN, EnterpriseCitation, EvidencePack, RetrievalPlan
+from app.metrics import record_retrieval_expansion
 from app.enterprise_rag.libs.metadata import normalize_source_type
 from app.enterprise_rag.libs.reranker import rerank_pairs
 from app.enterprise_rag.libs.scoring import build_rerank_debug_rows, heuristic_candidate_score
 from app.enterprise_rag.libs.sparse_index import search_enterprise_sparse
 from app.enterprise_rag.libs.text_cleaning import query_focused_snippet
+from app.resilience import make_failure_observation
 from app.vectorstore import get_enterprise_collection, get_enterprise_vectorstore
 
 
-def _build_filter(source_types: list[str]) -> dict[str, Any]:
-    source_types = [normalize_source_type(item) for item in source_types if item]
-    if not source_types:
-        return {"domain": {"$eq": ENTERPRISE_DOMAIN}}
-    return {
-        "$and": [
-            {"domain": {"$eq": ENTERPRISE_DOMAIN}},
-            {"source_type": {"$in": source_types}},
-        ]
-    }
+def _build_filter(plan: RetrievalPlan) -> dict[str, Any]:
+    source_types = [normalize_source_type(item) for item in plan.source_types if item]
+    clauses: list[dict[str, Any]] = [{"domain": {"$eq": ENTERPRISE_DOMAIN}}]
+    if source_types:
+        clauses.append({"source_type": {"$in": source_types}})
+    if plan.tenant_id and plan.tenant_id != DEFAULT_TENANT_ID:
+        clauses.append({"tenant_id": {"$eq": plan.tenant_id}})
+    if plan.workspace_id and plan.workspace_id != DEFAULT_WORKSPACE_ID:
+        clauses.append({"workspace_id": {"$eq": plan.workspace_id}})
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
@@ -46,6 +51,7 @@ def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
         expansion_reason=expansion_reason,
         first_pass_counts=first_pass_counts,
     )
+    record_retrieval_expansion("enterprise_rag", expansion_reason)
     return expanded
 
 
@@ -75,8 +81,8 @@ def _retrieve_evidence_once(
             },
         )
 
-    dense_docs = _dense_recall(plan)
-    sparse_docs = _sparse_recall(plan)
+    dense_docs, dense_meta = _dense_recall(plan)
+    sparse_docs, sparse_meta = _sparse_recall(plan)
     merged_docs, retrieval_sources = _merge_candidates(plan, dense_docs, sparse_docs)
     reranked_docs, rerank_scores, rerank_meta = _rerank_candidates(plan, merged_docs, retrieval_sources)
     evidence_docs = _select_evidence_docs(reranked_docs, plan.evidence_top_k)
@@ -101,6 +107,8 @@ def _retrieve_evidence_once(
                 "turn_end": str(doc.metadata.get("turn_end") or ""),
                 "section_path": str(doc.metadata.get("section_path") or ""),
                 "message_id": str(doc.metadata.get("message_id") or ""),
+                "tenant_id": str(doc.metadata.get("tenant_id") or ""),
+                "workspace_id": str(doc.metadata.get("workspace_id") or ""),
                 "bm25_score": float(doc.metadata.get("bm25_score") or 0.0),
                 "full_content": doc.page_content,
             },
@@ -124,6 +132,8 @@ def _retrieve_evidence_once(
             "question_type": plan.question_type,
             "budget_profile": plan.budget_profile,
             "source_types": list(plan.source_types),
+            "tenant_id": plan.tenant_id,
+            "workspace_id": plan.workspace_id,
             "dense_candidate_doc_ids": len({str(doc.metadata.get("doc_id") or "") for doc in dense_docs}),
             "sparse_candidate_doc_ids": len({str(doc.metadata.get("doc_id") or "") for doc in sparse_docs}),
             "expansion_triggered": expansion_triggered,
@@ -139,6 +149,8 @@ def _retrieve_evidence_once(
             if expansion_triggered
             else {},
             **rerank_meta,
+            **dense_meta,
+            **sparse_meta,
         },
         rerank_debug=rerank_debug[: plan.rerank_top_k],
     )
@@ -172,24 +184,49 @@ def _should_expand_retrieval(plan: RetrievalPlan, evidence: EvidencePack) -> tup
     return False, "none"
 
 
-def _dense_recall(plan: RetrievalPlan) -> list[Document]:
+def _dense_recall(plan: RetrievalPlan) -> tuple[list[Document], dict[str, Any]]:
     try:
         vectorstore = get_enterprise_vectorstore()
-        return vectorstore.similarity_search(
+        docs = vectorstore.similarity_search(
             plan.query,
             k=plan.dense_top_k,
-            filter=_build_filter(plan.source_types),
+            filter=_build_filter(plan),
         )
-    except Exception:
-        return []
+        return docs, {"dense_error": "", "dense_failure_observation": {}}
+    except Exception as exc:
+        return [], {
+            "dense_error": str(exc),
+            "dense_failure_observation": make_failure_observation(
+                service="chroma",
+                operation="enterprise_dense_recall",
+                error=str(exc),
+                fallback_strategy="continue_with_sparse_recall",
+                retry_count=0,
+            ),
+        }
 
 
-def _sparse_recall(plan: RetrievalPlan) -> list[Document]:
+def _sparse_recall(plan: RetrievalPlan) -> tuple[list[Document], dict[str, Any]]:
     try:
-        rows = search_enterprise_sparse(plan.query, source_types=plan.source_types, limit=plan.sparse_top_k)
-    except Exception:
-        return []
-    return [
+        rows = search_enterprise_sparse(
+            plan.query,
+            source_types=plan.source_types,
+            tenant_id="" if plan.tenant_id == DEFAULT_TENANT_ID else plan.tenant_id,
+            workspace_id="" if plan.workspace_id == DEFAULT_WORKSPACE_ID else plan.workspace_id,
+            limit=plan.sparse_top_k,
+        )
+    except Exception as exc:
+        return [], {
+            "sparse_error": str(exc),
+            "sparse_failure_observation": make_failure_observation(
+                service="sqlite_fts",
+                operation="enterprise_sparse_recall",
+                error=str(exc),
+                fallback_strategy="continue_with_dense_recall",
+                retry_count=0,
+            ),
+        }
+    docs = [
         Document(
             page_content=str(row.get("content") or ""),
             metadata={
@@ -202,11 +239,14 @@ def _sparse_recall(plan: RetrievalPlan) -> list[Document]:
                 "thread_id": str(row.get("thread_id") or ""),
                 "timestamp": str(row.get("timestamp") or ""),
                 "collection_version": str(row.get("collection_version") or ""),
+                "tenant_id": str(row.get("tenant_id") or ""),
+                "workspace_id": str(row.get("workspace_id") or ""),
                 "bm25_score": float(row.get("bm25_score") or 0.0),
             },
         )
         for row in rows
     ]
+    return docs, {"sparse_error": "", "sparse_failure_observation": {}}
 
 
 def _merge_candidates(plan: RetrievalPlan, dense_docs: list[Document], sparse_docs: list[Document]) -> tuple[list[Document], dict[str, str]]:
@@ -290,6 +330,13 @@ def _rerank_candidates(
             {"rerank_backend": "cross_encoder", "rerank_error": ""},
         )
     except Exception as exc:
+        failure_observation = make_failure_observation(
+            service="reranker",
+            operation="rerank_pairs",
+            error=str(exc),
+            fallback_strategy="heuristic_candidate_score",
+            retry_count=0,
+        )
         fallback_scores = [heuristic_scores.get(str(doc.metadata.get("chunk_id") or ""), 0.0) for doc in docs]
         paired = list(zip(fallback_scores, docs))
         paired.sort(key=lambda item: item[0], reverse=True)
@@ -297,7 +344,7 @@ def _rerank_candidates(
         return (
             [doc for _, doc in selected],
             {str(doc.metadata.get("chunk_id") or ""): float(score) for score, doc in selected},
-            {"rerank_backend": "heuristic_fallback", "rerank_error": str(exc)},
+            {"rerank_backend": "heuristic_fallback", "rerank_error": str(exc), "failure_observation": failure_observation},
         )
 
 

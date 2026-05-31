@@ -27,7 +27,9 @@ class ResolutionRule:
 
 CUSTOM_BODY_PATTERNS = (
     re.compile(r"正文(?:内容)?(?:改成|改为|写成|写为)[:：]?\s*(.+)", re.IGNORECASE),
+    re.compile(r"(?:文段|正文|内容|文本)(?:是|为)?[:：]\s*(.+)", re.IGNORECASE),
     re.compile(r"body\s*[:：]?\s*(.+)", re.IGNORECASE),
+    re.compile(r"content\s*(?:is|:|：)\s*(.+)", re.IGNORECASE),
     re.compile(r"write\s+in\s+the\s+body[:：]?\s*(.+)", re.IGNORECASE),
 )
 SUBJECT_OVERRIDE_PATTERNS = (
@@ -73,7 +75,7 @@ MAIL_ACTION_HINTS = {
     "status": ("状态", "status", "进度", "delivery"),
     "recall": ("撤回", "recall", "撤销发送", "unsend"),
 }
-CONFIRMATION_MARKERS = ("确认", "可以发送", "同意发送", "发送吧", "批准发送", "yes send", "confirm send", "ok send")
+CONFIRMATION_MARKERS = ("确认", "可以发送", "同意发送", "发送吧", "批准发送", "yes", "confirm", "ok", "yes send", "confirm send", "ok send")
 MAIL_ACTION_GATE_HINTS = (
     "邮件",
     "邮箱",
@@ -442,11 +444,17 @@ def _build_delivery_plan(
         subject = "外发内容"
     else:
         subject = "外发信息"
+    delivery_body = ""
+    explicit_body = str(constraints.get("body_override") or "").strip()
+    if explicit_body:
+        delivery_body = explicit_body.strip("“”\"'`")
+    elif str((selected_candidate or {}).get("kind") or "") == "user_inline_text":
+        delivery_body = str((selected_candidate or {}).get("content") or "").strip()
     return {
         "ok": True,
         "delivery_plan_kind": "body_constraints",
         "delivery_subject": subject,
-        "delivery_body": "",
+        "delivery_body": delivery_body,
         "body_constraints": constraints,
         "body_sources": body_sources,
         "source_policy": _mail_source_policy(),
@@ -532,6 +540,7 @@ RESOLUTION_RULES: list[ResolutionRule] = [
         matches=lambda ctx: (
             ctx.referential_request
             and not ctx.explicit_summary
+            and _candidate_by_kind(ctx.candidates, "user_inline_text") is None
             and _candidate_by_kind(ctx.candidates, "uploaded_text") is None
             and _candidate_by_kind(ctx.candidates, "assistant_last_answer") is None
         ),
@@ -548,6 +557,14 @@ RESOLUTION_RULES: list[ResolutionRule] = [
         build=lambda ctx: _success(
             ctx,
             selected_candidate=_candidate_by_kind(ctx.candidates, "assistant_last_answer"),
+        ),
+    ),
+    ResolutionRule(
+        name="user_inline_text_default",
+        matches=lambda ctx: _candidate_by_kind(ctx.candidates, "user_inline_text") is not None,
+        build=lambda ctx: _success(
+            ctx,
+            selected_candidate=_candidate_by_kind(ctx.candidates, "user_inline_text"),
         ),
     ),
     ResolutionRule(
@@ -627,7 +644,8 @@ def _detect_mail_action_type(message: str) -> str:
 
 def _choose_authoring_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     return (
-        _candidate_by_kind(candidates, "user_recent_text")
+        _candidate_by_kind(candidates, "user_inline_text")
+        or _candidate_by_kind(candidates, "user_recent_text")
         or _candidate_by_kind(candidates, "assistant_last_answer")
         or _candidate_by_kind(candidates, "uploaded_text")
     )

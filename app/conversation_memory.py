@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.documents import Document
 
 from app.conversation_store import get_related_merged_conversations, get_turns
+from app.actor_context import actor_from_mapping
 from app.vectorstore import get_vectorstore, upsert_documents
 
 
@@ -57,6 +58,7 @@ def build_turn_summary_document(
     citations: list[dict[str, Any]],
     upload_context: dict[str, Any] | None = None,
     dynamic_memory: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> Document:
     source_turn_ids = f"{user_turn_id},{assistant_turn_id}"
     citation_terms = []
@@ -82,6 +84,7 @@ def build_turn_summary_document(
             upload_lines.append(f"upload_snippets: {' | '.join(snippets[:3])}")
 
     dynamic_memory = dict(dynamic_memory or {})
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
     dynamic_lines: list[str] = []
     if dynamic_memory:
         for key in ("summary", "intent", "risk_level", "user_goal", "outcome", "failure_reason", "memory_scope"):
@@ -128,6 +131,9 @@ def build_turn_summary_document(
             "files_uploaded": memory_files,
             "created_at": _now(),
             "is_runtime_memory": "true",
+            "tenant_id": actor.tenant_id,
+            "user_id": actor.user_id,
+            "workspace_id": actor.workspace_id,
         },
     )
 
@@ -140,7 +146,9 @@ def build_merged_summary_document(
     source_turn_ids: list[str],
     summary: str,
     topics: list[str],
+    actor_context: dict[str, Any] | None = None,
 ) -> Document:
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=merged_conversation_id)
     return Document(
         page_content="\n".join(
             [
@@ -162,6 +170,9 @@ def build_merged_summary_document(
             "topic": ",".join(topics) if topics else "conversation_merge",
             "created_at": _now(),
             "is_runtime_memory": "true",
+            "tenant_id": actor.tenant_id,
+            "user_id": actor.user_id,
+            "workspace_id": actor.workspace_id,
         },
     )
 
@@ -246,7 +257,26 @@ def _filter_by_source_conversation(docs: list[Document], conversation_id: str) -
     return filtered
 
 
-def retrieve_turn_memory(session_id: str, conversation_id: str, question: str, top_k: int = 3) -> list[Document]:
+def _actor_filter_clauses(actor_context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not actor_context:
+        return []
+    actor = actor_from_mapping(actor_context)
+    if actor.is_local_dev:
+        return []
+    return [
+        {"tenant_id": {"$eq": actor.tenant_id}},
+        {"user_id": {"$eq": actor.user_id}},
+        {"workspace_id": {"$eq": actor.workspace_id}},
+    ]
+
+
+def retrieve_turn_memory(
+    session_id: str,
+    conversation_id: str,
+    question: str,
+    top_k: int = 3,
+    actor_context: dict[str, Any] | None = None,
+) -> list[Document]:
     vectorstore = get_vectorstore()
     filt = {
         "$and": [
@@ -254,12 +284,19 @@ def retrieve_turn_memory(session_id: str, conversation_id: str, question: str, t
             {"source_type": {"$eq": "turn_summary"}},
             {"session_id": {"$eq": session_id}},
             {"conversation_id": {"$eq": conversation_id}},
+            *_actor_filter_clauses(actor_context),
         ]
     }
     return vectorstore.similarity_search(question, k=top_k, filter=filt)
 
 
-def retrieve_merged_memory(session_id: str, conversation_id: str, question: str, top_k: int = 2) -> list[Document]:
+def retrieve_merged_memory(
+    session_id: str,
+    conversation_id: str,
+    question: str,
+    top_k: int = 2,
+    actor_context: dict[str, Any] | None = None,
+) -> list[Document]:
     related = get_related_merged_conversations(session_id, conversation_id)
     related_ids = {item["conversation_id"] for item in related}
     if not related_ids:
@@ -271,6 +308,7 @@ def retrieve_merged_memory(session_id: str, conversation_id: str, question: str,
             {"domain": {"$eq": "conversation"}},
             {"source_type": {"$eq": "merged_summary"}},
             {"session_id": {"$eq": session_id}},
+            *_actor_filter_clauses(actor_context),
         ]
     }
     docs = vectorstore.similarity_search(question, k=max(top_k * 3, 6), filter=filt)
@@ -310,6 +348,7 @@ def build_memory_context(
     session_id: str,
     conversation_id: str,
     question: str,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recent_context = recent_turns_context(conversation_id, limit=6)
     turn_docs: list[Document] = []
@@ -320,12 +359,12 @@ def build_memory_context(
         retrieval_query = f"{question}\nanchors: {', '.join(plan.entity_anchors)}"
 
     try:
-        turn_docs = retrieve_turn_memory(session_id, conversation_id, retrieval_query, top_k=plan.turn_top_k)
-        merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k)
+        turn_docs = retrieve_turn_memory(session_id, conversation_id, retrieval_query, top_k=plan.turn_top_k, actor_context=actor_context)
+        merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k, actor_context=actor_context)
         if plan.is_follow_up and not merged_docs:
             plan.merged_top_k = 4
             plan.expansion_reason = "follow_up_summary_not_found"
-            merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k)
+            merged_docs = retrieve_merged_memory(session_id, conversation_id, retrieval_query, top_k=plan.merged_top_k, actor_context=actor_context)
     except Exception:
         turn_docs = []
         merged_docs = []
@@ -370,4 +409,5 @@ def build_memory_context(
         "turn_top_k": plan.turn_top_k,
         "merged_top_k": plan.merged_top_k,
         "expansion_reason": plan.expansion_reason,
+        "actor_context": actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id).to_dict(),
     }

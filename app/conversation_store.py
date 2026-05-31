@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sqlite3
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.actor_context import actor_from_mapping
 from app.config import DATA_DIR
 from app.session_transcript import append_transcript_event
 
@@ -79,6 +80,14 @@ def init_conversation_store() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
         if "debug_payload" not in columns:
             conn.execute("ALTER TABLE turns ADD COLUMN debug_payload TEXT NOT NULL DEFAULT '{}'")
+        conversation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+        for column_name in ("tenant_id", "user_id", "workspace_id"):
+            if column_name not in conversation_columns:
+                conn.execute(f"ALTER TABLE conversations ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''")
+        turn_columns = {row["name"] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        for column_name in ("tenant_id", "user_id", "workspace_id"):
+            if column_name not in turn_columns:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''")
 
 
 def _row_to_conversation(row: sqlite3.Row) -> dict[str, Any]:
@@ -103,50 +112,65 @@ def create_conversation(
     is_merged: bool = False,
     source_conversation_ids: list[str] | None = None,
     conversation_id: str | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     init_conversation_store()
     now = _now()
     prefix = "merged" if is_merged else "conv"
     conv_id = conversation_id or _new_id(prefix)
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conv_id)
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO conversations (
                 conversation_id, session_id, title, summary, created_at, updated_at,
-                is_merged, source_conversation_ids
-            ) VALUES (?, ?, ?, '', ?, ?, ?, ?)
+                is_merged, source_conversation_ids, tenant_id, user_id, workspace_id
+            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 conv_id,
                 session_id,
-                title or ("合并对话" if is_merged else "新对话"),
+                title or ("Merged conversation" if is_merged else "New conversation"),
                 now,
                 now,
                 1 if is_merged else 0,
                 json.dumps(source_conversation_ids or [], ensure_ascii=False),
+                actor.tenant_id,
+                actor.user_id,
+                actor.workspace_id,
             ),
         )
     return get_conversation(conv_id) or {}
 
 
-def get_or_create_conversation(session_id: str, conversation_id: str | None = None) -> dict[str, Any]:
+def get_or_create_conversation(
+    session_id: str,
+    conversation_id: str | None = None,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if conversation_id:
         existing = get_conversation(conversation_id)
         if existing:
             return existing
-    return create_conversation(session_id)
+    return create_conversation(session_id, actor_context=actor_context)
 
 
-def list_conversations(session_id: str) -> list[dict[str, Any]]:
+def list_conversations(session_id: str, actor_context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     init_conversation_store()
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id) if actor_context else None
+    clauses = ["session_id = ?"]
+    params: list[Any] = [session_id]
+    if actor and not actor.is_local_dev:
+        clauses.extend(["tenant_id = ?", "user_id = ?", "workspace_id = ?"])
+        params.extend([actor.tenant_id, actor.user_id, actor.workspace_id])
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM conversations
-            WHERE session_id = ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY updated_at DESC
             """,
-            (session_id,),
+            tuple(params),
         ).fetchall()
     return [_row_to_conversation(row) for row in rows]
 
@@ -219,17 +243,20 @@ def append_turn(
     tool_calls: list[dict[str, Any]] | None = None,
     citations: list[dict[str, Any]] | None = None,
     debug_payload: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     init_conversation_store()
     turn_id = _new_id("turn")
     now = _now()
+    actor = actor_from_mapping(actor_context or {}, session_id=session_id, conversation_id=conversation_id)
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO turns (
                 turn_id, conversation_id, session_id, role, content, redacted_content,
-                answer_summary, intent, tool_calls, citations, debug_payload, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                answer_summary, intent, tool_calls, citations, debug_payload, created_at,
+                tenant_id, user_id, workspace_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 turn_id,
@@ -244,6 +271,9 @@ def append_turn(
                 json.dumps(citations or [], ensure_ascii=False),
                 json.dumps(debug_payload or {}, ensure_ascii=False),
                 now,
+                actor.tenant_id,
+                actor.user_id,
+                actor.workspace_id,
             ),
         )
         conn.execute(
@@ -265,6 +295,9 @@ def append_turn(
                 "tool_calls": tool_calls or [],
                 "citations": citations or [],
                 "debug_payload": debug_payload or {},
+                "tenant_id": actor.tenant_id,
+                "user_id": actor.user_id,
+                "workspace_id": actor.workspace_id,
                 "created_at": now,
             }
         )
@@ -285,6 +318,7 @@ def append_exchange(
     tool_calls: list[dict[str, Any]] | None = None,
     citations: list[dict[str, Any]] | None = None,
     debug_payload: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     user_turn = append_turn(
         session_id=session_id,
@@ -293,6 +327,7 @@ def append_exchange(
         content=question,
         redacted_content=redacted_question,
         intent=intent,
+        actor_context=actor_context,
     )
     assistant_turn = append_turn(
         session_id=session_id,
@@ -305,6 +340,7 @@ def append_exchange(
         tool_calls=tool_calls,
         citations=citations,
         debug_payload=debug_payload,
+        actor_context=actor_context,
     )
     return {"user_turn": user_turn, "assistant_turn": assistant_turn}
 

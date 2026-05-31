@@ -1768,6 +1768,9 @@ with right:
         st.metric("Memory", debug.get("memory_hits", 0))
         st.metric("Merged Memory", debug.get("merged_memory_hits", 0))
         st.metric("Latency", f"{debug.get('latency_ms', 0):.0f} ms")
+        st.metric("Input Tokens", int(debug.get("token_in", 0) or 0))
+        st.metric("Output Tokens", int(debug.get("token_out", 0) or 0))
+        st.metric("Cost", f"{float(debug.get('estimated_cost', 0.0) or 0.0):.4f}")
         if debug.get("task_id"):
             st.metric("Task", debug["task_id"])
             st.metric("Task Status", debug.get("task_status", ""))

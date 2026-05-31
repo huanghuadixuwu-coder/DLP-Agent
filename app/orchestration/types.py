@@ -35,6 +35,14 @@ class AgentSubtask:
     capability: str
     input: dict[str, Any] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
+    agent: str = ""
+    action: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+    risk: str = "low"
+    confirmation_required: bool = False
+    idempotency_key: str = ""
+    expected_observation_type: str = ""
+    resource_scope: dict[str, Any] = field(default_factory=dict)
     mutating: bool = False
     parallelizable: bool = True
     user_visible: bool = True
@@ -64,6 +72,23 @@ class ToolResult:
 
 
 @dataclass(slots=True)
+class TypedObservation:
+    observation_type: str
+    status: str = "completed"
+    source: str = ""
+    grounding_kind: str = "tool"
+    summary: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+    missing_fields: list[str] = field(default_factory=list)
+    constraints: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[dict[str, Any]] = field(default_factory=list)
+    citations: list[dict[str, Any]] = field(default_factory=list)
+    actor_context: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class OrchestrationContext:
     session_id: str
     conversation_id: str
@@ -71,6 +96,7 @@ class OrchestrationContext:
     safe_message: str
     display_message: str = ""
     upload_context: dict[str, Any] = field(default_factory=dict)
+    actor_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

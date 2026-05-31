@@ -18,6 +18,7 @@ from app.orchestration.policies import (
     looks_like_persona_signal,
     looks_like_reply_draft_request,
 )
+from app.orchestration.domain_agents import resolve_domain_agent_for_action
 from app.orchestration.registry import build_tool_registry
 from app.orchestration.types import AgentSubtask, AgentTaskPlan
 from app.upload_analysis import classify_upload_request
@@ -178,11 +179,20 @@ Return JSON only using this schema:
   "planner_reason": "...",
   "confidence": 0.0,
   "aggregation_strategy": "answer_all_parts|compose_reply_with_context|status_and_next_action",
-  "subtasks": [
+    "subtasks": [
     {
+      "task_id": "optional stable step id",
+      "agent": "mail|calendar|meeting|dlp|enterprise_rag|memory|supervisor",
       "capability": "one tool name from the catalog",
+      "action": "same as capability unless a more specific action is needed",
       "input": {},
+      "parameters": {},
       "dependencies": [],
+      "risk": "low|medium|high",
+      "confirmation_required": false,
+      "idempotency_key": "",
+      "expected_observation_type": "",
+      "resource_scope": {},
       "user_visible": true
     }
   ]
@@ -222,12 +232,22 @@ Rules:
             if capability not in valid_names:
                 continue
             definition = tool_catalog[capability]
+            action = str(item.get("action") or capability).strip()
+            parameters = dict(item.get("parameters") or item.get("input") or {})
             subtasks.append(
                 AgentSubtask(
-                    task_id=_task_id(capability),
+                    task_id=str(item.get("task_id") or _task_id(capability)),
                     capability=capability,
-                    input=dict(item.get("input") or {}),
+                    action=action,
+                    agent=str(item.get("agent") or resolve_domain_agent_for_action(action)),
+                    input=parameters,
+                    parameters=parameters,
                     dependencies=[str(dep) for dep in item.get("dependencies") or []],
+                    risk=str(item.get("risk") or "low"),
+                    confirmation_required=bool(item.get("confirmation_required", False) or definition.requires_confirmation),
+                    idempotency_key=str(item.get("idempotency_key") or ""),
+                    expected_observation_type=str(item.get("expected_observation_type") or definition.returns_observation_type),
+                    resource_scope=dict(item.get("resource_scope") or {}),
                     mutating=definition.mutating,
                     parallelizable=definition.parallelizable,
                     user_visible=bool(item.get("user_visible", True)),
@@ -275,8 +295,16 @@ def _finalize_plan(plan: AgentTaskPlan, fallback: AgentTaskPlan | None = None) -
             AgentSubtask(
                 task_id=task_id,
                 capability=item.capability,
+                action=item.action or item.capability,
+                agent=item.agent or resolve_domain_agent_for_action(item.action or item.capability),
                 input=normalized_input,
+                parameters=dict(item.parameters or normalized_input),
                 dependencies=[dep for dep in item.dependencies if dep],
+                risk=item.risk or "low",
+                confirmation_required=bool(item.confirmation_required or definition.requires_confirmation),
+                idempotency_key=item.idempotency_key,
+                expected_observation_type=item.expected_observation_type or definition.returns_observation_type,
+                resource_scope=dict(item.resource_scope or {}),
                 mutating=definition.mutating,
                 parallelizable=definition.parallelizable,
                 user_visible=item.user_visible,

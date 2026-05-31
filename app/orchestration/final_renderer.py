@@ -7,7 +7,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.conversation_memory import compact_text
 from app.graph import get_llm
+from app.metrics import record_llm_error, record_renderer_fallback
 from app.observability import estimate_cost, normalize_usage
+from app.orchestration.agent_verifier import verifier_observation, verify_agent_answer
+from app.resilience import make_failure_observation, run_with_retry
 
 
 FINAL_ANSWER_PROMPT = """You are the final answer renderer for a secure enterprise mail agent.
@@ -22,6 +25,7 @@ Rules:
 - For contextual_qa, prefer a natural recap instead of replaying every turn unless the user explicitly asks for exact wording.
 - For enterprise facts, stay grounded in the evidence and citations.
 - For mail and task results, explain the current state and next step naturally instead of dumping raw payload fields.
+- If an agent_verifier_verdict observation is present, follow its rewrite_instructions and do not claim a blocked action succeeded.
 """
 
 MAIL_AUTHORING_PROMPT = """You are the mail authoring renderer for an enterprise agent.
@@ -56,14 +60,70 @@ def render_final_answer(
     observations: list[dict[str, Any]],
     working_memory: list[str] | None = None,
     conservative: bool = False,
+    pending_confirmation: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_observations = list(observations or [])
+    first = _render_final_answer_once(
+        question=question,
+        current_goal=current_goal,
+        observations=normalized_observations,
+        working_memory=working_memory,
+        conservative=conservative,
+    )
+    verdict = verify_agent_answer(
+        question=question,
+        current_goal=current_goal,
+        observations=normalized_observations,
+        answer=str(first.get("answer") or ""),
+        pending_confirmation=pending_confirmation,
+    )
+    first["verifier_verdict"] = verdict
+    first["verifier_initial_verdict"] = verdict
+    first["verifier_rewrite_applied"] = False
+    if not verdict.get("needs_rewrite"):
+        return first
+
+    verifier_obs = verifier_observation(verdict, actor_context=actor_context)
+    second_observations = [*normalized_observations, verifier_obs]
+    second = _render_final_answer_once(
+        question=question,
+        current_goal=current_goal,
+        observations=second_observations,
+        working_memory=working_memory,
+        conservative=True,
+    )
+    final_verdict = verify_agent_answer(
+        question=question,
+        current_goal=current_goal,
+        observations=second_observations,
+        answer=str(second.get("answer") or ""),
+        pending_confirmation=pending_confirmation,
+    )
+    second["token_in"] = int(first.get("token_in", 0)) + int(second.get("token_in", 0))
+    second["token_out"] = int(first.get("token_out", 0)) + int(second.get("token_out", 0))
+    second["estimated_cost"] = float(first.get("estimated_cost", 0.0)) + float(second.get("estimated_cost", 0.0))
+    second["verifier_verdict"] = final_verdict
+    second["verifier_initial_verdict"] = verdict
+    second["verifier_rewrite_applied"] = True
+    return second
+
+
+def _render_final_answer_once(
+    *,
+    question: str,
+    current_goal: str,
+    observations: list[dict[str, Any]],
+    working_memory: list[str] | None = None,
+    conservative: bool = False,
 ) -> dict[str, Any]:
     working_memory = list(working_memory or [])[-4:]
     mode_hint = "Use conservative wording and explicitly say when evidence is partial." if conservative else "Answer directly and naturally."
     if current_goal == "contextual_qa":
         mode_hint = f"{mode_hint} {_contextual_answer_instruction(question)}".strip()
 
-    try:
-        response = get_llm().invoke(
+    ok, response, exc, retry_count = run_with_retry(
+        lambda: get_llm().invoke(
             [
                 SystemMessage(content=FINAL_ANSWER_PROMPT),
                 HumanMessage(
@@ -79,8 +139,23 @@ def render_final_answer(
                     )
                 ),
             ]
+        ),
+        service="llm",
+        operation_name="final_renderer",
+        attempts=2,
+        retry_delay_seconds=0.2,
+    )
+    if not ok or response is None:
+        error = str(exc or "unknown LLM renderer failure")
+        record_llm_error("final_renderer")
+        record_renderer_fallback("final_renderer")
+        failure_observation = make_failure_observation(
+            service="llm",
+            operation="final_renderer",
+            error=error,
+            fallback_strategy="deterministic_final_answer",
+            retry_count=retry_count,
         )
-    except Exception:
         answer = fallback_final_answer(
             question=question,
             current_goal=current_goal,
@@ -94,6 +169,7 @@ def render_final_answer(
             "token_out": 0,
             "estimated_cost": 0.0,
             "used_fallback": True,
+            "failure_observation": failure_observation,
         }
 
     token_in, token_out = normalize_usage(response)
@@ -112,6 +188,14 @@ def render_final_answer(
             "token_out": token_out,
             "estimated_cost": estimate_cost(token_in, token_out),
             "used_fallback": True,
+            "failure_observation": make_failure_observation(
+                service="llm",
+                operation="final_renderer_empty_output",
+                error="empty_output",
+                fallback_strategy="deterministic_final_answer",
+                retry_count=0,
+                severity="low",
+            ),
         }
     return {
         "answer": rendered,

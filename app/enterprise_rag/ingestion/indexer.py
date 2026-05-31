@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain_core.documents import Document
 
+from app.actor_context import actor_from_mapping
 from app.config import get_settings
 from app.enterprise_rag.core.types import ENTERPRISE_DOMAIN
 from app.enterprise_rag.ingestion.chunker import chunk_document
@@ -63,8 +64,10 @@ def upsert_enterprise_documents_hybrid(
     *,
     replace_existing: bool = True,
     return_details: bool = False,
+    actor_context: dict[str, Any] | None = None,
 ) -> int | dict[str, Any]:
     documents = list(documents or [])
+    actor = actor_from_mapping(actor_context or {})
     doc_ids = sorted({str(getattr(document, "doc_id", "") or "").strip() for document in documents if str(getattr(document, "doc_id", "") or "").strip()})
     dense_delete = {"documents_requested": 0, "chunks_deleted": 0}
     sparse_delete = {"documents_requested": 0, "chunks_deleted": 0}
@@ -75,6 +78,10 @@ def upsert_enterprise_documents_hybrid(
     chunks = []
     for document in documents:
         chunks.extend(chunk_document(document))
+    for chunk in chunks:
+        chunk.metadata.setdefault("tenant_id", actor.tenant_id)
+        chunk.metadata.setdefault("workspace_id", actor.workspace_id)
+        chunk.metadata.setdefault("user_id", actor.user_id)
     docs = _to_langchain_documents(chunks)
     upsert_enterprise_documents(docs)
     upsert_enterprise_sparse_chunks(
@@ -91,6 +98,8 @@ def upsert_enterprise_documents_hybrid(
                 "thread_id": str(chunk.metadata.get("thread_id") or ""),
                 "timestamp": str(chunk.metadata.get("timestamp") or ""),
                 "collection_version": str(chunk.metadata.get("collection_version") or ""),
+                "tenant_id": str(chunk.metadata.get("tenant_id") or ""),
+                "workspace_id": str(chunk.metadata.get("workspace_id") or ""),
             }
             for chunk in chunks
         ]
@@ -104,6 +113,8 @@ def upsert_enterprise_documents_hybrid(
         "dense_chunks_deleted": int(dense_delete.get("chunks_deleted", 0)),
         "sparse_chunks_deleted": int(sparse_delete.get("chunks_deleted", 0)),
         "content_hash": _batch_content_hash(documents),
+        "tenant_id": actor.tenant_id,
+        "workspace_id": actor.workspace_id,
         "content_hash_sample": {
             str(getattr(document, "doc_id", "") or ""): _document_content_hash(document)
             for document in documents[:20]
@@ -128,6 +139,7 @@ def ingest_enterprise_rag_bench(
     questions_path: str | None = None,
     limit: int = 200,
     reset: bool = False,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if mode not in {"sample", "full"}:
         raise ValueError("mode must be 'sample' or 'full'")
@@ -179,7 +191,12 @@ def ingest_enterprise_rag_bench(
                 if len(seen_doc_ids) >= len(expected_doc_ids) + distractor_limit:
                     break
 
-    index_details = upsert_enterprise_documents_hybrid(documents, replace_existing=True, return_details=True)
+    index_details = upsert_enterprise_documents_hybrid(
+        documents,
+        replace_existing=True,
+        return_details=True,
+        actor_context=actor_context,
+    )
     indexed_chunks = int(index_details["chunks_indexed"])
 
     run = {
@@ -202,6 +219,9 @@ def ingest_enterprise_rag_bench(
         "enterprise_collection": get_settings().enterprise_chroma_collection,
         "sparse_index": get_settings().enterprise_sparse_db_path,
         "reset": reset,
+        "actor_context": dict(actor_context or {}),
+        "tenant_id": str((actor_context or {}).get("tenant_id") or ""),
+        "workspace_id": str((actor_context or {}).get("workspace_id") or ""),
     }
     append_manifest_run(run)
     return run

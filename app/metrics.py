@@ -56,6 +56,30 @@ TASKS_INFLIGHT = Gauge("agent_tasks_inflight", "Current asynchronous DLP tasks i
 TASK_STATUS_TOTAL = Gauge("agent_task_status_total", "Current DLP tasks grouped by status.", ["status"])
 TASK_LATENCY_MS = Gauge("agent_task_latency_ms", "Average terminal task latency in milliseconds.")
 QUEUE_BACKLOG = Gauge("agent_queue_backlog", "Current queue backlog size.", ["queue"])
+RATE_LIMITED_TOTAL = Counter("agent_rate_limited_total", "Total requests rejected by rate limiting.", ["resource"])
+LLM_ERRORS_TOTAL = Counter("agent_llm_errors_total", "Total LLM or renderer call errors.", ["source"])
+RENDERER_FALLBACK_TOTAL = Counter("agent_renderer_fallback_total", "Total final renderer fallbacks.", ["source"])
+RETRIEVAL_EXPANSION_TOTAL = Counter("agent_retrieval_expansion_total", "Total retrieval expansions.", ["domain", "reason"])
+DEPENDENCY_FAILURES_TOTAL = Counter(
+    "agent_dependency_failures_total",
+    "Total dependency failures that produced degraded observations.",
+    ["service", "operation", "fallback_strategy"],
+)
+MULTI_AGENT_PLAN_FAILURES_TOTAL = Counter(
+    "agent_multi_agent_plan_failures_total",
+    "Total multi-agent DAG plan validation or execution failures.",
+    ["reason"],
+)
+SIDE_EFFECT_BLOCKED_TOTAL = Counter(
+    "agent_side_effect_blocked_total",
+    "Total side-effectful domain-agent steps blocked before confirmation.",
+    ["agent", "action"],
+)
+DEPENDENCY_BLOCKED_TOTAL = Counter(
+    "agent_dependency_blocked_total",
+    "Total DAG steps blocked because dependencies failed or were missing.",
+    ["agent", "action"],
+)
 APPROVAL_PENDING_TOTAL = Gauge("agent_approval_pending_total", "Current DLP tasks waiting for human approval.")
 EMAIL_SEND_TOTAL = Gauge("agent_email_send_total", "Current number of successfully sent DLP emails.")
 EMAIL_SEND_FAILURES_TOTAL = Gauge("agent_email_send_failures_total", "Current number of failed DLP email sends.")
@@ -288,6 +312,47 @@ def record_fault_injection(fault_type: str) -> None:
 def record_task_degradation(mode: str) -> None:
     if mode:
         DEGRADATION_MODE_TOTAL.labels(mode=mode).inc()
+
+
+def record_rate_limited(resource: str) -> None:
+    RATE_LIMITED_TOTAL.labels(resource=resource or "unknown").inc()
+
+
+def record_llm_error(source: str = "unknown") -> None:
+    LLM_ERRORS_TOTAL.labels(source=source or "unknown").inc()
+
+
+def record_renderer_fallback(source: str = "unknown") -> None:
+    RENDERER_FALLBACK_TOTAL.labels(source=source or "unknown").inc()
+
+
+def record_retrieval_expansion(domain: str, reason: str) -> None:
+    RETRIEVAL_EXPANSION_TOTAL.labels(domain=domain or "unknown", reason=reason or "unknown").inc()
+
+
+def record_dependency_failure(service: str, operation: str, fallback_strategy: str) -> None:
+    DEPENDENCY_FAILURES_TOTAL.labels(
+        service=service or "unknown",
+        operation=operation or "unknown",
+        fallback_strategy=fallback_strategy or "unknown",
+    ).inc()
+
+
+def record_multi_agent_plan_failure(reason: str) -> None:
+    MULTI_AGENT_PLAN_FAILURES_TOTAL.labels(reason=reason or "unknown").inc()
+
+
+def record_side_effect_blocked(agent: str, action: str) -> None:
+    SIDE_EFFECT_BLOCKED_TOTAL.labels(agent=agent or "unknown", action=action or "unknown").inc()
+
+
+def record_dependency_blocked(agent: str, action: str) -> None:
+    DEPENDENCY_BLOCKED_TOTAL.labels(agent=agent or "unknown", action=action or "unknown").inc()
+
+
+def record_queue_backlog(backlog: dict[str, int]) -> None:
+    for queue_name, count in backlog.items():
+        QUEUE_BACKLOG.labels(queue=str(queue_name)).set(int(count))
 
 
 def refresh_task_metrics(

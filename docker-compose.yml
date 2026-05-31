@@ -19,7 +19,7 @@ services:
       - chroma
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+      - ./external-models:/app/external-models
 
   worker:
     build:
@@ -30,6 +30,8 @@ services:
       celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=dlp_risk_queue --concurrency=$${RISK_WORKER_CONCURRENCY:-4} &
       celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=email_send_queue --concurrency=$${EMAIL_WORKER_CONCURRENCY:-2} &
       celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=mail_inbound_queue --concurrency=$${MAIL_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=enterprise_rag_queue --concurrency=$${ENTERPRISE_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=meeting_queue --concurrency=$${MEETING_WORKER_CONCURRENCY:-1} &
       wait
       "
     env_file:
@@ -43,7 +45,7 @@ services:
       - chroma
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+      - ./external-models:/app/external-models
 
   web:
     build:
@@ -60,7 +62,7 @@ services:
       - api
     volumes:
       - .:/app
-      - ../bge-small-zh-v1.5:/app/external-models/bge-small-zh-v1.5
+      - ./external-models:/app/external-models
 
   postgres:
     image: postgres:16-alpine

@@ -47,6 +47,7 @@ def _conversation_context_fetch(payload: dict[str, Any], _: OrchestrationContext
         session_id=context.session_id,
         conversation_id=context.conversation_id,
         question=query,
+        actor_context=context.actor_context,
     )
     return {
         "conversation_id": context.conversation_id,
@@ -66,7 +67,7 @@ def _governance_task_context_fetch(_: dict[str, Any], context: OrchestrationCont
 def _memory_search(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query") or context.message)
     top_k = int(payload.get("top_k") or 6)
-    result = search_workspace_memory_with_plan(query, top_k=top_k)
+    result = search_workspace_memory_with_plan(query, top_k=top_k, filters={"actor_context": dict(context.actor_context or {})})
     return {
         "hits": result.get("hits") or [],
         "retrieval_plan": result.get("retrieval_plan") or {},
@@ -148,6 +149,9 @@ def _enterprise_search(payload: dict[str, Any], context: OrchestrationContext, _
     top_k = int(payload.get("top_k") or 8)
     source_types = _sanitize_enterprise_source_types(payload.get("source_types"), question)
     plan = build_retrieval_plan(question, source_types=source_types, top_k=top_k)
+    if context.actor_context:
+        plan.tenant_id = str(context.actor_context.get("tenant_id") or "")
+        plan.workspace_id = str(context.actor_context.get("workspace_id") or "")
     evidence = retrieve_evidence(plan)
     return {"retrieval_plan": asdict(plan), "evidence": _evidence_to_dict(evidence)}
 
@@ -179,6 +183,7 @@ def _enterprise_answer(payload: dict[str, Any], context: OrchestrationContext, d
         session_id=context.session_id,
         conversation_id=context.conversation_id,
         question=question,
+        actor_context=context.actor_context,
     )
     answer = compose_enterprise_answer(
         question,
@@ -217,6 +222,7 @@ def _enterprise_rag_query(payload: dict[str, Any], context: OrchestrationContext
         top_k=int(payload.get("top_k") or 8),
         session_id=context.session_id,
         conversation_id=context.conversation_id,
+        actor_context=context.actor_context,
     )
 
 

@@ -705,8 +705,11 @@ def get_user_memory_context(*, session_id: str, conversation_id: str = "", limit
     }
 
 
-def get_workspace_memory_context(question: str, *, top_k: int = 6) -> dict[str, Any]:
-    result = search_workspace_memory_with_plan(question, top_k=top_k)
+def get_workspace_memory_context(question: str, *, top_k: int = 6, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    filters = {}
+    if actor_context:
+        filters["actor_context"] = dict(actor_context)
+    result = search_workspace_memory_with_plan(question, top_k=top_k, filters=filters)
     hits = list(result.get("hits") or [])
     summary = "\n".join(
         f"- {item.get('file_path', '')} :: {item.get('title', '')}: {item.get('snippet', '')}"
@@ -721,5 +724,6 @@ def get_workspace_memory_context(question: str, *, top_k: int = 6) -> dict[str, 
             "top_k": top_k,
             "retrieval_plan": result.get("retrieval_plan") or {},
             "diagnostics": result.get("diagnostics") or {},
+            "actor_context": dict(actor_context or {}),
         },
     }

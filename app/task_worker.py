@@ -11,11 +11,15 @@ from app.dlp_scenarios import normalize_fault_injection
 from app.inbound_mail import generate_daily_mail_digest, sync_inbound_mail
 from app.mcp_client import call_mcp_tool
 from app.metrics import record_fault_injection, record_task_degradation, record_task_retry
+from app.orchestration.observations import make_typed_observation
 from app.privacy_lab import scan_sensitive_message
+from app.resilience import make_failure_observation
 from app.task_events import build_task_event, publish_task_event
 from app.task_queue import celery_app, enqueue_email_send_task
 from app.task_store import add_task_event, get_dlp_task, set_task_status, update_task
 from app.upload_blob_store import load_upload_blob
+from app.orchestration.tool_discovery import dispatch_tool_call
+from app.orchestration.types import OrchestrationContext
 
 
 TEMPORARY_PROVIDER_TOKENS = ("timeout", "timed out", "tempor", "refused", "unavailable", "reset", "limit", "quota", "429")
@@ -428,14 +432,47 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "Task vanished after risk analysis"}
 
     if bool(task.get("approval_required", False)):
+        recovery_observation = make_typed_observation(
+            observation_type="governance_recovery",
+            source="dlp_worker",
+            status="blocked",
+            grounding_kind="guardrail",
+            summary="High-risk outbound content is blocked pending human approval.",
+            payload={
+                "task_id": task_id,
+                "risk_level": str(task.get("risk_level") or final_risk_level),
+                "approval_required": True,
+                "recovery_strategy": "human_approval_required_before_send",
+                "risk_reasons": list(task.get("risk_reasons") or []),
+                "next_recommended_action": "Review the redacted content and approve or reject the outbound request.",
+            },
+            provenance={"source": "dlp_worker"},
+            confidence=0.98,
+            actor_context={
+                "tenant_id": str(task.get("tenant_id") or ""),
+                "user_id": str(task.get("user_id") or ""),
+                "workspace_id": str(task.get("workspace_id") or ""),
+                "session_id": str(task.get("session_id") or ""),
+                "conversation_id": str(task.get("conversation_id") or ""),
+            },
+            success=True,
+        )
         task = set_task_status(
             task_id,
             "pending_approval",
             actor="worker",
             event_type="pending_approval",
             event_message="Sensitive outbound content detected. Waiting for human approval.",
-            extra_updates={"delivery_status": "pending_approval"},
-            details={"risk_reasons": task.get("risk_reasons", [])},
+            extra_updates={
+                "delivery_status": "pending_approval",
+                "domain_result": {
+                    "ok": False,
+                    "blocked_by": "dlp_high_risk",
+                    "recovery_observation": recovery_observation,
+                },
+                "next_recommended_action": "Review the redacted content and approve or reject the outbound request.",
+            },
+            details={"risk_reasons": task.get("risk_reasons", []), "recovery_observation": recovery_observation},
         )
         if task:
             _publish_snapshot(task, "pending_approval", "Sensitive outbound content detected. Waiting for approval.")
@@ -451,7 +488,49 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
     )
     if task:
         _publish_snapshot(task, "queued_for_send", "Low-risk task queued for outbound email sending.")
-    enqueue_email_send_task(task_id)
+    try:
+        enqueue_email_send_task(task_id)
+    except Exception as exc:
+        error = str(exc)
+        failure_observation = make_failure_observation(
+            service="celery",
+            operation="enqueue_email_send_task",
+            error=error,
+            fallback_strategy="mark_send_failed_and_return_recovery_observation",
+            retry_count=0,
+            actor_context={
+                "tenant_id": str(task.get("tenant_id") or ""),
+                "user_id": str(task.get("user_id") or ""),
+                "workspace_id": str(task.get("workspace_id") or ""),
+                "session_id": str(task.get("session_id") or ""),
+                "conversation_id": str(task.get("conversation_id") or ""),
+            },
+            severity="high",
+        )
+        task = set_task_status(
+            task_id,
+            "send_failed",
+            actor="worker",
+            event_type="enqueue_email_failed",
+            event_message="Email send task could not be queued.",
+            extra_updates={
+                "delivery_status": "send_failed",
+                "delivery_error": error,
+                "final_result": "Email send task could not be queued for worker execution.",
+                "last_error_category": "transient_infra",
+                "manual_handover_required": True,
+                "next_recommended_action": "Check Redis/Celery email worker health, then retry or use manual handover.",
+                "domain_result": {
+                    "ok": False,
+                    "error": error,
+                    "recovery_observation": failure_observation,
+                },
+            },
+            details={"error": error, "recovery_observation": failure_observation},
+        )
+        if task:
+            _publish_snapshot(task, "enqueue_email_failed", "Email send task could not be queued.")
+        return {"ok": False, "status": "send_failed", "error": error}
     return {"ok": True, "status": "queued_for_send"}
 
 
@@ -491,6 +570,21 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
     if fault_injection.get("force_smtp_fail"):
         record_fault_injection("force_smtp_fail")
         error = "Injected SMTP failure for scenario replay."
+        failure_observation = make_failure_observation(
+            service="smtp",
+            operation="send_email_smtp",
+            error=error,
+            fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
+            retry_count=0,
+            actor_context={
+                "tenant_id": str(task.get("tenant_id") or ""),
+                "user_id": str(task.get("user_id") or ""),
+                "workspace_id": str(task.get("workspace_id") or ""),
+                "session_id": str(task.get("session_id") or ""),
+                "conversation_id": str(task.get("conversation_id") or ""),
+            },
+            severity="medium",
+        )
         task = set_task_status(
             task_id,
             "send_failed",
@@ -506,8 +600,14 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
                 "last_error_category": "provider_temporary",
                 "manual_handover_required": False,
                 "next_recommended_action": "Use retry-send or manual handover once governance actions are enabled.",
+                "domain_result": {
+                    "ok": False,
+                    "error": error,
+                    "failure_observation": failure_observation,
+                    "recovery_observation": failure_observation,
+                },
             },
-            details={"error": error, "injected": True},
+            details={"error": error, "injected": True, "recovery_observation": failure_observation},
         )
         if task:
             _publish_snapshot(task, "send_failed", "Outbound email failed to send.")
@@ -563,6 +663,24 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
                     else "Review recipient, SMTP settings, or content policy before retrying."
                 ),
                 "final_result": f"Email send failed: {error}",
+                "domain_result": {
+                    "ok": False,
+                    "error": error,
+                    "failure_observation": make_failure_observation(
+                        service="smtp",
+                        operation="send_email_smtp",
+                        error=error,
+                        fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
+                        retry_count=0,
+                        actor_context={
+                            "tenant_id": str(task.get("tenant_id") or ""),
+                            "user_id": str(task.get("user_id") or ""),
+                            "workspace_id": str(task.get("workspace_id") or ""),
+                            "session_id": str(task.get("session_id") or ""),
+                            "conversation_id": str(task.get("conversation_id") or ""),
+                        },
+                    ),
+                },
             },
             details={"error": error},
         )
@@ -647,6 +765,24 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
                 if error_category == "provider_temporary"
                 else "Review recipient, SMTP settings, or content policy before retrying."
             ),
+            "domain_result": {
+                "ok": False,
+                "error": error,
+                "failure_observation": dict(payload.get("failure_observation") or make_failure_observation(
+                    service="smtp",
+                    operation="send_email_smtp",
+                    error=error,
+                    fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
+                    retry_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
+                    actor_context={
+                        "tenant_id": str(task.get("tenant_id") or ""),
+                        "user_id": str(task.get("user_id") or ""),
+                        "workspace_id": str(task.get("workspace_id") or ""),
+                        "session_id": str(task.get("session_id") or ""),
+                        "conversation_id": str(task.get("conversation_id") or ""),
+                    },
+                )),
+            },
         },
         details={"error": error},
     )
@@ -663,3 +799,210 @@ def sync_inbound_mail_task() -> dict[str, Any]:
 @celery_app.task(name="app.task_worker.generate_daily_mail_digest_task")
 def generate_daily_mail_digest_task() -> dict[str, Any]:
     return generate_daily_mail_digest()
+
+
+@celery_app.task(name="app.task_worker.enterprise_rag_ingest_task")
+def enterprise_rag_ingest_task(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.enterprise_rag.ingestion.indexer import ingest_enterprise_rag_bench
+
+    payload = dict(payload or {})
+    return ingest_enterprise_rag_bench(
+        mode=str(payload.get("mode") or "sample"),
+        documents_path=payload.get("documents_path"),
+        questions_path=payload.get("questions_path"),
+        limit=int(payload.get("limit") or 200),
+        reset=bool(payload.get("reset", False)),
+        actor_context=dict(payload.get("actor_context") or {}),
+    )
+
+
+@celery_app.task(name="app.task_worker.enterprise_rag_benchmark_task")
+def enterprise_rag_benchmark_task(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
+
+    payload = dict(payload or {})
+    return run_benchmark_sample(
+        questions_path=payload.get("questions_path"),
+        limit=max(1, min(int(payload.get("limit") or 20), 100)),
+        top_k=max(1, min(int(payload.get("top_k") or 8), 30)),
+    )
+
+
+@celery_app.task(
+    bind=True,
+    base=GovernedTaskBase,
+    name="app.task_worker.process_domain_meeting_task",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 2},
+)
+def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
+    task = get_dlp_task(task_id)
+    if not task:
+        return {"ok": False, "error": "Unknown task_id"}
+    if str(task.get("task_type") or "") != "domain_meeting":
+        return {"ok": True, "skipped": True, "status": task.get("status"), "reason": "not_domain_meeting"}
+    if task["status"] == "completed":
+        return {"ok": True, "skipped": True, "status": "completed"}
+    if task["status"] not in {"queued", "failed"}:
+        return {"ok": True, "skipped": True, "status": task["status"]}
+
+    if self.request.retries:
+        record_task_retry("meeting")
+
+    action = str(task.get("domain_action") or "").strip()
+    stored_payload = dict(task.get("domain_payload") or {})
+    payload = _domain_tool_payload(stored_payload)
+    if not action.startswith("meeting_"):
+        task = set_task_status(
+            task_id,
+            "failed",
+            actor="worker",
+            event_type="domain_action_rejected",
+            event_message="Meeting worker rejected a non-meeting domain action.",
+            extra_updates={
+                "domain_result": {"ok": False, "error": "invalid_meeting_action", "action": action},
+                "delivery_status": "failed",
+                "delivery_error": "invalid_meeting_action",
+                "final_result": "Meeting worker rejected a non-meeting domain action.",
+            },
+            details={"action": action},
+        )
+        return {"ok": False, "status": "failed", "error": "invalid_meeting_action"}
+
+    task = set_task_status(
+        task_id,
+        "processing",
+        actor="worker",
+        event_type="meeting_processing_started",
+        event_message="Worker started Tencent Meeting domain action.",
+        extra_updates={"delivery_status": "processing"},
+        details={"action": action},
+    )
+    if not task:
+        return {"ok": False, "error": "Task vanished during meeting processing"}
+    _publish_snapshot(task, "meeting_processing_started", "Worker started Tencent Meeting domain action.")
+
+    context = OrchestrationContext(
+        session_id=str(task.get("session_id") or ""),
+        conversation_id=str(task.get("conversation_id") or ""),
+        message=str(task.get("message_raw") or ""),
+        safe_message=str(task.get("message_raw") or ""),
+        display_message=str(task.get("request_message") or task.get("message_raw") or ""),
+        actor_context={
+            "tenant_id": str(task.get("tenant_id") or ""),
+            "user_id": str(task.get("user_id") or ""),
+            "workspace_id": str(task.get("workspace_id") or ""),
+            "session_id": str(task.get("session_id") or ""),
+            "conversation_id": str(task.get("conversation_id") or ""),
+            "roles": ["admin"],
+        },
+    )
+    dispatched = dispatch_tool_call(action, payload, context, {}, allow_side_effects=True)
+    result = dict(dispatched.get("result") or {})
+    ok = bool(dispatched.get("ok"))
+    post_confirm_results = _run_post_confirm_domain_steps(
+        action=action,
+        stored_payload=stored_payload,
+        tool_payload=payload,
+        tool_result=result,
+        context=context,
+    ) if ok else []
+    status = "completed" if ok else "failed"
+    error = str(dispatched.get("error") or result.get("error") or "")
+    summary = str(result.get("summary") or result.get("message") or error or f"{action} completed.")
+    task = set_task_status(
+        task_id,
+        status,
+        actor="worker",
+        event_type="meeting_completed" if ok else "meeting_failed",
+        event_message=summary,
+        extra_updates={
+            "domain_result": {
+                "ok": ok,
+                "action": action,
+                "result": result,
+                "error": error,
+                "post_confirm_results": post_confirm_results,
+            },
+            "delivery_status": status,
+            "delivery_result": summary if ok else "",
+            "delivery_error": "" if ok else error,
+            "final_result": summary,
+            "last_error_category": "" if ok else _classify_provider_error(error),
+            "manual_handover_required": bool(error),
+            "next_recommended_action": "" if ok else "Review Tencent Meeting provider response and retry or create the meeting manually.",
+        },
+        details={"action": action, "ok": ok, "error": error},
+    )
+    if task:
+        _publish_snapshot(task, "meeting_completed" if ok else "meeting_failed", summary)
+    return {"ok": ok, "status": status, "error": error, "result": result, "post_confirm_results": post_confirm_results}
+
+
+def _domain_tool_payload(stored_payload: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(stored_payload.get("tool_input"), dict):
+        return dict(stored_payload.get("tool_input") or {})
+    return {str(key): value for key, value in stored_payload.items() if not str(key).startswith("_")}
+
+
+def _run_post_confirm_domain_steps(
+    *,
+    action: str,
+    stored_payload: dict[str, Any],
+    tool_payload: dict[str, Any],
+    tool_result: dict[str, Any],
+    context: OrchestrationContext,
+) -> list[dict[str, Any]]:
+    dag_plan = dict(stored_payload.get("_dag_plan") or {})
+    subtasks = list(dag_plan.get("subtasks") or [])
+    if not subtasks:
+        return []
+    idempotency_key = str(tool_payload.get("idempotency_key") or stored_payload.get("idempotency_key") or "")
+    confirmed_task_id = ""
+    for item in subtasks:
+        if not isinstance(item, dict):
+            continue
+        parameters = dict(item.get("parameters") or item.get("input") or {})
+        if str(item.get("action") or item.get("capability") or "") != action:
+            continue
+        if idempotency_key and str(parameters.get("idempotency_key") or item.get("idempotency_key") or "") != idempotency_key:
+            continue
+        confirmed_task_id = str(item.get("task_id") or "")
+        break
+    if not confirmed_task_id:
+        return []
+
+    dependency_payloads = {
+        confirmed_task_id: {
+            **tool_result,
+            "confirmed_action": action,
+            "idempotency_key": idempotency_key,
+        }
+    }
+    outputs: list[dict[str, Any]] = []
+    for item in subtasks:
+        if not isinstance(item, dict):
+            continue
+        dependencies = [str(dep) for dep in list(item.get("dependencies") or [])]
+        post_action = str(item.get("action") or item.get("capability") or "")
+        if confirmed_task_id not in dependencies or post_action == action:
+            continue
+        dispatched = dispatch_tool_call(
+            post_action,
+            dict(item.get("parameters") or item.get("input") or {}),
+            context,
+            dependency_payloads,
+            allow_side_effects=False,
+        )
+        outputs.append(
+            {
+                "task_id": str(item.get("task_id") or ""),
+                "action": post_action,
+                "ok": bool(dispatched.get("ok")),
+                "result": dict(dispatched.get("result") or {}),
+                "error": str(dispatched.get("error") or ""),
+                "observation_type": str(dispatched.get("observation_type") or ""),
+            }
+        )
+    return outputs

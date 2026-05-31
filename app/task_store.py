@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 from app.config import get_settings
 
 
-TERMINAL_TASK_STATUSES = {"sent", "rejected", "send_failed", "failed"}
+TERMINAL_TASK_STATUSES = {"sent", "rejected", "send_failed", "failed", "completed"}
 RECOVERABLE_TASK_STATUSES = {"needs_clarification", "input_invalid", "delivery_deferred"}
 JSON_TASK_FIELDS = {
     "risk_reasons",
@@ -21,10 +21,18 @@ JSON_TASK_FIELDS = {
     "fault_injection",
     "expected_outcome",
     "missing_fields",
+    "domain_payload",
+    "domain_result",
 }
 LIST_JSON_FIELDS = {"risk_reasons", "redactions", "retrieved_evidence", "missing_fields"}
 BOOLEAN_TASK_FIELDS = {"approval_required", "manual_handover_required", "lab_run"}
 TASK_COLUMN_MIGRATIONS = [
+    ("task_type", "TEXT NOT NULL DEFAULT 'dlp_outbound'"),
+    ("user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+    ("domain_action", "TEXT NOT NULL DEFAULT ''"),
+    ("domain_payload", "TEXT NOT NULL DEFAULT '{}'"),
+    ("domain_result", "TEXT NOT NULL DEFAULT '{}'"),
     ("request_message", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_subject", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_body", "TEXT NOT NULL DEFAULT ''"),
@@ -115,10 +123,15 @@ def init_task_store() -> None:
                     task_id TEXT PRIMARY KEY,
                     task_type TEXT NOT NULL DEFAULT 'dlp_outbound',
                     tenant_id TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    workspace_id TEXT NOT NULL DEFAULT '',
                     session_id TEXT NOT NULL,
                     conversation_id TEXT NOT NULL DEFAULT '',
                     priority INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
+                    domain_action TEXT NOT NULL DEFAULT '',
+                    domain_payload TEXT NOT NULL DEFAULT '{}',
+                    domain_result TEXT NOT NULL DEFAULT '{}',
                     risk_level TEXT NOT NULL DEFAULT '',
                     approval_required BOOLEAN NOT NULL DEFAULT FALSE,
                     destination_email TEXT NOT NULL DEFAULT '',
@@ -206,6 +219,7 @@ def init_task_store() -> None:
 
 def create_dlp_task(
     *,
+    task_type: str = "dlp_outbound",
     session_id: str,
     conversation_id: str,
     message_raw: str,
@@ -235,6 +249,12 @@ def create_dlp_task(
     scenario_name: str = "",
     fault_injection: dict[str, Any] | None = None,
     expected_outcome: dict[str, Any] | None = None,
+    domain_action: str = "",
+    domain_payload: dict[str, Any] | None = None,
+    domain_result: dict[str, Any] | None = None,
+    tenant_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
 ) -> dict[str, Any]:
     init_task_store()
     now = _now()
@@ -243,21 +263,29 @@ def create_dlp_task(
         conn.execute(
             """
             INSERT INTO dlp_tasks (
-                task_id, session_id, conversation_id, priority, status,
+                task_id, task_type, tenant_id, user_id, workspace_id, session_id, conversation_id, priority, status,
+                domain_action, domain_payload, domain_result,
                 destination_email, requested_action, message_raw, request_message,
                 delivery_subject, delivery_body, delivery_plan_kind, resolved_source_kind, attachment_strategy, attachment_content,
                 attachment_filename, attachment_content_type, attachment_blob_id, source_filename,
                 source_content_type, source_parse_status, source_parse_error, entry_issue_type,
                 missing_fields, clarification_question, lab_run, scenario_id, scenario_name,
                 fault_injection, expected_outcome, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 task_id,
+                task_type,
+                tenant_id,
+                user_id,
+                workspace_id,
                 session_id,
                 conversation_id,
                 priority,
                 status,
+                domain_action,
+                json.dumps(domain_payload or {}, ensure_ascii=False),
+                json.dumps(domain_result or {}, ensure_ascii=False),
                 destination_email,
                 requested_action,
                 message_raw,
@@ -299,7 +327,13 @@ def create_dlp_task(
                 else "Task created in a governance state and is waiting for more input."
             ),
             "status": status,
+            "task_type": task_type,
+            "domain_action": domain_action,
+            "domain_payload": domain_payload or {},
             "destination_email": destination_email,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
             "request_message": request_message,
             "delivery_subject": delivery_subject,
             "delivery_body": delivery_body,
@@ -329,6 +363,9 @@ def get_dlp_task(task_id: str) -> dict[str, Any] | None:
 def list_dlp_tasks(
     *,
     session_id: str | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     status: str | None = None,
     risk_level: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -338,6 +375,15 @@ def list_dlp_tasks(
     if session_id:
         clauses.append("session_id = %s")
         params.append(session_id)
+    if tenant_id:
+        clauses.append("tenant_id = %s")
+        params.append(tenant_id)
+    if user_id:
+        clauses.append("user_id = %s")
+        params.append(user_id)
+    if workspace_id:
+        clauses.append("workspace_id = %s")
+        params.append(workspace_id)
     if status:
         clauses.append("status = %s")
         params.append(status)

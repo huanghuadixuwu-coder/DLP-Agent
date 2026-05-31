@@ -16,6 +16,7 @@ from app.graph import get_llm
 from app.hermes_dynamic_memory import get_recent_compactions, get_structured_turn_summaries, get_user_memory_context, get_workspace_memory_context
 from app.observability import estimate_cost, normalize_usage
 from app.orchestration.final_renderer import fallback_final_answer, render_final_answer
+from app.orchestration.observations import make_typed_observation
 from app.orchestration.registry import build_tool_executor_map, build_tool_registry
 from app.orchestration.types import OrchestrationContext, PendingConfirmation, ReactTraceStep
 
@@ -68,6 +69,7 @@ def run_react_agent_request(
     recommended_tool: str = "",
     router_reason: str = "",
     degraded_from: str = "none",
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     registry = build_tool_registry()
@@ -79,6 +81,7 @@ def run_react_agent_request(
         safe_message=safe_message,
         display_message=display_message or message,
         upload_context=dict(upload_context or {}),
+        actor_context=dict(actor_context or {}),
     )
     state: dict[str, Any] = {
         "request_id": str(uuid4()),
@@ -88,6 +91,7 @@ def run_react_agent_request(
         "safe_message": safe_message,
         "display_message": display_message or message,
         "upload_context": dict(upload_context or {}),
+        "actor_context": dict(actor_context or {}),
         "mode_used": "react",
         "planner_type": "react_controller",
         "route_mode": "slow",
@@ -533,15 +537,21 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
     started = perf_counter()
     memory_kind = memory_kind or "conversation_recent"
     if len(state.get("memory_reads", [])) >= int(state.get("max_memory_reads", 2)):
-        observation = {
-            "kind": memory_kind,
-            "observation_type": f"read_memory.{memory_kind}",
-            "summary": "Memory read budget exhausted.",
-            "hits": 0,
-            "provenance": {"source": "budget_guardrail"},
-            "memory_boundary": "context_only",
-            "enterprise_citation_required": True,
-        }
+        observation = make_typed_observation(
+            observation_type=f"read_memory.{memory_kind}",
+            source="budget_guardrail",
+            status="blocked",
+            grounding_kind="memory",
+            summary="Memory read budget exhausted.",
+            payload={"kind": memory_kind, "hits": 0, "memory_boundary": "context_only", "enterprise_citation_required": True},
+            provenance={"source": "budget_guardrail"},
+            confidence=0.9,
+            actor_context=context.actor_context,
+            kind=memory_kind,
+            hits=0,
+            memory_boundary="context_only",
+            enterprise_citation_required=True,
+        )
         state.setdefault("observations", []).append(observation)
         return observation
 
@@ -550,6 +560,7 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
             session_id=context.session_id,
             conversation_id=context.conversation_id,
             question=context.message,
+            actor_context=context.actor_context,
         )
         compactions = get_recent_compactions(session_id=context.session_id, conversation_id=context.conversation_id, limit=3)
         structured = get_structured_turn_summaries(session_id=context.session_id, conversation_id=context.conversation_id, limit=6)
@@ -573,7 +584,7 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
         state["memory_hits"] = int(memory.get("memory_hits", 0))
         state["merged_memory_hits"] = int(memory.get("merged_memory_hits", 0))
     elif memory_kind == "workspace_memory":
-        workspace = get_workspace_memory_context(context.message, top_k=6)
+        workspace = get_workspace_memory_context(context.message, top_k=6, actor_context=context.actor_context)
         observation = {
             "kind": "workspace_memory",
             "hits": int(workspace.get("hits", 0)),
@@ -615,6 +626,21 @@ def _read_memory(context: OrchestrationContext, state: dict[str, Any], memory_ki
     observation.setdefault("observation_type", f"read_memory.{observation['kind']}")
     observation.setdefault("memory_boundary", "context_only")
     observation.setdefault("enterprise_citation_required", True)
+    observation = make_typed_observation(
+        observation_type=str(observation.get("observation_type") or f"read_memory.{observation['kind']}"),
+        source=str((observation.get("provenance") or {}).get("source") or "conversation_memory"),
+        status="completed",
+        grounding_kind="memory",
+        summary=str(observation.get("summary") or ""),
+        payload=dict(observation),
+        provenance=dict(observation.get("provenance") or {}),
+        confidence=0.86,
+        actor_context=context.actor_context,
+        kind=str(observation.get("kind") or memory_kind),
+        hits=int(observation.get("hits", 0) or 0),
+        memory_boundary="context_only",
+        enterprise_citation_required=True,
+    )
     state.setdefault("memory_reads", []).append({"kind": observation["kind"], "hits": observation["hits"], "summary": observation["summary"], "provenance": observation.get("provenance", {})})
     state.setdefault("tool_calls", []).append(
         {
@@ -701,10 +727,23 @@ def _call_tool(
     started = perf_counter()
     definition = registry.get(tool_name)
     if not definition:
-        observation = {"summary": f"Unknown tool: {tool_name}", "success": False, "terminate": False}
+        observation = make_typed_observation(
+            observation_type="tool_error",
+            source="react_controller",
+            status="failed",
+            grounding_kind="tool",
+            summary=f"Unknown tool: {tool_name}",
+            payload={"tool_name": tool_name, "error": "unknown_tool"},
+            provenance={"source": "react_controller"},
+            confidence=1.0,
+            actor_context=context.actor_context,
+            tool_name=tool_name,
+            terminate=False,
+            success=False,
+        )
         state["tool_failures"] = int(state.get("tool_failures", 0)) + 1
         state.setdefault("partial_failures", []).append({"tool_name": tool_name, "error": observation["summary"]})
-        state.setdefault("observations", []).append({"kind": "tool_error", **observation})
+        state.setdefault("observations", []).append(observation)
         _accumulate_latency(state, "react_act", started)
         return observation
 
@@ -721,8 +760,23 @@ def _call_tool(
         state["answer"] = _render_confirmation_message(pending)
         state["termination_reason"] = "needs_confirmation"
         state["final_answer_source"] = "tool_confirmation_guardrail"
-        observation = {"summary": f"Guardrailed side-effectful tool: {tool_name}", "success": True, "terminate": True}
-        state.setdefault("observations", []).append({"kind": "confirmation", **observation})
+        observation = make_typed_observation(
+            observation_type="confirmation_required",
+            source="react_controller",
+            status="needs_confirmation",
+            grounding_kind="guardrail",
+            summary=f"Guardrailed side-effectful tool: {tool_name}",
+            payload={"tool_name": tool_name, "pending_confirmation": asdict(pending), "confirmation_required": True},
+            provenance={"source": "react_controller", "tool_name": tool_name},
+            confidence=1.0,
+            side_effects=[{"kind": "tool_call", "tool_name": tool_name, "allowed": False, "reason": "requires_confirmation"}],
+            actor_context=context.actor_context,
+            kind="confirmation",
+            tool_name=tool_name,
+            terminate=True,
+            success=True,
+        )
+        state.setdefault("observations", []).append(observation)
         _accumulate_latency(state, "react_act", started)
         return observation
 
@@ -758,27 +812,23 @@ def _call_tool(
     }
     citations = list(payload.get("citations") or payload.get("evidence", {}).get("citations", []))
     state.setdefault("tool_calls", []).append(call_record)
-    state.setdefault("tool_observations", []).append(
-        {
-            "tool_name": tool_name,
-            "success": success,
-            "summary": summary,
-            "observation_type": definition.returns_observation_type,
-            "payload": payload,
-            "citations": citations,
-        }
+    tool_observation = make_typed_observation(
+        observation_type=definition.returns_observation_type,
+        source=tool_name,
+        status="completed" if success else "failed",
+        grounding_kind="tool",
+        summary=summary,
+        payload=payload,
+        provenance={"source": tool_name, "reads_from": definition.reads_from, "writes_to": definition.writes_to},
+        confidence=0.92 if success else 0.25,
+        citations=citations,
+        actor_context=context.actor_context,
+        kind="tool_result",
+        tool_name=tool_name,
+        success=success,
     )
-    state.setdefault("observations", []).append(
-        {
-            "kind": "tool_result",
-            "tool_name": tool_name,
-            "success": success,
-            "summary": summary,
-            "observation_type": definition.returns_observation_type,
-            "payload": payload,
-            "citations": citations,
-        }
-    )
+    state.setdefault("tool_observations", []).append(tool_observation)
+    state.setdefault("observations", []).append(tool_observation)
     state.setdefault("working_memory", []).append(summary)
     if citations:
         state["citations"] = citations[:10]
@@ -909,6 +959,8 @@ def _render_react_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "final_answer_source": state.get("final_answer_source") or "",
         "memory_reads": list(state.get("memory_reads", [])),
         "tool_observations": list(state.get("tool_observations", [])),
+        "verifier_verdict": state.get("verifier_verdict") or {},
+        "verifier_rewrite_applied": bool(state.get("verifier_rewrite_applied", False)),
     }
 
 
@@ -940,7 +992,15 @@ def _compose_final_answer(state: dict[str, Any], *, conservative: bool) -> str:
         observations=list(state.get("observations", []))[-8:],
         working_memory=list(state.get("working_memory", []))[-4:],
         conservative=conservative,
+        pending_confirmation=dict(state.get("pending_confirmation") or {}),
+        actor_context=dict(state.get("actor_context") or {}),
     )
+    state["verifier_verdict"] = dict(rendered.get("verifier_verdict") or {})
+    state["verifier_initial_verdict"] = dict(rendered.get("verifier_initial_verdict") or {})
+    state["verifier_rewrite_applied"] = bool(rendered.get("verifier_rewrite_applied", False))
+    if isinstance(rendered.get("failure_observation"), dict):
+        state.setdefault("observations", []).append(dict(rendered["failure_observation"]))
+        state.setdefault("tool_observations", []).append(dict(rendered["failure_observation"]))
     state["token_in"] = int(state.get("token_in", 0)) + int(rendered.get("token_in", 0))
     state["token_out"] = int(state.get("token_out", 0)) + int(rendered.get("token_out", 0))
     state["estimated_cost"] = float(state.get("estimated_cost", 0.0)) + float(rendered.get("estimated_cost", 0.0))

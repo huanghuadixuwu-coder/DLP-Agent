@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from celery import Celery
+from redis import Redis
 
 from app.config import get_settings
+from app.resilience import make_failure_observation, run_with_retry
 
 
 RISK_QUEUE = "dlp_risk_queue"
 EMAIL_QUEUE = "email_send_queue"
 MAIL_QUEUE = "mail_inbound_queue"
+ENTERPRISE_QUEUE = "enterprise_rag_queue"
+MEETING_QUEUE = "meeting_queue"
 
 settings = get_settings()
 
@@ -24,6 +28,9 @@ celery_app.conf.update(
         "app.task_worker.send_dlp_email_task": {"queue": EMAIL_QUEUE},
         "app.task_worker.sync_inbound_mail_task": {"queue": MAIL_QUEUE},
         "app.task_worker.generate_daily_mail_digest_task": {"queue": MAIL_QUEUE},
+        "app.task_worker.enterprise_rag_ingest_task": {"queue": ENTERPRISE_QUEUE},
+        "app.task_worker.enterprise_rag_benchmark_task": {"queue": ENTERPRISE_QUEUE},
+        "app.task_worker.process_domain_meeting_task": {"queue": MEETING_QUEUE},
     },
     task_serializer="json",
     accept_content=["json"],
@@ -34,20 +41,78 @@ celery_app.conf.update(
 
 
 def enqueue_dlp_risk_task(task_id: str) -> str:
-    celery_app.send_task("app.task_worker.process_dlp_outbound_task", args=[task_id], queue=RISK_QUEUE)
+    _send_task_with_resilience("app.task_worker.process_dlp_outbound_task", args=[task_id], queue=RISK_QUEUE)
     return task_id
 
 
 def enqueue_email_send_task(task_id: str) -> str:
-    celery_app.send_task("app.task_worker.send_dlp_email_task", args=[task_id], queue=EMAIL_QUEUE)
+    _send_task_with_resilience("app.task_worker.send_dlp_email_task", args=[task_id], queue=EMAIL_QUEUE)
     return task_id
 
 
 def enqueue_inbound_mail_sync() -> str:
-    result = celery_app.send_task("app.task_worker.sync_inbound_mail_task", queue=MAIL_QUEUE)
+    result = _send_task_with_resilience("app.task_worker.sync_inbound_mail_task", queue=MAIL_QUEUE)
     return str(result.id)
 
 
 def enqueue_daily_mail_digest() -> str:
-    result = celery_app.send_task("app.task_worker.generate_daily_mail_digest_task", queue=MAIL_QUEUE)
+    result = _send_task_with_resilience("app.task_worker.generate_daily_mail_digest_task", queue=MAIL_QUEUE)
     return str(result.id)
+
+
+def enqueue_enterprise_ingest(payload: dict) -> str:
+    result = _send_task_with_resilience("app.task_worker.enterprise_rag_ingest_task", args=[payload], queue=ENTERPRISE_QUEUE)
+    return str(result.id)
+
+
+def enqueue_enterprise_benchmark(payload: dict) -> str:
+    result = _send_task_with_resilience("app.task_worker.enterprise_rag_benchmark_task", args=[payload], queue=ENTERPRISE_QUEUE)
+    return str(result.id)
+
+
+def enqueue_meeting_task(task_id: str) -> str:
+    _send_task_with_resilience("app.task_worker.process_domain_meeting_task", args=[task_id], queue=MEETING_QUEUE)
+    return task_id
+
+
+def get_queue_health() -> dict:
+    queue_names = [RISK_QUEUE, EMAIL_QUEUE, MAIL_QUEUE, ENTERPRISE_QUEUE, MEETING_QUEUE]
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        backlog = {queue_name: int(client.llen(queue_name)) for queue_name in queue_names}
+        return {"ok": True, "queues": backlog, "queue_count": len(backlog), "error": ""}
+    except Exception as exc:
+        observation = make_failure_observation(
+            service="redis",
+            operation="queue_health",
+            error=str(exc),
+            fallback_strategy="return_zero_backlog_and_degraded_queue_health",
+            retry_count=0,
+        )
+        return {
+            "ok": False,
+            "queues": {queue_name: 0 for queue_name in queue_names},
+            "queue_count": len(queue_names),
+            "error": str(exc),
+            "failure_observation": observation,
+        }
+
+
+def _send_task_with_resilience(task_name: str, *, queue: str, args: list | None = None):
+    ok, result, exc, retry_count = run_with_retry(
+        lambda: celery_app.send_task(task_name, args=args or [], queue=queue),
+        service="celery",
+        operation_name=f"send_task:{task_name}",
+        attempts=2,
+        retry_delay_seconds=0.2,
+    )
+    if ok and result is not None:
+        return result
+    observation = make_failure_observation(
+        service="celery",
+        operation=f"send_task:{task_name}",
+        error=str(exc or "unknown celery enqueue failure"),
+        fallback_strategy="raise_structured_enqueue_failure",
+        retry_count=retry_count,
+    )
+    raise RuntimeError(observation["payload"]["error"])

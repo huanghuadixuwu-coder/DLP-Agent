@@ -8,6 +8,7 @@ from email.message import EmailMessage
 from typing import Any
 
 from app.config import get_settings
+from app.resilience import make_failure_observation, run_with_retry
 
 
 def _mask_email(value: str) -> str:
@@ -122,7 +123,7 @@ def send_email_smtp(
                 filename=attachment["filename"],
             )
 
-    try:
+    def _send_once() -> None:
         with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=20) as smtp:
             smtp.login(settings.smtp_username, settings.smtp_password)
             smtp.sendmail(
@@ -130,7 +131,18 @@ def send_email_smtp(
                 [to_email],
                 message.as_bytes(),
             )
-    except Exception as exc:
+
+    ok, _, exc, retry_count = run_with_retry(
+        _send_once,
+        service="smtp",
+        operation_name="send_email_smtp",
+        attempts=2,
+        retry_delay_seconds=0.5,
+        circuit_threshold=3,
+        cooldown_seconds=60.0,
+    )
+    if not ok:
+        error = str(exc or "unknown SMTP send failure")
         return {
             "ok": False,
             "provider": provider,
@@ -138,7 +150,18 @@ def send_email_smtp(
             "from_email_masked": _mask_email(from_email),
             "sent_at": "",
             "attachments_sent": len(normalized_attachments),
-            "error": str(exc),
+            "error": error,
+            "resilience": {
+                "retry_count": retry_count,
+                "fallback_strategy": "delivery_deferred_or_send_failed_task_state",
+            },
+            "failure_observation": make_failure_observation(
+                service="smtp",
+                operation="send_email_smtp",
+                error=error,
+                fallback_strategy="delivery_deferred_or_send_failed_task_state",
+                retry_count=retry_count,
+            ),
         }
 
     return {

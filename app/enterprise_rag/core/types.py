@@ -64,6 +64,8 @@ class RetrievalPlan:
     evidence_top_k: int = 5
     require_evidence: bool = True
     expansion_enabled: bool = True
+    tenant_id: str = ""
+    workspace_id: str = ""
 
 
 @dataclass(slots=True)

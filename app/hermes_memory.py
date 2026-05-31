@@ -311,9 +311,20 @@ def search_workspace_memory(question: str, *, top_k: int = 6) -> list[dict[str, 
     return list(search_workspace_memory_with_plan(question, top_k=top_k).get("hits") or [])
 
 
-def build_runtime_context_bundle(*, session_id: str, conversation_id: str, question: str) -> dict[str, Any]:
-    legacy_memory = build_memory_context(session_id=session_id, conversation_id=conversation_id, question=question)
-    workspace_result = search_workspace_memory_with_plan(question, top_k=4)
+def build_runtime_context_bundle(
+    *,
+    session_id: str,
+    conversation_id: str,
+    question: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    legacy_memory = build_memory_context(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        question=question,
+        actor_context=actor_context,
+    )
+    workspace_result = search_workspace_memory_with_plan(question, top_k=4, filters={"actor_context": dict(actor_context or {})})
     workspace_hits = list(workspace_result.get("hits") or [])
     transcript_entries = load_recent_transcript_entries(session_id=session_id, conversation_id=conversation_id, limit=8)
     provider = get_user_model_provider()
@@ -365,5 +376,6 @@ def build_runtime_context_bundle(*, session_id: str, conversation_id: str, quest
         },
         "transcript_entries": transcript_entries,
         "legacy_memory": legacy_memory,
+        "actor_context": dict(actor_context or {}),
     }
 
