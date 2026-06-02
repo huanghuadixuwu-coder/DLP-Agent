@@ -6,6 +6,10 @@ from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.mail.source_resolver import apply_source_resolution
+
+REFERENCE_CANDIDATE_KINDS = {"assistant_last_answer", "meeting_result", "mail_thread", "user_recent_text"}
+
 
 @dataclass(frozen=True)
 class ResolutionContext:
@@ -16,6 +20,7 @@ class ResolutionContext:
     referential_request: bool
     explicit_summary: bool
     send_both: bool
+    source_resolution: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,16 @@ SELF_INTRO_MARKERS = ("我们是谁", "讲明我们是谁", "介绍我们", "说
 REFERENCE_MARKERS = ("作为参考", "供您参考", "根据您的邮件", "根据你邮件", "for reference", "per your email", "based on your email")
 ATTACHMENT_MARKERS = ("附件", "attach", "attached", "以附件形式")
 SUMMARY_MARKERS = ("总结", "摘要", "summary", "recap", "概括")
+VERBATIM_COPY_MARKERS = (
+    "原文发送",
+    "原样发送",
+    "一字不改",
+    "不要修改",
+    "照发",
+    "verbatim",
+    "as-is",
+    "without changes",
+)
 DATE_MARKERS = ("日期", "date")
 TIME_MARKERS = ("时间", "time")
 REMOVE_ATTACHMENT_MARKERS = ("不要附件", "去掉附件", "移除附件", "remove attachment", "without attachment")
@@ -105,6 +120,28 @@ MAIL_ACTION_GATE_HINTS = (
 
 def _candidate_by_kind(candidates: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
     return next((item for item in candidates if str(item.get("kind")) == kind), None)
+
+
+def _candidate_from_source_resolution(context: ResolutionContext) -> dict[str, Any] | None:
+    selected_ids = [str(item) for item in list(context.source_resolution.get("selected_candidate_ids") or []) if str(item)]
+    if not selected_ids:
+        return None
+    for candidate_id in selected_ids:
+        match = next((item for item in context.candidates if str(item.get("candidate_id") or "") == candidate_id), None)
+        if match:
+            return match
+    return None
+
+
+def _is_reference_candidate(candidate: dict[str, Any] | None) -> bool:
+    return str((candidate or {}).get("kind") or "") in REFERENCE_CANDIDATE_KINDS
+
+
+def _selected_reference_candidates(context: ResolutionContext) -> list[dict[str, Any]]:
+    selected_ids = {str(item) for item in list(context.source_resolution.get("selected_candidate_ids") or []) if str(item)}
+    if not selected_ids:
+        return []
+    return [item for item in context.candidates if str(item.get("candidate_id") or "") in selected_ids]
 
 
 def _content_preview(candidate: dict[str, Any] | None, *, limit: int = 120) -> str:
@@ -287,26 +324,42 @@ def _mail_source_policy() -> dict[str, Any]:
         "attachment_source": "attachment_only",
         "reference_source": "summarize_only",
         "body_source": "user_explicit_only",
+        "assistant_answer_source": "rewrite_for_recipient_if_user_explicit_reference",
         "allow_attachment_body_only_if_explicit": True,
     }
 
 
-def _render_authoring_draft(message: str, candidate: dict[str, Any] | None) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+def _reference_compose_mode(message: str) -> str:
+    return "verbatim_copy" if _message_has_any(message, VERBATIM_COPY_MARKERS) else "recipient_ready_summary"
+
+
+def _render_authoring_draft(
+    message: str,
+    candidate: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str]:
     constraints = _extract_body_constraints(message)
     source = str((candidate or {}).get("content") or "").strip()
     if not source and not str(constraints.get("body_override") or "").strip():
-        return "", constraints, []
-    body = str(constraints.get("body_override") or "").strip()
-    if not body:
-        body = source
+        return False, constraints, [], [], "direct_body"
+    role = str((candidate or {}).get("kind") or "user_inline_text")
+    source_content = str(constraints.get("body_override") or "").strip() or source
     body_sources = [
         {
-            "kind": "body_source",
-            "role": str((candidate or {}).get("kind") or "inline_body"),
-            "policy": "user_explicit_only",
+            "kind": "reference_source",
+            "role": role,
+            "policy": "author_with_renderer",
         }
     ]
-    return body, constraints, body_sources
+    reference_sources = [
+        {
+            "candidate_id": str((candidate or {}).get("candidate_id") or "authoring-source"),
+            "source_turn_id": str((candidate or {}).get("source_turn_id") or ""),
+            "role": role,
+            "policy": "author_with_renderer",
+            "content": source_content,
+        }
+    ]
+    return True, constraints, body_sources, reference_sources, "recipient_ready_summary"
 
 
 def _body_clarification_if_needed(
@@ -369,6 +422,11 @@ def _base_mail_plan(
     body_constraints: dict[str, Any] | None = None,
     body_sources: list[dict[str, Any]] | None = None,
     source_policy: dict[str, Any] | None = None,
+    compose_mode: str = "direct_body",
+    reference_sources: list[dict[str, Any]] | None = None,
+    source_resolution: dict[str, Any] | None = None,
+    source_artifacts: list[dict[str, Any]] | None = None,
+    provenance_refs: list[dict[str, Any]] | None = None,
     draft_id: str | None = None,
     draft_status: str = "",
 ) -> dict[str, Any]:
@@ -398,19 +456,64 @@ def _base_mail_plan(
         "body_constraints": dict(body_constraints or {}),
         "body_sources": list(body_sources or []),
         "source_policy": dict(source_policy or _mail_source_policy()),
+        "compose_mode": compose_mode,
+        "reference_sources": list(reference_sources or []),
+        "source_resolution": dict(source_resolution or {}),
+        "source_artifacts": list(source_artifacts or []),
+        "provenance_refs": list(provenance_refs or []),
     }
 
 
-def build_review_content(delivery_body: str, selected_candidate: dict[str, Any] | None, attachment_candidate: dict[str, Any] | None) -> str:
+def _candidate_provenance_ref(candidate: dict[str, Any] | None, *, role: str) -> dict[str, Any]:
+    if not candidate:
+        return {}
+    return {
+        "role": role,
+        "kind": str(candidate.get("kind") or ""),
+        "candidate_id": str(candidate.get("candidate_id") or ""),
+        "source_turn_id": str(candidate.get("source_turn_id") or ""),
+        "filename": str(candidate.get("filename") or ""),
+    }
+
+
+def _source_artifacts(
+    selected_candidate: dict[str, Any] | None,
+    attachment_candidate: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    selected_ref = _candidate_provenance_ref(selected_candidate, role="selected_source")
+    if selected_ref:
+        artifacts.append(selected_ref)
+    attachment_ref = _candidate_provenance_ref(attachment_candidate, role="attachment_source")
+    if attachment_ref:
+        artifacts.append(attachment_ref)
+    return artifacts
+
+
+def build_review_content(
+    delivery_body: str,
+    selected_candidate: dict[str, Any] | None,
+    attachment_candidate: dict[str, Any] | None,
+    *,
+    include_selected_source: bool = False,
+    include_attachment_content: bool = True,
+) -> str:
+    """Build the DLP review text without mixing provenance into the outbound body.
+
+    The selected source may be a prior assistant answer used to author the mail.
+    Once a recipient-ready body exists, that source is provenance/debug data; adding
+    it to the review body duplicates content and can make the preview look like two
+    mails. Attachments remain reviewable when explicitly sent.
+    """
     parts: list[str] = []
     body = (delivery_body or "").strip()
     selected_text = str((selected_candidate or {}).get("content") or "").strip()
     attachment_text = str((attachment_candidate or {}).get("content") or "").strip()
     if body:
         parts.append(body)
-    if selected_text and selected_text != body:
+    if include_selected_source and selected_text and selected_text != body:
         parts.append(selected_text)
-    if attachment_text:
+    if include_attachment_content and attachment_text:
         label = str((attachment_candidate or {}).get("filename") or "attachment")
         parts.append(f"[Attachment Content: {label}]\n{attachment_text}")
     return "\n\n".join(part for part in parts if part).strip()
@@ -421,6 +524,9 @@ def _build_delivery_plan(
     message: str,
     selected_candidate: dict[str, Any] | None,
     attachment_candidate: dict[str, Any] | None,
+    explicitly_selected_reference: bool = False,
+    reference_candidates: list[dict[str, Any]] | None = None,
+    compose_mode_override: str = "",
     existing_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     constraints = _extract_body_constraints(message, existing_constraints)
@@ -437,6 +543,8 @@ def _build_delivery_plan(
         selected_candidate=selected_candidate,
         attachment_candidate=attachment_candidate,
     )
+    compose_mode = "direct_body"
+    reference_sources: list[dict[str, Any]] = []
     filename = str((attachment_candidate or {}).get("filename") or "")
     if attachment_candidate:
         subject = f"附件：{filename}" if filename else "附件请查收"
@@ -450,6 +558,38 @@ def _build_delivery_plan(
         delivery_body = explicit_body.strip("“”\"'`")
     elif str((selected_candidate or {}).get("kind") or "") == "user_inline_text":
         delivery_body = str((selected_candidate or {}).get("content") or "").strip()
+    elif explicitly_selected_reference and _is_reference_candidate(selected_candidate):
+        compose_mode = compose_mode_override or _reference_compose_mode(message)
+        resolved_references = list(reference_candidates or [selected_candidate])
+        reference_sources.extend(
+            {
+                "candidate_id": str(item.get("candidate_id") or ""),
+                "source_turn_id": str(item.get("source_turn_id") or ""),
+                "role": str(item.get("kind") or "reference_source"),
+                "policy": compose_mode,
+                "content": str(item.get("content") or "").strip(),
+            }
+            for item in resolved_references
+        )
+        if compose_mode == "verbatim_copy":
+            delivery_body = "\n\n".join(str(item.get("content") or "").strip() for item in resolved_references if str(item.get("content") or "").strip())
+        body_sources.append(
+            {
+                "kind": "reference_source",
+                "role": str((selected_candidate or {}).get("kind") or "reference_source"),
+                "policy": compose_mode,
+            }
+        )
+    elif str((selected_candidate or {}).get("kind") or "") == "assistant_last_answer" and not attachment_candidate:
+        return {
+            "ok": False,
+            "needs_clarification": True,
+            "clarification_kind": "missing_explicit_body_source",
+            "missing_fields": ["body_source"],
+            "body_constraints": constraints,
+            "body_sources": body_sources,
+            "source_policy": _mail_source_policy(),
+        }
     return {
         "ok": True,
         "delivery_plan_kind": "body_constraints",
@@ -458,6 +598,8 @@ def _build_delivery_plan(
         "body_constraints": constraints,
         "body_sources": body_sources,
         "source_policy": _mail_source_policy(),
+        "compose_mode": compose_mode,
+        "reference_sources": reference_sources,
     }
 
 
@@ -482,6 +624,9 @@ def _success(
         message=context.message,
         selected_candidate=selected_candidate,
         attachment_candidate=attachment_candidate,
+        explicitly_selected_reference=context.referential_request or context.explicit_summary,
+        reference_candidates=_selected_reference_candidates(context),
+        compose_mode_override=str(context.source_resolution.get("compose_mode") or ""),
     )
     if not delivery_plan.get("ok"):
         delivery_plan.setdefault("candidates", context.candidates)
@@ -508,6 +653,11 @@ def _success(
         "body_constraints": dict(delivery_plan.get("body_constraints") or {}),
         "body_sources": list(delivery_plan.get("body_sources") or []),
         "source_policy": dict(delivery_plan.get("source_policy") or _mail_source_policy()),
+        "compose_mode": str(delivery_plan.get("compose_mode") or "direct_body"),
+        "reference_sources": list(delivery_plan.get("reference_sources") or []),
+        "source_resolution": dict(context.source_resolution),
+        "source_artifacts": _source_artifacts(selected_candidate, attachment_candidate),
+        "provenance_refs": _source_artifacts(selected_candidate, attachment_candidate),
         "review_content": build_review_content(
             str(delivery_plan.get("delivery_body") or ""),
             selected_candidate,
@@ -517,6 +667,18 @@ def _success(
 
 
 RESOLUTION_RULES: list[ResolutionRule] = [
+    ResolutionRule(
+        name="semantic_selected_candidate",
+        matches=lambda ctx: _candidate_from_source_resolution(ctx) is not None,
+        build=lambda ctx: _success(
+            ctx,
+            selected_candidate=_candidate_from_source_resolution(ctx),
+            attachment_candidate=_candidate_from_source_resolution(ctx)
+            if str((_candidate_from_source_resolution(ctx) or {}).get("kind") or "") == "uploaded_text"
+            and _has_marker(ctx.message, ATTACHMENT_MARKERS)
+            else None,
+        ),
+    ),
     ResolutionRule(
         name="send_both",
         matches=lambda ctx: ctx.send_both,
@@ -608,15 +770,30 @@ def build_outbound_resolution(
     referential_request: bool,
     explicit_summary: bool,
     send_both: bool,
+    source_resolution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    normalized_source_resolution = dict(source_resolution or {})
+    candidates = apply_source_resolution(list(candidates or []), normalized_source_resolution)
+    if normalized_source_resolution.get("needs_clarification") and candidates:
+        return {
+            **_clarification(
+                message,
+                destination_email,
+                list(candidates),
+                "ambiguous_or_missing_semantic_source",
+            ),
+            "source_resolution": normalized_source_resolution,
+            "resolution_rule": "semantic_source_clarification",
+        }
     context = ResolutionContext(
         message=(message or "").strip(),
         request_message=(request_message or message or "").strip(),
         destination_email=(destination_email or "").strip(),
-        candidates=list(candidates or []),
-        referential_request=bool(referential_request),
+        candidates=list(candidates),
+        referential_request=bool(referential_request or normalized_source_resolution.get("referential_request")),
         explicit_summary=bool(explicit_summary),
         send_both=bool(send_both),
+        source_resolution=normalized_source_resolution,
     )
     rule = next((item for item in RESOLUTION_RULES if item.matches(context)), RESOLUTION_RULES[-1])
     result = rule.build(context)
@@ -646,6 +823,8 @@ def _choose_authoring_candidate(candidates: list[dict[str, Any]]) -> dict[str, A
     return (
         _candidate_by_kind(candidates, "user_inline_text")
         or _candidate_by_kind(candidates, "user_recent_text")
+        or _candidate_by_kind(candidates, "meeting_result")
+        or _candidate_by_kind(candidates, "mail_thread")
         or _candidate_by_kind(candidates, "assistant_last_answer")
         or _candidate_by_kind(candidates, "uploaded_text")
     )
@@ -661,6 +840,7 @@ def build_mail_action_plan(
     explicit_summary: bool,
     send_both: bool,
     conversation_id: str = "",
+    source_resolution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action_type = _detect_mail_action_type(message)
     if action_type == "recall_message":
@@ -691,8 +871,8 @@ def build_mail_action_plan(
         }
     if action_type in {"polish_body", "rewrite_body"}:
         candidate = _choose_authoring_candidate(candidates)
-        draft, constraints, body_sources = _render_authoring_draft(message, candidate)
-        if not draft:
+        has_source, constraints, body_sources, reference_sources, compose_mode = _render_authoring_draft(message, candidate)
+        if not has_source:
             return {
                 "ok": False,
                 "needs_clarification": True,
@@ -722,6 +902,10 @@ def build_mail_action_plan(
                 body_constraints=constraints,
                 body_sources=body_sources,
                 source_policy=_mail_source_policy(),
+                compose_mode=compose_mode,
+                reference_sources=reference_sources,
+                source_artifacts=_source_artifacts(candidate, None),
+                provenance_refs=_source_artifacts(candidate, None),
             ),
         }
 
@@ -733,15 +917,20 @@ def build_mail_action_plan(
         referential_request=referential_request,
         explicit_summary=explicit_summary,
         send_both=send_both,
+        source_resolution=source_resolution,
     )
     if not resolution.get("ok"):
+        missing_fields = ["content_or_attachment"]
+        if not destination_email:
+            missing_fields.insert(0, "recipient")
         existing_plan = _base_mail_plan(
             action_type=action_type,
             destination_email=destination_email,
             conversation_id=conversation_id,
-            missing_fields=["content_or_attachment"],
+            missing_fields=missing_fields,
             request_message=request_message,
             resolution_rule=str(resolution.get("resolution_rule") or ""),
+            source_resolution=dict(resolution.get("source_resolution") or source_resolution or {}),
         )
         if resolution.get("mail_plan"):
             clarification_plan = dict(resolution.get("mail_plan") or {})
@@ -760,6 +949,36 @@ def build_mail_action_plan(
 
     selected_candidate = dict(resolution.get("selected_candidate") or {})
     attachment_candidate = dict(resolution.get("attachment_candidate") or {}) if resolution.get("attachment_candidate") else None
+    if not destination_email and not str(resolution.get("destination_email") or "").strip():
+        return {
+            "ok": False,
+            "needs_clarification": True,
+            "mail_plan": _base_mail_plan(
+                action_type=action_type,
+                destination_email="",
+                conversation_id=conversation_id,
+                selected_candidate=selected_candidate or None,
+                attachment_candidate=attachment_candidate,
+                delivery_subject=str(resolution.get("delivery_subject") or ""),
+                delivery_body=str(resolution.get("delivery_body") or ""),
+                review_content=str(resolution.get("review_content") or ""),
+                resolution_rule=str(resolution.get("resolution_rule") or ""),
+                request_message=str(resolution.get("request_message") or request_message),
+                missing_fields=["recipient"],
+                source_refs=[str(selected_candidate.get("kind") or "")]
+                + ([str(attachment_candidate.get("kind") or "")] if attachment_candidate else []),
+                body_constraints=dict(resolution.get("body_constraints") or {}),
+                body_sources=list(resolution.get("body_sources") or []),
+                source_policy=dict(resolution.get("source_policy") or _mail_source_policy()),
+                compose_mode=str(resolution.get("compose_mode") or "direct_body"),
+                reference_sources=list(resolution.get("reference_sources") or []),
+                source_resolution=dict(resolution.get("source_resolution") or source_resolution or {}),
+                source_artifacts=list(resolution.get("source_artifacts") or []),
+                provenance_refs=list(resolution.get("provenance_refs") or []),
+            ),
+            "clarification_kind": "missing_recipient",
+            "candidates": list(resolution.get("candidates") or []),
+        }
     mail_plan = _base_mail_plan(
         action_type=action_type,
         destination_email=str(resolution.get("destination_email") or destination_email),
@@ -776,6 +995,11 @@ def build_mail_action_plan(
         body_constraints=dict(resolution.get("body_constraints") or {}),
         body_sources=list(resolution.get("body_sources") or []),
         source_policy=dict(resolution.get("source_policy") or _mail_source_policy()),
+        compose_mode=str(resolution.get("compose_mode") or "direct_body"),
+        reference_sources=list(resolution.get("reference_sources") or []),
+        source_resolution=dict(resolution.get("source_resolution") or source_resolution or {}),
+        source_artifacts=list(resolution.get("source_artifacts") or []),
+        provenance_refs=list(resolution.get("provenance_refs") or []),
     )
     return {
         "ok": True,
@@ -809,28 +1033,42 @@ def patch_pending_mail_plan(
     message: str,
     request_message: str,
     mail_plan: dict[str, Any],
+    structured_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     updated = dict(mail_plan or {})
+    structured = dict(structured_patch or {})
     recipients = list(updated.get("resolved_recipients") or [])
     destination_email = recipients[0] if recipients else ""
     selected_candidate = dict(updated.get("selected_candidate") or {})
     attachment_candidate = dict(updated.get("attachment_candidate") or {}) if updated.get("attachment_candidate") else None
 
-    if _looks_like_change_recipient(message):
+    structured_recipient = str(structured.get("recipient") or "").strip()
+    if structured_recipient:
+        destination_email = structured_recipient
+        updated["resolved_recipients"] = [destination_email]
+    elif _looks_like_change_recipient(message):
         match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", message, re.IGNORECASE)
         if match:
             destination_email = match.group(0)
             updated["resolved_recipients"] = [destination_email]
-    if _looks_like_change_subject(message):
+    structured_subject = str(structured.get("subject") or "").strip()
+    if structured_subject:
+        updated["resolved_subject"] = structured_subject
+    elif _looks_like_change_subject(message):
         subject = _extract_subject_override(message)
         if subject:
             updated["resolved_subject"] = subject
-    if _has_marker(message, REMOVE_ATTACHMENT_MARKERS):
+    if bool(structured.get("remove_attachment")) or _has_marker(message, REMOVE_ATTACHMENT_MARKERS):
         attachment_candidate = None
         updated["resolved_attachments"] = []
 
     existing_constraints = dict(updated.get("body_constraints") or {})
     merged_constraints = _extract_body_constraints(message, existing_constraints)
+    if isinstance(structured.get("constraints"), dict):
+        merged_constraints.update(dict(structured.get("constraints") or {}))
+    structured_body = str(structured.get("body_override") or "").strip()
+    if structured_body:
+        merged_constraints["body_override"] = structured_body
     clarification = _body_clarification_if_needed(
         constraints=merged_constraints,
         destination_email=destination_email,
@@ -860,13 +1098,13 @@ def patch_pending_mail_plan(
             "status": "pending_confirmation",
         }
     )
-    if _looks_like_replace_body(message) and str(merged_constraints.get("body_override") or "").strip():
+    if structured_body or (_looks_like_replace_body(message) and str(merged_constraints.get("body_override") or "").strip()):
         patch_kind = "replace_pending_draft_body"
-    elif _looks_like_change_subject(message):
+    elif structured_subject or _looks_like_change_subject(message):
         patch_kind = "change_pending_subject"
-    elif _looks_like_change_recipient(message):
+    elif structured_recipient or _looks_like_change_recipient(message):
         patch_kind = "change_pending_recipient"
-    elif _has_marker(message, REMOVE_ATTACHMENT_MARKERS):
+    elif bool(structured.get("remove_attachment")) or _has_marker(message, REMOVE_ATTACHMENT_MARKERS):
         patch_kind = "remove_pending_attachment"
     else:
         patch_kind = "edit_pending_draft"

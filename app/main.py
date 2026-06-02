@@ -23,7 +23,15 @@ from app.actor_context import ActorContext, build_actor_context, permission_obse
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.config import get_settings
-from app.conversation_memory import build_memory_context, compact_text, infer_title, write_merged_summary, write_turn_summary
+from app.continuation_state import (
+    PendingObject,
+    pending_object_from_confirmation,
+    pending_object_from_mail_clarification,
+    pending_object_from_record,
+    pending_object_from_source_clarification,
+    resolve_continuation,
+)
+from app.conversation_memory import build_memory_context, compact_text, infer_title, write_merged_summary
 from app.conversation_store import (
     append_exchange,
     create_conversation,
@@ -39,7 +47,7 @@ from app.conversation_store import (
 from app.dlp_entry import classify_dlp_entry, extract_destination_email as dlp_extract_destination_email, looks_like_outbound_action as dlp_looks_like_outbound_action
 from app.dlp_scenarios import build_status_path, evaluate_scenario_task, get_dlp_scenario, list_dlp_scenarios, normalize_fault_injection
 from app.email_sender import send_email_smtp
-from app.enterprise_rag.core.service import answer_enterprise_question
+from app.enterprise_rag.core.service import answer_enterprise_question, build_enterprise_answer_observation
 from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
 from app.enterprise_rag.eval.casebook import build_casebook
 from app.enterprise_rag.ingestion.manifest_store import load_manifest
@@ -63,17 +71,27 @@ from app.inbound_mail import (
     list_inbound_mail_messages,
     sync_inbound_mail,
 )
-from app.inbound_mail_store import init_inbound_mail_store, list_notifications
+from app.inbound_mail_store import init_inbound_mail_store, list_notifications, list_recent_inbound_threads
 from app.mail.current_provider import CurrentImapSmtpMailProvider
 from app.mail.draft_store import (
     bind_mail_draft_task,
     build_persisted_confirmation_payload,
+    cancel_mail_draft,
     get_latest_active_mail_draft,
     init_mail_draft_store,
     upsert_mail_draft,
 )
+from app.mail.content_parser import parse_message_content_candidates
+from app.mail.source_resolver import resolve_mail_source_request
 from app.disambiguation_lab import answer_apple_query
 from app.labs_long_doc import allocate_context
+from app.pending_object_store import (
+    consume_pending_object,
+    get_latest_active_pending_object,
+    init_pending_object_store,
+    list_active_pending_objects,
+    upsert_pending_object,
+)
 from app.metrics import (
     content_type,
     record_context_budget,
@@ -91,7 +109,6 @@ from app.metrics import (
     record_dlp_scenario_replay,
     record_task_created,
     record_task_degradation,
-    record_turn_summary_write,
     record_unified_agent,
     record_unified_evidence_hits,
     record_queue_backlog,
@@ -104,8 +121,6 @@ from app.outbound_delivery import (
     build_review_content,
     build_outbound_resolution,
     looks_like_mail_action_request,
-    looks_like_pending_draft_edit_request,
-    looks_like_send_confirmation,
     patch_pending_mail_plan,
 )
 from app.models import (
@@ -162,6 +177,7 @@ from app.task_queue import (
     MAIL_QUEUE,
     RISK_QUEUE,
     enqueue_daily_mail_digest,
+    enqueue_conversation_memory_summary,
     enqueue_dlp_risk_task,
     enqueue_email_send_task,
     enqueue_enterprise_benchmark,
@@ -310,6 +326,7 @@ async def lifespan(_: FastAPI):
     init_conversation_store()
     init_task_store()
     init_mail_draft_store()
+    init_pending_object_store()
     init_auth_store()
     init_inbound_mail_store()
     init_workspace_memory_index()
@@ -323,15 +340,13 @@ async def lifespan(_: FastAPI):
     yield
 
 
+settings = get_settings()
+cors_allow_origins = [origin.strip() for origin in settings.cors_allow_origins.split(",") if origin.strip()]
+
 app = FastAPI(title="Secure Enterprise Mail Agent", version="0.4.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8511",
-        "http://127.0.0.1:8511",
-        "http://localhost:8501",
-        "http://127.0.0.1:8501",
-    ],
+    allow_origins=cors_allow_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -341,6 +356,16 @@ DEFAULT_DLP_EMAIL = "17388861183@163.com"
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 OUTBOUND_REFERENCE_TOKENS = (
+    "上述",
+    "上面的",
+    "上文",
+    "刚才的",
+    "前面的",
+    "上述方案",
+    "上述解决方案",
+    "上面的回答",
+    "刚才的回答",
+    "刚才的内容",
     "这个文档",
     "这个文件",
     "这个内容",
@@ -434,7 +459,7 @@ def _looks_like_outbound_action(message: str) -> bool:
 
 def _extract_destination_email(message: str) -> str:
     match = EMAIL_PATTERN.search(message or "")
-    return match.group(0) if match else DEFAULT_DLP_EMAIL
+    return match.group(0) if match else ""
 
 
 def _build_outbound_message(message: str, uploaded_text: str = "", uploaded_filename: str = "") -> str:
@@ -491,7 +516,11 @@ def _get_latest_upload_context(conversation_id: str) -> dict[str, Any]:
     return {}
 
 
-def _resolve_upload_context(payload: UnifiedAgentRequest, conversation_id: str) -> tuple[dict[str, Any], bool]:
+def _resolve_upload_context(
+    payload: UnifiedAgentRequest,
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
     upload_blob_id = ""
     if (payload.uploaded_file_base64 or "").strip() and (payload.uploaded_filename or "").strip():
         try:
@@ -514,6 +543,12 @@ def _resolve_upload_context(payload: UnifiedAgentRequest, conversation_id: str) 
         source_parse_error=payload.source_parse_error,
     )
     if current_upload_context.get("content_available"):
+        _persist_upload_artifact_object(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            upload_context=current_upload_context,
+            actor_context=actor_context,
+        )
         return current_upload_context, False
     if refers_to_recent_upload(payload.message):
         recalled = _get_latest_upload_context(conversation_id)
@@ -563,32 +598,61 @@ def _sanitize_recent_content(text: str) -> str:
     return "" if cleaned in OUTBOUND_NON_CONTENT_ANSWERS else cleaned
 
 
-INLINE_MAIL_BODY_PATTERNS = (
-    re.compile(r"(?:文段|正文|内容|文本)(?:是|为)?[:：]\s*(.+)$", re.IGNORECASE | re.DOTALL),
-    re.compile(r"(?:send|email|mail)\s+(?:this\s+)?(?:text|content)[:：]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
-)
-
-
 def _extract_inline_mail_body(message: str) -> str:
     text = str(message or "").strip()
     if not text:
         return ""
-    for pattern in INLINE_MAIL_BODY_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        body = str(match.group(1) or "").strip()
-        body = body.strip().strip("“”\"'`")
-        body = body.strip()
-        if body:
-            return body
+    parsed_candidates = parse_message_content_candidates(text)
+    for candidate in parsed_candidates:
+        if str(candidate.get("source_type") or "") == "user_inline_text":
+            body = str(candidate.get("content") or "").strip()
+            if body:
+                return body
+    # Current-turn outbound body extraction must only come from ContentCandidate.
+    # State-specific body clarification can still treat the whole follow-up as a body.
     return ""
+
+
+def _mail_thread_candidate_content(thread: dict[str, Any]) -> str:
+    messages: list[dict[str, Any]] = []
+    for item in list(thread.get("messages") or [])[:5]:
+        body = str(item.get("summary") or item.get("body_preview") or item.get("snippet") or item.get("body_text") or "")
+        messages.append(
+            {
+                "message_id": str(item.get("message_id") or ""),
+                "sender": str(item.get("sender") or ""),
+                "recipients": str(item.get("recipients") or ""),
+                "subject": str(item.get("subject") or ""),
+                "received_at": str(item.get("received_at") or ""),
+                "summary": compact_text(body, 500),
+            }
+        )
+    return json.dumps(
+        {
+            "thread_id": str(thread.get("thread_id") or ""),
+            "provider_thread_id": str(thread.get("provider_thread_id") or ""),
+            "subject": str(thread.get("subject") or ""),
+            "latest_received_at": str(thread.get("latest_received_at") or ""),
+            "messages": messages,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _answer_artifact_candidate_label(summary: str, citations: list[dict[str, Any]] | None = None) -> str:
+    for item in list(citations or []):
+        title = str(item.get("title") or item.get("source_title") or item.get("doc_id") or "").strip()
+        if title:
+            return f"之前的回答：{compact_text(title, 72)}"
+    preview = compact_text(summary, 72).strip()
+    return f"之前的回答：{preview or '可复用的处理方案'}"
 
 
 def _collect_outbound_candidates(
     payload: UnifiedAgentRequest,
     conversation_id: str,
     upload_context: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -599,6 +663,8 @@ def _collect_outbound_candidates(
         kind: str,
         content: str,
         label: str,
+        candidate_id: str = "",
+        source_turn_id: str = "",
         filename: str = "",
         content_type: str = "",
         supports_attachment: bool = False,
@@ -617,6 +683,8 @@ def _collect_outbound_candidates(
         candidates.append(
             {
                 "kind": kind,
+                "candidate_id": candidate_id or f"{kind}:{len(candidates)}",
+                "source_turn_id": source_turn_id,
                 "label": label,
                 "content": normalized,
                 "filename": filename,
@@ -626,15 +694,23 @@ def _collect_outbound_candidates(
             }
         )
 
-    inline_mail_body = _extract_inline_mail_body(str(payload.message or ""))
-    if inline_mail_body:
-        _append_candidate(
-            kind="user_inline_text",
-            content=inline_mail_body,
-            label="用户本轮明确提供的正文",
-            content_type="text/plain",
-        )
-
+    inline_content_candidates = parse_message_content_candidates(str(payload.message or ""))
+    if inline_content_candidates:
+        for parsed in inline_content_candidates:
+            if str(parsed.get("source_type") or "") != "user_inline_text":
+                continue
+            inline_mail_body = str(parsed.get("content") or "").strip()
+            if not inline_mail_body:
+                continue
+            span = list(parsed.get("provenance_span") or [])
+            span_id = "-".join(str(item) for item in span[:2]) if span else str(len(candidates))
+            _append_candidate(
+                kind="user_inline_text",
+                candidate_id=f"user-inline:{span_id}",
+                content=inline_mail_body,
+                label="用户本轮明确提供的正文",
+                content_type="text/plain",
+            )
     current_upload_text = _sanitize_recent_content(str(payload.uploaded_text or ""))
     if current_upload_text:
         _append_candidate(
@@ -673,20 +749,95 @@ def _collect_outbound_candidates(
                 upload_blob_id=str(recalled_upload.get("upload_blob_id") or ""),
             )
 
+    if actor_context:
+        for artifact in list_active_pending_objects(
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+            object_types=["answer_artifact"],
+            limit=12,
+        ):
+            payload_data = dict(artifact.get("payload") or {})
+            turn_id = str(payload_data.get("turn_id") or payload_data.get("resource_id") or "").strip()
+            answer_summary = _sanitize_recent_content(str(payload_data.get("answer_summary") or ""))
+            if not turn_id or not answer_summary:
+                continue
+            citations = [dict(item) for item in list(payload_data.get("citations") or [])]
+            _append_candidate(
+                kind="assistant_last_answer",
+                candidate_id=str(artifact.get("object_id") or f"assistant-turn:{turn_id}"),
+                source_turn_id=turn_id,
+                content=answer_summary,
+                label=_answer_artifact_candidate_label(answer_summary, citations),
+                content_type="text/plain",
+            )
+
+    if actor_context:
+        completed_meeting_task = _latest_completed_meeting_task(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+        )
+        if completed_meeting_task:
+            details = _meeting_result_details(completed_meeting_task)
+            meeting_content = json.dumps(
+                {
+                    "task_id": str(completed_meeting_task.get("task_id") or ""),
+                    "subject": details.get("subject") or "",
+                    "meeting_id": details.get("meeting_id") or "",
+                    "meeting_code": details.get("meeting_code") or "",
+                    "meeting_url": details.get("meeting_url") or "",
+                    "start_time": details.get("start_time") or "",
+                    "end_time": details.get("end_time") or "",
+                },
+                ensure_ascii=False,
+            )
+            _append_candidate(
+                kind="meeting_result",
+                candidate_id=f"meeting-task:{completed_meeting_task.get('task_id')}",
+                content=meeting_content,
+                label=str(details.get("subject") or "最近创建的腾讯会议结果"),
+                content_type="application/json",
+            )
+
+    if actor_context:
+        with suppress(Exception):
+            for thread in list_recent_inbound_threads(limit=3, messages_per_thread=5):
+                thread_id = str(thread.get("thread_id") or thread.get("provider_thread_id") or "").strip()
+                if not thread_id:
+                    continue
+                subject = str(thread.get("subject") or "recent inbound mail thread")
+                _append_candidate(
+                    kind="mail_thread",
+                    candidate_id=f"mail-thread:{thread_id}",
+                    content=_mail_thread_candidate_content(thread),
+                    label=f"mail thread: {subject}",
+                    content_type="application/json",
+                )
+
     turns = get_turns(conversation_id, limit=10)
+    assistant_candidate_count = 0
     for turn in reversed(turns):
         role = str(turn.get("role") or "").lower()
         debug_payload = dict(turn.get("debug_payload") or {})
         if role == "assistant" and (
             bool(debug_payload.get("needs_clarification"))
             or str(debug_payload.get("mode_used") or "") in {"outbound_resolution", "task_queue"}
-            or str(debug_payload.get("termination_reason") or "") == "needs_clarification"
+            or str(debug_payload.get("termination_reason") or "") in {"needs_clarification", "needs_confirmation"}
         ):
             continue
         content = _sanitize_recent_content(str(turn.get("answer_summary") or turn.get("redacted_content") or turn.get("content") or ""))
         if role == "assistant" and content:
-            _append_candidate(kind="assistant_last_answer", content=content, label="刚才生成的总结/回答")
-            break
+            turn_id = str(turn.get("turn_id") or f"recent-{assistant_candidate_count}")
+            _append_candidate(
+                kind="assistant_last_answer",
+                candidate_id=f"assistant-turn:{turn_id}",
+                source_turn_id=turn_id,
+                content=content,
+                label="最近生成的总结/回答",
+            )
+            assistant_candidate_count += 1
+            if assistant_candidate_count >= 5:
+                break
     for turn in reversed(turns):
         role = str(turn.get("role") or "").lower()
         content = _sanitize_recent_content(str(turn.get("redacted_content") or turn.get("content") or ""))
@@ -700,8 +851,9 @@ def _build_outbound_resolution(
     payload: UnifiedAgentRequest,
     conversation_id: str,
     upload_context: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    candidates = _collect_outbound_candidates(payload, conversation_id, upload_context)
+    candidates = _collect_outbound_candidates(payload, conversation_id, upload_context, actor_context=actor_context)
     return build_outbound_resolution(
         message=str(payload.message or ""),
         request_message=str(payload.message or ""),
@@ -830,6 +982,7 @@ def _build_mail_plan_observation(
         "body_constraints": dict(mail_plan.get("body_constraints") or {}),
         "body_sources": list(mail_plan.get("body_sources") or []),
         "source_policy": dict(mail_plan.get("source_policy") or {}),
+        "source_resolution": dict(mail_plan.get("source_resolution") or {}),
         "draft_mode": draft_mode or str(mail_plan.get("mail_action_type") or ""),
         "provider_capabilities": _mail_provider_capabilities(),
         "mail_plan": mail_plan,
@@ -844,6 +997,35 @@ def _build_mail_plan_observation(
         payload=payload,
         citations=[],
         confidence=0.95,
+        actor_context=actor_context,
+    )
+
+
+def _build_mail_task_created_observation(
+    *,
+    task: dict[str, Any],
+    mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or "")
+    summary = (
+        f"已基于当前确认的邮件内容创建治理任务 `{task_id}`，系统正在执行 DLP 风险判断。"
+        if task_id
+        else "已基于当前确认的邮件内容创建治理任务，系统正在执行 DLP 风险判断。"
+    )
+    return _build_mail_plan_observation(
+        mail_plan,
+        source="mail_confirmation",
+        summary=summary,
+        draft_mode="task_created",
+        observation_type="governed_mail_task_created",
+        extra_payload={
+            "task_id": task_id,
+            "task_status": str(task.get("status") or ""),
+            "risk_level": str(task.get("risk_level") or ""),
+            "delivery_status": str(task.get("delivery_status") or ""),
+            "next_actions": ["wait_for_dlp", "check_task_progress", "revise_if_blocked"],
+        },
         actor_context=actor_context,
     )
 
@@ -909,19 +1091,30 @@ def _build_task_agent_response(
     display_message: str,
     task: dict[str, Any],
     routing_reason: str,
+    intent: str = "privacy_alert",
+    current_goal: str = "privacy_alert",
+    routing_source: str = "rule",
+    routing_confidence: float = 0.99,
+    candidate_intents: list[str] | None = None,
+    mode_used: str = "task_queue",
+    extra_observations: list[dict[str, Any]] | None = None,
+    final_answer_source: str = "task_queue_renderer",
+    actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     task_id = str(task["task_id"])
     status = str(task["status"])
     answer_text = _task_answer_text(task)
     needs_clarification = status in {"needs_clarification", "input_invalid"}
     task_observation = _build_task_status_observation(task)
+    observations = [dict(item) for item in list(extra_observations or [])]
+    observations.append(task_observation)
     renderer = {"answer": answer_text, "token_in": 0, "token_out": 0, "estimated_cost": 0.0, "used_fallback": False}
     if not needs_clarification:
         renderer = render_final_answer(
             question=outbound_message,
-            current_goal="privacy_alert",
-            observations=[task_observation],
-            working_memory=[str(task_observation["summary"])],
+            current_goal=current_goal,
+            observations=observations,
+            working_memory=[str(item.get("summary") or "") for item in observations if str(item.get("summary") or "").strip()],
             conservative=status not in {"sent", "delivery_deferred"},
         )
     synthetic_result = {
@@ -932,12 +1125,12 @@ def _build_task_agent_response(
         "safe_message": str(task.get("message_redacted") or outbound_message),
         "display_message": display_message,
         "answer": str(renderer.get("answer") or answer_text),
-        "intent": "privacy_alert",
-        "routing_source": "rule",
-        "routing_confidence": 0.99,
+        "intent": intent,
+        "routing_source": routing_source,
+        "routing_confidence": routing_confidence,
         "routing_reason": routing_reason,
-        "candidate_intents": ["privacy_alert"],
-        "mode_used": "task_queue",
+        "candidate_intents": list(candidate_intents or [intent]),
+        "mode_used": mode_used,
         "tool_calls": [
             {
                 "tool_name": "govern_dlp_task" if needs_clarification else "enqueue_dlp_risk_task",
@@ -964,10 +1157,12 @@ def _build_task_agent_response(
         "token_in": 0,
         "token_out": 0,
         "estimated_cost": 0.0,
+        "tool_observations": observations,
     }
+    synthetic_result = attach_trace_evaluation(synthetic_result, actor_context=actor_context)
     turn_id, memory_written = _write_unified_conversation_memory(synthetic_result, conversation_id)
     record_request(
-        mode="task_queue",
+        mode=mode_used,
         latency_ms=0.0,
         token_in=int(renderer.get("token_in", 0)),
         token_out=int(renderer.get("token_out", 0)),
@@ -975,25 +1170,25 @@ def _build_task_agent_response(
         retrieval_hits=0,
     )
     record_unified_agent(
-        intent="privacy_alert",
+        intent=intent,
         tool_calls=synthetic_result["tool_calls"],
         needs_clarification=needs_clarification,
         privacy_guardrail=bool(synthetic_result["privacy"].get("redacted")),
         context_budget_used=None,
     )
-    record_router("rule", 0.99)
+    record_router(routing_source, routing_confidence)
     record_unified_evidence_hits(synthetic_result["retrieved_evidence"])
     return UnifiedAgentResponse(
         session_id=session_id,
         conversation_id=conversation_id,
         turn_id=turn_id,
         answer=str(synthetic_result["answer"]),
-        intent="privacy_alert",
-        routing_source="rule",
-        routing_confidence=0.99,
+        intent=intent,
+        routing_source=routing_source,
+        routing_confidence=routing_confidence,
         routing_reason=routing_reason,
-        candidate_intents=["privacy_alert"],
-        mode_used="task_queue",
+        candidate_intents=list(candidate_intents or [intent]),
+        mode_used=mode_used,
         tool_calls=synthetic_result["tool_calls"],
         retrieved_evidence=synthetic_result["retrieved_evidence"],
         needs_clarification=needs_clarification,
@@ -1008,8 +1203,8 @@ def _build_task_agent_response(
         answer_collapsed=False,
         reflection_notes=None,
         upload_context={},
-        final_answer_source="task_queue_clarification" if needs_clarification else ("task_queue_renderer_fallback" if renderer.get("used_fallback") else "task_queue_renderer"),
-        tool_observations=[task_observation],
+        final_answer_source="task_queue_clarification" if needs_clarification else (f"{final_answer_source}_fallback" if renderer.get("used_fallback") else final_answer_source),
+        tool_observations=list(synthetic_result.get("tool_observations") or observations),
         workflow_id=None,
         workflow_status=None,
         workflow_risk_level=None,
@@ -1182,6 +1377,7 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[st
                 delivery_status=str(task.get("delivery_status", "not_sent")),
             )
         )
+    _persist_task_registry_object(task, actor_context=actor.to_dict())
     return task
 
 
@@ -1248,17 +1444,27 @@ def _build_mail_action_plan(
     payload: UnifiedAgentRequest,
     conversation_id: str,
     upload_context: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    candidates = _collect_outbound_candidates(payload, conversation_id, upload_context)
+    candidates = _collect_outbound_candidates(payload, conversation_id, upload_context, actor_context=actor_context)
+    referential_request = _looks_like_referential_outbound_request(payload.message)
+    explicit_summary = _looks_like_summary_reference(payload.message)
+    source_resolution = resolve_mail_source_request(
+        message=str(payload.message or ""),
+        candidates=candidates,
+        legacy_referential_request=referential_request,
+        explicit_summary=explicit_summary,
+    )
     return build_mail_action_plan(
         message=str(payload.message or ""),
         request_message=str(payload.message or ""),
         candidates=candidates,
         destination_email=_extract_destination_email(payload.message),
-        referential_request=_looks_like_referential_outbound_request(payload.message),
-        explicit_summary=_looks_like_summary_reference(payload.message),
+        referential_request=referential_request,
+        explicit_summary=explicit_summary,
         send_both=_looks_like_send_both_request(payload.message),
         conversation_id=conversation_id,
+        source_resolution=source_resolution,
     )
 
 
@@ -1285,7 +1491,271 @@ def _persist_mail_plan(
         persisted_plan["confirmation_id"] = str(stored.get("confirmation_id") or "")
     if stored.get("confirmation_key"):
         persisted_plan["idempotency_key"] = str(stored.get("confirmation_key") or "")
+    _persist_mail_draft_registry_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=persisted_plan,
+        actor_context=actor_context,
+    )
     return persisted_plan
+
+
+def _persist_mail_draft_registry_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    mail_plan: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    draft_id = str(mail_plan.get("draft_id") or "").strip()
+    if not draft_id:
+        return {}
+    resource_status = str(mail_plan.get("status") or "draft")
+    continuations = ["patch", "cancel"]
+    if resource_status == "pending_confirmation":
+        continuations.insert(0, "confirm")
+    return upsert_pending_object(
+        object_type="mail_draft",
+        object_id=f"mail-draft:{draft_id}",
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload={
+            "resource_type": "mail_draft",
+            "resource_id": draft_id,
+            "resource_status": resource_status,
+            "mail_plan": dict(mail_plan),
+        },
+        actor_context=actor_context,
+        status="active",
+        salience=0.84,
+        allowed_continuations=continuations,
+        source_observation_ids=[
+            str(item.get("candidate_id") or item.get("source_turn_id") or "")
+            for item in list(mail_plan.get("provenance_refs") or [])
+            if str(item.get("candidate_id") or item.get("source_turn_id") or "")
+        ],
+        supersede_same_type=True,
+    )
+
+
+def _persist_task_registry_object(
+    task: dict[str, Any],
+    *,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        return {}
+    task_type = str(task.get("task_type") or "dlp_outbound")
+    object_type = "domain_task" if task_type.startswith("domain_") else "dlp_task"
+    task_actor = {
+        "tenant_id": str(task.get("tenant_id") or ""),
+        "user_id": str(task.get("user_id") or ""),
+        "workspace_id": str(task.get("workspace_id") or ""),
+        "session_id": str(task.get("session_id") or ""),
+        "conversation_id": str(task.get("conversation_id") or ""),
+        **dict(actor_context or {}),
+    }
+    task_status = str(task.get("status") or "queued")
+    continuations = ["show_status"]
+    if task_status in {"needs_clarification", "input_invalid"}:
+        continuations.append("provide_missing_field")
+    return upsert_pending_object(
+        object_type=object_type,
+        object_id=task_id,
+        session_id=str(task.get("session_id") or ""),
+        conversation_id=str(task.get("conversation_id") or ""),
+        payload={
+            "resource_type": object_type,
+            "resource_id": task_id,
+            "resource_status": task_status,
+            "task_type": task_type,
+            "task_id": task_id,
+        },
+        actor_context=task_actor,
+        status="active",
+        salience=0.58,
+        allowed_continuations=continuations,
+        supersede_same_type=False,
+    )
+
+
+def _persist_upload_artifact_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    upload_context: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    blob_id = str(upload_context.get("upload_blob_id") or "").strip()
+    if not blob_id:
+        return {}
+    return upsert_pending_object(
+        object_type="upload_artifact",
+        object_id=blob_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload={
+            "resource_type": "upload_artifact",
+            "resource_id": blob_id,
+            "resource_status": "available",
+            "filename": str(upload_context.get("filename") or ""),
+            "content_type": str(upload_context.get("content_type") or ""),
+            "parse_status": str(upload_context.get("parse_status") or ""),
+        },
+        actor_context=actor_context,
+        status="active",
+        salience=0.42,
+        allowed_continuations=["reference", "attach"],
+        supersede_same_type=False,
+    )
+
+
+def _persist_answer_artifact_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    turn_id: str,
+    answer_summary: str,
+    intent: str,
+    citations: list[dict[str, Any]],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not turn_id or not answer_summary or intent in {"action_or_draft", "pending_object_cancelled"}:
+        return {}
+    return upsert_pending_object(
+        object_type="answer_artifact",
+        object_id=f"assistant-turn:{turn_id}",
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload={
+            "resource_type": "answer_artifact",
+            "resource_id": turn_id,
+            "resource_status": "available",
+            "turn_id": turn_id,
+            "intent": intent,
+            "answer_summary": answer_summary,
+            "citations": list(citations or []),
+        },
+        actor_context=actor_context,
+        status="active",
+        salience=0.36,
+        allowed_continuations=["reference"],
+        source_observation_ids=[str(item.get("doc_id") or "") for item in citations if str(item.get("doc_id") or "")],
+        supersede_same_type=False,
+    )
+
+
+def _consume_mail_draft_registry_object(draft_id: str, actor_context: dict[str, Any]) -> None:
+    if draft_id:
+        consume_pending_object(f"mail-draft:{draft_id}", actor_context=actor_context)
+
+
+def _active_registry_objects(
+    conversation_id: str,
+    actor_context: dict[str, Any],
+) -> list[PendingObject]:
+    objects = [
+        pending
+        for pending in (
+            pending_object_from_record(item)
+            for item in list_active_pending_objects(
+                conversation_id=conversation_id,
+                actor_context=actor_context,
+            )
+        )
+        if pending is not None
+    ]
+    if not any(item.object_type == "mail_draft" for item in objects):
+        draft = get_latest_active_mail_draft(conversation_id, actor_context=actor_context)
+        if draft:
+            _persist_mail_draft_registry_object(
+                session_id=str(draft.get("session_id") or actor_context.get("session_id") or ""),
+                conversation_id=conversation_id,
+                mail_plan=dict(draft.get("mail_plan") or {}),
+                actor_context=actor_context,
+            )
+            objects = [
+                pending
+                for pending in (
+                    pending_object_from_record(item)
+                    for item in list_active_pending_objects(
+                        conversation_id=conversation_id,
+                        actor_context=actor_context,
+                    )
+                )
+                if pending is not None
+            ]
+    return objects
+
+
+def _safe_pending_object_snapshot(
+    item: dict[str, Any],
+    *,
+    actor_context: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(item.get("payload") or {})
+    object_type = str(item.get("object_type") or "")
+    resource_status = str(payload.get("resource_status") or item.get("status") or "")
+    resource: dict[str, Any] = {}
+    if object_type == "mail_draft":
+        mail_plan = dict(payload.get("mail_plan") or {})
+        resource = {
+            "draft_id": str(mail_plan.get("draft_id") or payload.get("resource_id") or ""),
+            "draft_state": str(mail_plan.get("draft_state") or ""),
+            "status": str(mail_plan.get("status") or resource_status),
+            "recipients": list(mail_plan.get("resolved_recipients") or []),
+            "subject": str(mail_plan.get("resolved_subject") or ""),
+            "missing_fields": list(mail_plan.get("missing_fields") or []),
+            "confirmation_required": bool(mail_plan.get("requires_confirmation")),
+        }
+        resource_status = str(resource.get("status") or resource_status)
+    elif object_type in {"dlp_task", "domain_task"}:
+        task_id = str(payload.get("task_id") or payload.get("resource_id") or item.get("object_id") or "")
+        task = get_dlp_task(task_id) or {}
+        if task and (
+            str(task.get("tenant_id") or "") == str(actor_context.get("tenant_id") or "")
+            and str(task.get("workspace_id") or "") == str(actor_context.get("workspace_id") or "")
+            and str(task.get("user_id") or "") == str(actor_context.get("user_id") or "")
+        ):
+            resource_status = str(task.get("status") or resource_status)
+            resource = {
+                "task_id": task_id,
+                "task_type": str(task.get("task_type") or ""),
+                "status": resource_status,
+                "risk_level": str(task.get("risk_level") or ""),
+                "delivery_status": str(task.get("delivery_status") or ""),
+                "missing_fields": list(task.get("missing_fields") or []),
+            }
+    elif object_type == "upload_artifact":
+        resource = {
+            "blob_id": str(payload.get("resource_id") or item.get("object_id") or ""),
+            "filename": str(payload.get("filename") or ""),
+            "content_type": str(payload.get("content_type") or ""),
+            "parse_status": str(payload.get("parse_status") or ""),
+        }
+    elif object_type == "answer_artifact":
+        resource = {
+            "turn_id": str(payload.get("turn_id") or payload.get("resource_id") or ""),
+            "intent": str(payload.get("intent") or ""),
+            "summary": compact_text(str(payload.get("answer_summary") or ""), 280),
+        }
+    else:
+        resource = {
+            "resource_id": str(payload.get("resource_id") or item.get("object_id") or ""),
+            "missing_fields": list((payload.get("mail_plan") or {}).get("missing_fields") or []),
+        }
+    return {
+        "object_id": str(item.get("object_id") or ""),
+        "object_type": object_type,
+        "status": str(item.get("status") or ""),
+        "resource_status": resource_status,
+        "allowed_continuations": list(item.get("allowed_continuations") or []),
+        "salience": float(item.get("salience") or 0.0),
+        "expires_at": str(item.get("expires_at") or ""),
+        "updated_at": str(item.get("updated_at") or ""),
+        "resource": resource,
+    }
 
 
 def _get_latest_pending_mail_confirmation(
@@ -1310,13 +1780,79 @@ def _get_latest_pending_mail_confirmation(
     return {}
 
 
+def _persist_confirmation_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    confirmation_payload: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(confirmation_payload or {})
+    if not payload:
+        return {}
+    kind = "mail" if dict(payload.get("mail_plan") or {}) else "domain"
+    pending = pending_object_from_confirmation({"kind": kind, "payload": payload})
+    if pending is None or not pending.object_id:
+        return {}
+    return upsert_pending_object(
+        object_type=pending.object_type,
+        object_id=pending.object_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload={"kind": kind, "confirmation_payload": payload},
+        actor_context=actor_context,
+        status="pending_confirmation",
+        salience=pending.salience,
+        allowed_continuations=list(pending.allowed_continuations),
+        supersede_same_type=True,
+    )
+
+
+def _get_latest_registry_confirmation(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidates = [
+        item
+        for item in (
+            get_latest_active_pending_object(
+                conversation_id=conversation_id,
+                object_type="mail_confirmation",
+                actor_context=actor_context,
+            ),
+            get_latest_active_pending_object(
+                conversation_id=conversation_id,
+                object_type="domain_confirmation",
+                actor_context=actor_context,
+            ),
+        )
+        if item
+    ]
+    if not candidates:
+        return {}
+    stored = max(candidates, key=lambda item: (str(item.get("updated_at") or ""), float(item.get("salience") or 0.0)))
+    payload = dict(stored.get("payload") or {})
+    confirmation_payload = dict(payload.get("confirmation_payload") or {})
+    kind = str(payload.get("kind") or ("mail" if confirmation_payload.get("mail_plan") else "domain"))
+    if not confirmation_payload or kind not in {"mail", "domain"}:
+        return {}
+    return {
+        "kind": kind,
+        "payload": confirmation_payload,
+        "object_id": str(stored.get("object_id") or ""),
+        "persistence_source": "pending_objects",
+        "registry_status": str(stored.get("status") or ""),
+    }
+
+
 def _get_latest_pending_confirmation(
     conversation_id: str,
     actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    persisted_registry = _get_latest_registry_confirmation(conversation_id, actor_context)
+    if persisted_registry:
+        return persisted_registry
     persisted_mail = _get_latest_pending_mail_confirmation(conversation_id, actor_context)
-    if persisted_mail:
-        return {"kind": "mail", "payload": persisted_mail}
     for turn in reversed(get_turns(conversation_id, limit=12)):
         if str(turn.get("role") or "").lower() != "assistant":
             continue
@@ -1326,11 +1862,260 @@ def _get_latest_pending_confirmation(
             continue
         mail_plan = dict(confirmation_payload.get("mail_plan") or {})
         if mail_plan and str(mail_plan.get("mail_action_type") or "").startswith(("send_", "compose_")):
-            return {"kind": "mail", "payload": confirmation_payload}
+            return {"kind": "mail", "payload": persisted_mail or confirmation_payload}
         tool_name = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "")
         if tool_name.startswith(("meeting_", "calendar_")):
             return {"kind": "domain", "payload": confirmation_payload}
+    if persisted_mail:
+        return {"kind": "mail", "payload": persisted_mail}
     return {}
+
+
+def _persist_source_clarification_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    mail_plan: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    if not source_resolution.get("needs_clarification") or not candidates:
+        return {}
+    object_id = f"source-clarification:{mail_plan.get('draft_id') or uuid.uuid4().hex[:16]}"
+    payload = {
+        "mail_plan": dict(mail_plan),
+        "candidates": list(candidates),
+        "source_resolution": source_resolution,
+        "request_message": str(mail_plan.get("request_message") or ""),
+    }
+    return upsert_pending_object(
+        object_type="source_clarification",
+        object_id=object_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload=payload,
+        actor_context=actor_context,
+        status="needs_clarification",
+        salience=0.92,
+        allowed_continuations=["choose_source", "cancel"],
+        supersede_same_type=True,
+    )
+
+
+def _mail_field_clarification_type(mail_plan: dict[str, Any]) -> str:
+    missing_fields = {str(field) for field in list(mail_plan.get("missing_fields") or []) if str(field)}
+    if "recipient" in missing_fields:
+        return "recipient_clarification"
+    if missing_fields.intersection({"content", "content_or_attachment", "body_source", "recipient_ready_body"}):
+        return "body_clarification"
+    return ""
+
+
+def _persist_mail_field_clarification_object(
+    *,
+    session_id: str,
+    conversation_id: str,
+    mail_plan: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if dict(mail_plan.get("source_resolution") or {}).get("needs_clarification") and candidates:
+        return {}
+    object_type = _mail_field_clarification_type(mail_plan)
+    if not object_type:
+        return {}
+    object_id = f"{object_type}:{mail_plan.get('draft_id') or uuid.uuid4().hex[:16]}"
+    payload = {
+        "object_type": object_type,
+        "mail_plan": dict(mail_plan),
+        "candidates": list(candidates),
+        "request_message": str(mail_plan.get("request_message") or ""),
+    }
+    return upsert_pending_object(
+        object_type=object_type,
+        object_id=object_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        payload=payload,
+        actor_context=actor_context,
+        status="needs_clarification",
+        salience=0.91 if object_type == "recipient_clarification" else 0.88,
+        allowed_continuations=["provide_missing_field", "cancel"],
+        supersede_same_type=True,
+    )
+
+
+def _get_latest_pending_source_clarification(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    persisted = get_latest_active_pending_object(
+        conversation_id=conversation_id,
+        object_type="source_clarification",
+        actor_context=actor_context,
+    )
+    if persisted:
+        return {
+            "kind": "source_clarification",
+            "payload": dict(persisted.get("payload") or {}),
+            "object_id": str(persisted.get("object_id") or ""),
+            "persistence_source": "pending_objects",
+        }
+    for turn in reversed(get_turns(conversation_id, limit=12)):
+        if str(turn.get("role") or "").lower() != "assistant":
+            continue
+        debug_payload = dict(turn.get("debug_payload") or {})
+        if not bool(debug_payload.get("needs_clarification")):
+            continue
+        task_plan = dict(debug_payload.get("task_plan") or {})
+        mail_plan = dict(task_plan.get("mail_plan") or {})
+        source_resolution = dict(mail_plan.get("source_resolution") or {})
+        if not source_resolution.get("needs_clarification"):
+            continue
+        candidates = list(task_plan.get("candidates") or [])
+        if not candidates:
+            for tool_call in list(debug_payload.get("tool_calls") or []):
+                result = dict(tool_call.get("result") or {})
+                candidates = list(result.get("candidates") or [])
+                if candidates:
+                    break
+        if not candidates:
+            continue
+        return {
+            "kind": "source_clarification",
+            "payload": {
+                "mail_plan": mail_plan,
+                "candidates": candidates,
+                "source_resolution": source_resolution,
+                "request_message": str(mail_plan.get("request_message") or ""),
+            },
+            "object_id": str(mail_plan.get("draft_id") or ""),
+            "persistence_source": "conversation_debug",
+        }
+    return {}
+
+
+def _get_latest_pending_mail_field_clarification(
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    for object_type in ("recipient_clarification", "body_clarification"):
+        persisted = get_latest_active_pending_object(
+            conversation_id=conversation_id,
+            object_type=object_type,
+            actor_context=actor_context,
+        )
+        if persisted:
+            return {
+                "kind": object_type,
+                "payload": {
+                    **dict(persisted.get("payload") or {}),
+                    "object_id": str(persisted.get("object_id") or ""),
+                    "persistence_source": "pending_objects",
+                },
+                "object_id": str(persisted.get("object_id") or ""),
+                "persistence_source": "pending_objects",
+            }
+    return {}
+
+
+def _first_resolved_recipient(mail_plan: dict[str, Any]) -> str:
+    recipients = list(mail_plan.get("resolved_recipients") or [])
+    if recipients:
+        return str(recipients[0] or "").strip()
+    return ""
+
+
+def _remove_missing_fields(mail_plan: dict[str, Any], fields: set[str]) -> None:
+    mail_plan["missing_fields"] = [
+        field
+        for field in list(mail_plan.get("missing_fields") or [])
+        if str(field) not in fields
+    ]
+
+
+def _mail_plan_ready_for_confirmation(mail_plan: dict[str, Any]) -> bool:
+    return bool(list(mail_plan.get("resolved_recipients") or [])) and bool(str(mail_plan.get("resolved_body") or "").strip()) and not list(mail_plan.get("missing_fields") or [])
+
+
+def _resolve_pending_mail_field_clarification(
+    *,
+    user_message: str,
+    pending_payload: dict[str, Any],
+) -> dict[str, Any]:
+    mail_plan = dict(pending_payload.get("mail_plan") or {})
+    candidates = list(pending_payload.get("candidates") or [])
+    object_type = str(pending_payload.get("object_type") or "")
+    if not mail_plan:
+        return {"ok": False, "needs_clarification": True, "mail_plan": {"missing_fields": ["mail_plan"]}, "candidates": candidates}
+    if object_type == "recipient_clarification":
+        recipient = _extract_destination_email(user_message)
+        if not recipient:
+            mail_plan["missing_fields"] = sorted({*list(mail_plan.get("missing_fields") or []), "recipient"})
+            return {"ok": False, "needs_clarification": True, "mail_plan": mail_plan, "candidates": candidates}
+        mail_plan["resolved_recipients"] = [recipient]
+        _remove_missing_fields(mail_plan, {"recipient"})
+    elif object_type == "body_clarification":
+        body = _extract_inline_mail_body(user_message) or str(user_message or "").strip()
+        if not body:
+            mail_plan["missing_fields"] = sorted({*list(mail_plan.get("missing_fields") or []), "content"})
+            return {"ok": False, "needs_clarification": True, "mail_plan": mail_plan, "candidates": candidates}
+        mail_plan["resolved_body"] = body
+        mail_plan["review_content"] = build_review_content(body, dict(mail_plan.get("selected_candidate") or {}) or None, dict(mail_plan.get("attachment_candidate") or {}) or None)
+        mail_plan["selected_candidate"] = {
+            "kind": "user_inline_text",
+            "candidate_id": f"user-inline-continuation:{uuid.uuid4().hex[:8]}",
+            "source_turn_id": "",
+            "label": "用户补充的正文",
+            "content": body,
+            "filename": "",
+            "content_type": "text/plain",
+            "supports_attachment": False,
+            "upload_blob_id": "",
+        }
+        mail_plan["target_object"] = "user_inline_text"
+        mail_plan["source_refs"] = ["user_inline_text"]
+        _remove_missing_fields(mail_plan, {"content", "content_or_attachment", "body_source", "recipient_ready_body"})
+    else:
+        return {"ok": False, "needs_clarification": True, "mail_plan": mail_plan, "candidates": candidates}
+    if _mail_plan_ready_for_confirmation(mail_plan):
+        mail_plan["status"] = "pending_confirmation"
+        mail_plan["requires_confirmation"] = True
+        return {"ok": True, "mode": "confirmation_required", "mail_plan": mail_plan, "candidates": candidates}
+    mail_plan["status"] = "needs_clarification"
+    return {"ok": False, "needs_clarification": True, "mail_plan": mail_plan, "candidates": candidates}
+
+
+def _resolve_pending_mail_source_clarification(
+    *,
+    user_message: str,
+    pending_payload: dict[str, Any],
+    conversation_id: str,
+) -> dict[str, Any]:
+    mail_plan = dict(pending_payload.get("mail_plan") or {})
+    candidates = list(pending_payload.get("candidates") or [])
+    original_message = str(mail_plan.get("request_message") or pending_payload.get("request_message") or "").strip()
+    if not original_message:
+        original_message = user_message
+    source_resolution = resolve_mail_source_request(
+        message=user_message,
+        candidates=candidates,
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    destination_email = _first_resolved_recipient(mail_plan) or _extract_destination_email(original_message)
+    return build_mail_action_plan(
+        message=original_message,
+        request_message=original_message,
+        candidates=candidates,
+        destination_email=destination_email,
+        referential_request=True,
+        explicit_summary=_looks_like_summary_reference(original_message),
+        send_both=_looks_like_send_both_request(original_message),
+        conversation_id=conversation_id,
+        source_resolution=source_resolution,
+    )
 
 
 def _create_domain_task_from_confirmation(
@@ -1384,6 +2169,7 @@ def _create_domain_task_from_confirmation(
         user_id=str(actor_context.get("user_id") or ""),
         workspace_id=str(actor_context.get("workspace_id") or ""),
     )
+    _persist_task_registry_object(task, actor_context=actor_context)
     try:
         enqueue_meeting_task(str(task["task_id"]))
     except Exception as exc:
@@ -1394,6 +2180,7 @@ def _create_domain_task_from_confirmation(
             error=str(exc),
             actor_context=actor_context,
         )
+    _persist_task_registry_object(task, actor_context=actor_context)
     return task
 
 
@@ -1554,10 +2341,11 @@ def _mail_plan_from_meeting_task(
         "unsupported_reason": "",
         "unsupported_code": "",
         "missing_fields": missing_fields,
-        "review_content": meeting_text,
+        "review_content": "",
         "request_message": request_message,
         "selected_candidate": {
-            "kind": "meeting_invitation",
+            "kind": "meeting_result",
+            "candidate_id": f"meeting-task:{task.get('task_id')}",
             "label": subject,
             "filename": "",
             "content_type": "application/json",
@@ -1572,10 +2360,38 @@ def _mail_plan_from_meeting_task(
         },
         "body_sources": [
             {
-                "kind": "meeting_result",
+                "kind": "reference_source",
                 "role": "meeting_invitation_details",
-                "policy": "summarize_only",
+                "policy": "recipient_ready_summary",
                 "task_id": str(task.get("task_id") or ""),
+            }
+        ],
+        "compose_mode": "recipient_ready_summary",
+        "reference_sources": [
+            {
+                "candidate_id": f"meeting-task:{task.get('task_id')}",
+                "source_turn_id": "",
+                "role": "meeting_result",
+                "policy": "recipient_ready_summary",
+                "content": meeting_text,
+            }
+        ],
+        "source_artifacts": [
+            {
+                "role": "meeting_invitation_details",
+                "kind": "meeting_result",
+                "candidate_id": f"meeting-task:{task.get('task_id')}",
+                "source_turn_id": "",
+                "filename": "",
+            }
+        ],
+        "provenance_refs": [
+            {
+                "role": "meeting_invitation_details",
+                "kind": "meeting_result",
+                "candidate_id": f"meeting-task:{task.get('task_id')}",
+                "source_turn_id": "",
+                "filename": "",
             }
         ],
         "source_policy": {
@@ -1620,6 +2436,153 @@ def _looks_like_meeting_invitation_continuation(message: str) -> bool:
             "send invitation",
         )
     )
+
+
+def _build_pending_object_cancelled_response(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    display_message: str,
+    pending_object: PendingObject,
+    actor_context: dict[str, Any],
+) -> UnifiedAgentResponse:
+    observation = make_typed_observation(
+        observation_type="pending_object_cancelled",
+        source="continuation_resolver",
+        summary="The active pending object was cancelled by the user.",
+        payload={
+            "object_id": pending_object.object_id,
+            "object_type": pending_object.object_type,
+            "status": "cancelled",
+            "next_actions": ["start_new_task"],
+        },
+        provenance={"source": "pending_objects", "object_id": pending_object.object_id},
+        confidence=0.99,
+        actor_context=actor_context,
+    )
+    route_decision = {
+        "routing_source": "continuation_resolver",
+        "intent": "pending_object_cancelled",
+        "confidence": 0.99,
+        "router_reason": "The user cancelled the active pending object before any new task planning.",
+    }
+    result = {
+        "intent": "pending_object_cancelled",
+        "observations": [observation],
+        "tool_observations": [observation],
+        "tool_calls": [
+            {
+                "tool_name": "continuation_resolver",
+                "success": True,
+                "status": "cancelled",
+                "error": "",
+                "result": dict(observation.get("payload") or {}),
+            }
+        ],
+        "task_plan": {"cancelled_pending_object": pending_object.to_dict()},
+        "termination_reason": "pending_object_cancelled",
+        "final_answer_source": "pending_object_cancelled_renderer",
+    }
+    return _build_fast_path_response(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message=message,
+        display_message=display_message,
+        route_decision=route_decision,
+        result=result,
+        latency_ms=0.0,
+        actor_context=actor_context,
+    )
+
+
+def _build_continuation_clarification_response(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    display_message: str,
+    decision: Any,
+    pending_objects: list[PendingObject],
+    actor_context: dict[str, Any],
+) -> UnifiedAgentResponse:
+    observation = make_typed_observation(
+        observation_type="continuation_resolution_required",
+        source="continuation_resolver",
+        summary="An active object exists, but the latest message cannot be safely classified as an edit or a new task.",
+        payload={
+            "decision": decision.to_dict(),
+            "active_objects": [
+                {
+                    "object_id": item.object_id,
+                    "object_type": item.object_type,
+                    "status": item.status,
+                    "allowed_continuations": list(item.allowed_continuations),
+                }
+                for item in pending_objects[:6]
+            ],
+            "next_actions": ["clarify_edit_existing_object", "clarify_start_new_task"],
+        },
+        provenance={"source": "pending_objects", "object_id": str(decision.object_id or "")},
+        confidence=0.99,
+        actor_context=actor_context,
+    )
+    route_decision = {
+        "routing_source": "continuation_resolver",
+        "intent": "continuation_resolution_required",
+        "confidence": 0.99,
+        "router_reason": "The durable state layer requires clarification before any planner or side effect can continue.",
+    }
+    result = {
+        "intent": "continuation_resolution_required",
+        "observations": [observation],
+        "tool_observations": [observation],
+        "tool_calls": [
+            {
+                "tool_name": "continuation_resolver",
+                "success": True,
+                "status": "clarification_required",
+                "error": "",
+                "result": dict(observation.get("payload") or {}),
+            }
+        ],
+        "needs_clarification": True,
+        "task_plan": {"continuation_resolution": dict(observation.get("payload") or {})},
+        "termination_reason": "continuation_resolution_required",
+        "final_answer_source": "continuation_resolution_renderer",
+    }
+    return _build_fast_path_response(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message=message,
+        display_message=display_message,
+        route_decision=route_decision,
+        result=result,
+        latency_ms=0.0,
+        actor_context=actor_context,
+    )
+
+
+def _enterprise_renderer_observation_payload(result: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(result.get("enterprise_answer_observation") or build_enterprise_answer_observation(result))
+    payload.pop("citations_brief", None)
+    payload.pop("retrieval_summary", None)
+    return payload
+
+
+def _enterprise_renderer_citations(result: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = dict(result.get("enterprise_answer_observation") or build_enterprise_answer_observation(result))
+    return [dict(item) for item in list(payload.get("citations_brief") or [])]
+
+
+def _enterprise_renderer_observation_summary(payload: dict[str, Any]) -> str:
+    facts = list(payload.get("canonical_facts") or [])
+    if facts:
+        return str(dict(facts[0] or {}).get("normalized_fact") or "")[:240]
+    state = dict(payload.get("answer_state") or {})
+    if state.get("missing_evidence"):
+        return "当前企业知识检索未形成可回答证据。"
+    return "已检索企业知识证据并生成结构化事实。"
 
 
 def _build_meeting_result_response(
@@ -1715,17 +2678,147 @@ def _render_mail_plan_with_llm(
     body_for_sending = str(render_result.get("body_for_sending") or "").strip()
     if body_for_sending:
         rendered_plan["resolved_body"] = body_for_sending
+        rendered_plan["authoring_status"] = "completed"
         rendered_plan["review_content"] = build_review_content(
             body_for_sending,
             dict(rendered_plan.get("selected_candidate") or {}) or None,
             dict(rendered_plan.get("attachment_candidate") or {}) or None,
         )
+    elif str(rendered_plan.get("compose_mode") or "") == "recipient_ready_summary":
+        rendered_plan["authoring_status"] = "failed"
+        rendered_plan["authoring_failure"] = dict(render_result.get("failure_observation") or {})
+        rendered_plan["recovery_hint"] = "Retry recipient-ready mail authoring from the resolved reference source."
     return rendered_plan, render_result
 
 
 def _mail_render_latency_ms(render_result: dict[str, Any]) -> float:
     latency = float(render_result.get("latency_ms") or 0.0)
     return round(max(latency, 0.01), 2)
+
+
+def _build_mail_authoring_recovery_response(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    display_message: str,
+    mail_plan: dict[str, Any],
+    render_result: dict[str, Any],
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse:
+    rendered_plan = _persist_mail_plan(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=mail_plan,
+        actor_context=actor_context,
+        status="authoring_failed",
+    )
+    failure_observation = dict(render_result.get("failure_observation") or rendered_plan.get("authoring_failure") or {})
+    if not failure_observation:
+        failure_observation = make_failure_observation(
+            service="llm",
+            operation="mail_authoring",
+            error="recipient_ready_body_empty",
+            fallback_strategy="return_mail_authoring_recovery_observation",
+            actor_context=actor_context,
+        )
+    latency_ms = _mail_render_latency_ms(render_result)
+    answer = "邮件正文整理服务暂时不可用，本次没有创建发送任务。请稍后重试。"
+    mail_observation = _build_mail_plan_observation(
+        rendered_plan,
+        source="mail_authoring_renderer",
+        summary=answer,
+        draft_mode="authoring_failed",
+        observation_type="mail_authoring_recovery",
+        extra_payload={"recovery_observation": failure_observation},
+        actor_context=actor_context,
+    )
+    synthetic_result = {
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "request_id": str(uuid.uuid4()),
+        "message": message,
+        "safe_message": message,
+        "display_message": display_message or message,
+        "answer": answer,
+        "intent": "action_or_draft",
+        "routing_source": "mail_action",
+        "routing_confidence": 0.99,
+        "routing_reason": "Recipient-ready mail authoring dependency failed before confirmation.",
+        "candidate_intents": ["action_or_draft"],
+        "mode_used": "mail_action",
+        "tool_calls": [
+            {
+                "tool_name": "mail_authoring_renderer",
+                "success": False,
+                "status": "degraded",
+                "error": str(dict(failure_observation.get("payload") or {}).get("error") or ""),
+                "result": {"mail_plan": rendered_plan, "recovery_observation": failure_observation},
+            }
+        ],
+        "retrieved_evidence": [],
+        "needs_clarification": False,
+        "clarification_question": None,
+        "privacy": {},
+        "context_budget": {},
+        "citations": [],
+        "memory_context": {},
+        "memory_hits": 0,
+        "merged_memory_hits": 0,
+        "reflection_notes": None,
+        "task_plan": {"mail_plan": rendered_plan},
+        "final_answer_source": "mail_authoring_recovery",
+        "termination_reason": "dependency_failure",
+        "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
+        "token_in": int(render_result.get("token_in", 0)),
+        "token_out": int(render_result.get("token_out", 0)),
+        "estimated_cost": float(render_result.get("estimated_cost", 0.0)),
+        "tool_observations": [failure_observation, mail_observation],
+    }
+    turn_id, memory_written = _write_unified_conversation_memory(synthetic_result, conversation_id)
+    return UnifiedAgentResponse(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        answer=answer,
+        intent="action_or_draft",
+        routing_source="mail_action",
+        routing_confidence=0.99,
+        routing_reason=str(synthetic_result["routing_reason"]),
+        candidate_intents=["action_or_draft"],
+        mode_used="mail_action",
+        tool_calls=synthetic_result["tool_calls"],
+        retrieved_evidence=[],
+        needs_clarification=False,
+        clarification_question=None,
+        privacy={},
+        context_budget={},
+        citations=[],
+        memory_written=memory_written,
+        memory_hits=0,
+        merged_memory_hits=0,
+        memory_context={},
+        answer_collapsed=False,
+        reflection_notes=None,
+        task_plan=synthetic_result["task_plan"],
+        final_answer_source="mail_authoring_recovery",
+        termination_reason="dependency_failure",
+        tool_observations=[failure_observation, mail_observation],
+        workflow_id=None,
+        workflow_status=None,
+        workflow_risk_level=None,
+        task_id=None,
+        task_status=None,
+        task_risk_level=None,
+        delivery_status=None,
+        delivery_result=None,
+        delivery_error=str(dict(failure_observation.get("payload") or {}).get("error") or ""),
+        trace_id=str(synthetic_result["request_id"]),
+        latency_ms=latency_ms,
+        token_in=int(render_result.get("token_in", 0)),
+        token_out=int(render_result.get("token_out", 0)),
+        estimated_cost=float(render_result.get("estimated_cost", 0.0)),
+    )
 
 
 def _build_mail_clarification_response(
@@ -1750,6 +2843,20 @@ def _build_mail_clarification_response(
         mail_plan=rendered_plan,
         actor_context=actor_context,
         status="needs_clarification",
+    )
+    pending_source_object = _persist_source_clarification_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        candidates=list(candidates or []),
+        actor_context=actor_context,
+    )
+    pending_field_object = _persist_mail_field_clarification_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan=rendered_plan,
+        candidates=list(candidates or []),
+        actor_context=actor_context,
     )
     latency_ms = _mail_render_latency_ms(render_result)
     clarification_question = str(render_result.get("clarification_question") or render_result.get("user_message") or "").strip()
@@ -1793,7 +2900,11 @@ def _build_mail_clarification_response(
         "memory_hits": 0,
         "merged_memory_hits": 0,
         "reflection_notes": None,
-        "task_plan": {"mail_plan": rendered_plan, "candidates": list(candidates or [])},
+        "task_plan": {
+            "mail_plan": rendered_plan,
+            "candidates": list(candidates or []),
+            "pending_object": pending_source_object or pending_field_object,
+        },
         "node_latencies_ms": {"total": latency_ms, "mail_renderer": latency_ms},
         "token_in": int(render_result.get("token_in", 0)),
         "token_out": int(render_result.get("token_out", 0)),
@@ -1858,6 +2969,27 @@ def _build_mail_confirmation_response(
         mail_plan=mail_plan,
         render_mode="confirmation",
     )
+    if str(rendered_plan.get("authoring_status") or "") == "failed":
+        return _build_mail_authoring_recovery_response(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            display_message=display_message,
+            mail_plan=rendered_plan,
+            render_result=render_result,
+            actor_context=actor_context,
+        )
+    if str(rendered_plan.get("compose_mode") or "") == "recipient_ready_summary" and not str(
+        rendered_plan.get("resolved_body") or ""
+    ).strip():
+        return _build_mail_clarification_response(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            display_message=display_message,
+            mail_plan=rendered_plan,
+            actor_context=actor_context,
+        )
     rendered_plan = _persist_mail_plan(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -1990,6 +3122,16 @@ def _build_mail_patch_response(
         mail_plan=mail_plan,
         render_mode="patch",
     )
+    if str(rendered_plan.get("authoring_status") or "") == "failed":
+        return _build_mail_authoring_recovery_response(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            display_message=display_message,
+            mail_plan=rendered_plan,
+            render_result=render_result,
+            actor_context=actor_context,
+        )
     rendered_plan = _persist_mail_plan(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -2123,6 +3265,16 @@ def _build_mail_draft_response(
         mail_plan=mail_plan,
         render_mode="draft",
     )
+    if str(rendered_plan.get("authoring_status") or "") == "failed":
+        return _build_mail_authoring_recovery_response(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            display_message=display_message,
+            mail_plan=rendered_plan,
+            render_result=render_result,
+            actor_context=actor_context,
+        )
     rendered_plan = _persist_mail_plan(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -2347,8 +3499,12 @@ def _build_fast_path_response(
     actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
     observations = list(result.get("observations") or result.get("tool_observations") or [])
+    router_latency_ms = float(route_decision.get("router_latency_ms") or 0.0)
+    tool_path_latency_ms = float(latency_ms)
+    pre_renderer_latency_ms = router_latency_ms + tool_path_latency_ms
+    renderer_started = perf_counter()
     renderer = {"answer": str(result.get("answer") or ""), "token_in": 0, "token_out": 0, "estimated_cost": 0.0, "used_fallback": False}
-    if not bool(result.get("needs_clarification", False)) and not bool(result.get("skip_renderer", False)):
+    if not bool(result.get("skip_renderer", False)):
         renderer = render_final_answer(
             question=message,
             current_goal=str(result.get("intent") or route_decision.get("intent") or "fast_path"),
@@ -2361,6 +3517,8 @@ def _build_fast_path_response(
         if isinstance(renderer.get("failure_observation"), dict):
             observations.append(dict(renderer["failure_observation"]))
             result.setdefault("tool_observations", []).append(dict(renderer["failure_observation"]))
+    renderer_latency_ms = (perf_counter() - renderer_started) * 1000.0
+    latency_ms = pre_renderer_latency_ms + renderer_latency_ms
     synthetic_result = {
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -2378,7 +3536,11 @@ def _build_fast_path_response(
         "tool_calls": list(result.get("tool_calls") or []),
         "retrieved_evidence": list(result.get("retrieved_evidence") or []),
         "needs_clarification": bool(result.get("needs_clarification", False)),
-        "clarification_question": result.get("clarification_question"),
+        "clarification_question": (
+            str(result.get("clarification_question") or renderer.get("answer") or "")
+            if bool(result.get("needs_clarification", False))
+            else result.get("clarification_question")
+        ),
         "privacy": dict(result.get("privacy") or {}),
         "context_budget": {},
         "citations": list(result.get("citations") or []),
@@ -2420,19 +3582,37 @@ def _build_fast_path_response(
         ),
         "memory_reads": list(result.get("memory_reads") or []),
         "tool_observations": list(result.get("tool_observations") or []),
-        "node_latencies_ms": {"total": round(latency_ms, 2)},
+        "node_latencies_ms": {
+            "total": round(latency_ms, 2),
+            "router": round(router_latency_ms, 2),
+            "tool_path": round(tool_path_latency_ms, 2),
+            "pre_renderer": round(pre_renderer_latency_ms, 2),
+            "final_renderer": round(renderer_latency_ms, 2),
+        },
         "token_in": int(result.get("token_in", 0)) + int(renderer.get("token_in", 0)),
         "token_out": int(result.get("token_out", 0)) + int(renderer.get("token_out", 0)),
         "estimated_cost": float(result.get("estimated_cost", 0.0)) + float(renderer.get("estimated_cost", 0.0)),
     }
+    trace_eval_started = perf_counter()
     synthetic_result = attach_trace_evaluation(synthetic_result, actor_context=actor_context)
+    trace_eval_latency_ms = (perf_counter() - trace_eval_started) * 1000.0
+    memory_persist_started = perf_counter()
     turn_id, memory_written = _write_unified_conversation_memory(synthetic_result, conversation_id)
+    memory_persist_latency_ms = (perf_counter() - memory_persist_started) * 1000.0
+    latency_ms += trace_eval_latency_ms + memory_persist_latency_ms
+    synthetic_result["node_latencies_ms"].update(
+        {
+            "total": round(latency_ms, 2),
+            "trace_evaluation": round(trace_eval_latency_ms, 2),
+            "memory_persist_enqueue": round(memory_persist_latency_ms, 2),
+        }
+    )
     record_request(
         mode="fast_path",
         latency_ms=latency_ms,
-        token_in=int(result.get("token_in", 0)),
-        token_out=int(result.get("token_out", 0)),
-        estimated_cost=float(result.get("estimated_cost", 0.0)),
+        token_in=int(synthetic_result["token_in"]),
+        token_out=int(synthetic_result["token_out"]),
+        estimated_cost=float(synthetic_result["estimated_cost"]),
         retrieval_hits=len(list(synthetic_result.get("citations", []))),
         memory_hits=int(synthetic_result.get("memory_hits", 0)),
         used_conversation_memory=bool(synthetic_result.get("memory_hits", 0) or synthetic_result.get("merged_memory_hits", 0)),
@@ -2762,14 +3942,16 @@ def _execute_fast_path(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             actor_context=actor_context,
+            compose_answer=False,
         )
+        observation_payload = _enterprise_renderer_observation_payload(payload_dict)
         observation = make_typed_observation(
-            observation_type="enterprise_rag_result",
+            observation_type="enterprise_answer_observation",
             source="enterprise_rag_query",
             grounding_kind="retrieval",
-            summary=compact_text(str(payload_dict.get("answer") or ""), 240),
-            payload=payload_dict,
-            citations=list(payload_dict.get("citations") or []),
+            summary=_enterprise_renderer_observation_summary(observation_payload),
+            payload=observation_payload,
+            citations=_enterprise_renderer_citations(payload_dict),
             confidence=float(payload_dict.get("confidence", 0.0) or 0.0),
             actor_context=actor_context,
         )
@@ -3315,15 +4497,17 @@ def _handle_compound_agent_request(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
                 actor_context=actor_context,
+                compose_answer=False,
             )
+            observation_payload = _enterprise_renderer_observation_payload(result)
             observations.append(
                 {
-                    "observation_type": "enterprise_rag_result",
+                    "observation_type": "enterprise_answer_observation",
                     "source": "enterprise_rag_query",
                     "grounding_kind": "retrieval",
-                    "summary": compact_text(str(result.get("answer") or ""), 240),
-                    "payload": result,
-                    "citations": list(result.get("citations") or []),
+                    "summary": _enterprise_renderer_observation_summary(observation_payload),
+                    "payload": observation_payload,
+                    "citations": _enterprise_renderer_citations(result),
                     "confidence": float(result.get("confidence", 0.0) or 0.0),
                 }
             )
@@ -3387,15 +4571,17 @@ def _handle_compound_agent_request(
                 str(subtask.input.get("question") or payload.message),
                 source_types=list(subtask.input.get("source_types") or []),
                 actor_context=actor_context,
+                compose_answer=False,
             )
+            observation_payload = _enterprise_renderer_observation_payload(result)
             observations.append(
                 make_typed_observation(
-                    observation_type="enterprise_rag_result",
+                    observation_type="enterprise_answer_observation",
                     source="enterprise_rag_query",
                     grounding_kind="retrieval",
-                    summary=compact_text(str(result.get("answer") or ""), 240),
-                    payload=result,
-                    citations=list(result.get("citations") or []),
+                    summary=_enterprise_renderer_observation_summary(observation_payload),
+                    payload=observation_payload,
+                    citations=_enterprise_renderer_citations(result),
                     confidence=float(result.get("confidence", 0.0) or 0.0),
                     actor_context=actor_context,
                 )
@@ -3447,58 +4633,57 @@ def _handle_async_outbound_agent_request(
     upload_context: dict[str, Any] | None = None,
     actor_context: dict[str, Any] | None = None,
 ) -> UnifiedAgentResponse:
-    resolution = _build_outbound_resolution(payload, conversation_id, dict(upload_context or {}))
-    if not resolution.get("ok"):
-        return _build_rule_clarification_response(
+    mail_action_plan = _build_mail_action_plan(
+        payload,
+        conversation_id,
+        dict(upload_context or {}),
+        actor_context=actor_context,
+    )
+    if mail_action_plan.get("needs_clarification"):
+        return _build_mail_clarification_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             message=payload.message,
             display_message=display_message,
-            clarification_question=str(
-                resolution.get("clarification_question")
-                or "我已经识别到外发意图，但还不能安全判断要发送的具体内容。请先明确发送对象。"
-            ),
-            routing_reason="Detected a referential outbound request and required explicit content resolution before creating a DLP task.",
-            candidates=list(resolution.get("candidates") or []),
+            mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+            candidates=list(mail_action_plan.get("candidates") or []),
+            actor_context=actor_context,
         )
-
-    selected_candidate = dict(resolution.get("selected_candidate") or {})
-    task_payload = DlpTaskCreateRequest(
+    if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "unsupported":
+        return _build_mail_unsupported_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+            actor_context=actor_context,
+        )
+    if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "draft_only":
+        return _build_mail_draft_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+            actor_context=actor_context,
+        )
+    if mail_action_plan.get("ok") and mail_action_plan.get("mode") == "confirmation_required":
+        return _build_mail_confirmation_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            mail_plan=dict(mail_action_plan.get("mail_plan") or {}),
+            actor_context=actor_context,
+        )
+    return _build_mail_clarification_response(
         session_id=payload.session_id,
         conversation_id=conversation_id,
         message=payload.message,
-        request_message=str(resolution.get("request_message") or payload.message),
-        review_content=str(resolution.get("review_content") or ""),
-        resolved_outbound_content=str(resolution.get("resolved_outbound_content") or outbound_message),
-        resolved_source_kind=str(resolution.get("resolved_source_kind") or ""),
-        delivery_subject=str(resolution.get("delivery_subject") or ""),
-        delivery_body=str(resolution.get("delivery_body") or ""),
-        delivery_plan_kind=str(resolution.get("delivery_plan_kind") or ""),
-        attachment_strategy=str(resolution.get("attachment_strategy") or "none"),
-        attachment_content=str(resolution.get("attachment_content") or ""),
-        attachment_filename=str(resolution.get("attachment_filename") or ""),
-        attachment_content_type=str(resolution.get("attachment_content_type") or ""),
-        attachment_blob_id=str(resolution.get("attachment_blob_id") or ""),
-        destination_email=str(resolution.get("destination_email") or _extract_destination_email(payload.message)),
-        uploaded_filename=str(selected_candidate.get("filename") or payload.uploaded_filename),
-        uploaded_content_type=str(selected_candidate.get("content_type") or payload.uploaded_content_type),
-        uploaded_text=str(selected_candidate.get("content") or payload.uploaded_text),
-        uploaded_file_base64=payload.uploaded_file_base64,
-        source_parse_status=payload.source_parse_status,
-        source_parse_error=payload.source_parse_error,
-        tenant_id=str((actor_context or {}).get("tenant_id") or ""),
-        user_id=str((actor_context or {}).get("user_id") or ""),
-        workspace_id=str((actor_context or {}).get("workspace_id") or ""),
-        roles=list((actor_context or {}).get("roles") or []),
-    )
-    task = _create_async_dlp_task(task_payload, actor_context=actor_context)
-    return _build_task_agent_response(
-        session_id=payload.session_id,
-        conversation_id=conversation_id,
-        outbound_message=str(resolution.get("resolved_outbound_content") or outbound_message),
         display_message=display_message,
-        task=task,
-        routing_reason="Resolved outbound content and created a governed DLP task.",
+        mail_plan={"missing_fields": ["content_or_attachment"], "request_message": payload.message},
+        candidates=[],
+        actor_context=actor_context,
     )
 
 
@@ -3516,6 +4701,7 @@ def _create_dlp_task_from_mail_plan(
     idempotency_key = str(mail_plan.get("idempotency_key") or "")
     existing = get_dlp_task_by_idempotency_key(idempotency_key) if idempotency_key else None
     if existing:
+        _persist_task_registry_object(existing, actor_context=actor_context)
         if draft_id:
             bind_mail_draft_task(
                 draft_id,
@@ -3698,6 +4884,18 @@ def _write_unified_conversation_memory(
 
     user_turn = exchange["user_turn"]
     assistant_turn = exchange["assistant_turn"]
+    try:
+        _persist_answer_artifact_object(
+            session_id=str(result["session_id"]),
+            conversation_id=conversation_id,
+            turn_id=str(assistant_turn["turn_id"]),
+            answer_summary=answer_summary,
+            intent=str(result.get("intent", "")),
+            citations=list(result.get("citations") or []),
+            actor_context=actor_context or result.get("actor_context") or {},
+        )
+    except Exception as exc:  # pragma: no cover - best effort artifact registry write
+        logger.warning("Answer artifact registry write skipped: %s", exc)
     written = False
     dynamic_memory_result: dict[str, Any] = {}
     try:
@@ -3713,31 +4911,32 @@ def _write_unified_conversation_memory(
         logger.warning("Hermes dynamic memory write skipped: %s", exc)
     try:
         dynamic_identifiers = dict(dynamic_memory_result.get("identifiers") or {})
-        written = write_turn_summary(
-            session_id=str(result["session_id"]),
-            conversation_id=conversation_id,
-            user_turn_id=str(user_turn["turn_id"]),
-            assistant_turn_id=str(assistant_turn["turn_id"]),
-            question=question,
-            safe_question=safe_question,
-            answer=answer,
-            answer_summary=answer_summary,
-            intent=str(result.get("intent", "")),
-            citations=result.get("citations", []),
-            upload_context=result.get("upload_context", {}) or {},
-            actor_context=actor_context or result.get("actor_context") or {},
-            dynamic_memory={
-                "user_goal": question,
-                "outcome": answer_summary,
-                "failure_reason": _summarize_memory_failure_for_doc(result),
-                "memory_scope": str(dynamic_memory_result.get("memory_scope") or "session"),
-                "key_files": dynamic_identifiers.get("files") or [],
-                "recipients": dynamic_identifiers.get("emails") or [],
-                "task_ids": dynamic_identifiers.get("task_ids") or [],
-            },
+        enqueue_conversation_memory_summary(
+            {
+                "session_id": str(result["session_id"]),
+                "conversation_id": conversation_id,
+                "user_turn_id": str(user_turn["turn_id"]),
+                "assistant_turn_id": str(assistant_turn["turn_id"]),
+                "question": question,
+                "safe_question": safe_question,
+                "answer": answer,
+                "answer_summary": answer_summary,
+                "intent": str(result.get("intent", "")),
+                "citations": result.get("citations", []),
+                "upload_context": result.get("upload_context", {}) or {},
+                "actor_context": actor_context or result.get("actor_context") or {},
+                "dynamic_memory": {
+                    "user_goal": question,
+                    "outcome": answer_summary,
+                    "failure_reason": _summarize_memory_failure_for_doc(result),
+                    "memory_scope": str(dynamic_memory_result.get("memory_scope") or "session"),
+                    "key_files": dynamic_identifiers.get("files") or [],
+                    "recipients": dynamic_identifiers.get("emails") or [],
+                    "task_ids": dynamic_identifiers.get("task_ids") or [],
+                },
+            }
         )
-        if written:
-            record_turn_summary_write()
+        written = True
     except Exception as exc:  # pragma: no cover - best effort memory write
         logger.warning("Unified turn memory write skipped: %s", exc)
 
@@ -4238,6 +5437,32 @@ def get_conversation_summary_api(conversation_id: str) -> dict:
     return {"conversation": conversation, "merge": merge}
 
 
+@app.get("/agent/pending-objects")
+def list_agent_pending_objects_api(
+    request: Request,
+    conversation_id: str,
+    session_id: str = "",
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request, session_id=session_id, conversation_id=conversation_id)
+    _ensure_permission(actor, "agent.chat", "pending_objects")
+    conversation, _ = _ensure_conversation(session_id or actor.session_id, conversation_id, actor.to_dict())
+    items = list_active_pending_objects(
+        conversation_id=str(conversation["conversation_id"]),
+        actor_context=actor.to_dict(),
+    )
+    snapshots = [
+        _safe_pending_object_snapshot(item, actor_context=actor.to_dict())
+        for item in items
+    ]
+    return {
+        "ok": True,
+        "conversation_id": str(conversation["conversation_id"]),
+        "actor_context": actor.to_dict(),
+        "pending_objects": snapshots,
+        "count": len(snapshots),
+    }
+
+
 @app.get("/tasks", response_model=list[DlpTaskResponse])
 def list_dlp_tasks_api(
     request: Request,
@@ -4247,6 +5472,7 @@ def list_dlp_tasks_api(
 ) -> list[DlpTaskResponse]:
     actor = build_actor_context(request=request, session_id=session_id or "")
     _ensure_permission(actor, "task.read", "dlp_tasks")
+    workspace_task_reader = bool({"admin", "approver"}.intersection({str(role).lower() for role in actor.roles}))
     return [
         _task_response(item)
         for item in list_dlp_tasks(
@@ -4254,7 +5480,9 @@ def list_dlp_tasks_api(
             status=status,
             risk_level=risk_level,
             tenant_id=None if actor.is_local_dev else actor.tenant_id,
-            user_id=None if actor.is_local_dev else actor.user_id,
+            # Governance users review tasks across users inside their bound
+            # workspace. They never receive an unscoped cross-tenant listing.
+            user_id=None if actor.is_local_dev or workspace_task_reader else actor.user_id,
             workspace_id=None if actor.is_local_dev else actor.workspace_id,
         )
     ]
@@ -4627,8 +5855,20 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     conversation_id = str(conversation["conversation_id"])
     actor = replace(actor, conversation_id=conversation_id)
     actor_context = actor.to_dict()
+    continuation_state_snapshot: dict[str, Any] = {}
 
     def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
+        _persist_confirmation_object(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            confirmation_payload=dict(response.confirmation_payload or response.pending_confirmation or {}),
+            actor_context=actor_context,
+        )
+        if continuation_state_snapshot:
+            response.task_plan = {
+                **dict(response.task_plan or {}),
+                "continuation_state": dict(continuation_state_snapshot),
+            }
         return _attach_landing_context(
             response,
             actor=actor,
@@ -4640,7 +5880,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
 
     outbound_message = _build_outbound_message(payload.message, payload.uploaded_text, payload.uploaded_filename)
     display_message = _build_display_message(payload.message, payload.uploaded_filename, payload.source_parse_status)
-    upload_context, recalled_upload = _resolve_upload_context(payload, conversation_id)
+    upload_context, recalled_upload = _resolve_upload_context(payload, conversation_id, actor_context)
     if recalled_upload and upload_context.get("filename"):
         display_message = _build_display_message(
             payload.message,
@@ -4713,9 +5953,90 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             candidates=[],
             actor_context=actor_context,
         ))
-    multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
-    if looks_like_send_confirmation(payload.message) and multi_agent_dag_plan is None:
-        latest_confirmation = _get_latest_pending_confirmation(conversation_id, actor_context)
+    latest_confirmation = _get_latest_pending_confirmation(conversation_id, actor_context)
+    pending_object = pending_object_from_confirmation(latest_confirmation)
+    latest_source_clarification = _get_latest_pending_source_clarification(conversation_id, actor_context)
+    source_pending_object = pending_object_from_source_clarification(
+        dict(latest_source_clarification.get("payload") or {})
+    )
+    latest_field_clarification = _get_latest_pending_mail_field_clarification(conversation_id, actor_context)
+    field_pending_object = pending_object_from_mail_clarification(
+        dict(latest_field_clarification.get("payload") or {})
+    )
+    registry_objects = _active_registry_objects(conversation_id, actor_context)
+    pending_objects_by_key = {
+        (item.object_type, item.object_id): item
+        for item in registry_objects
+    }
+    for item in (pending_object, source_pending_object, field_pending_object):
+        if item is not None:
+            pending_objects_by_key[(item.object_type, item.object_id)] = item
+    pending_objects = list(pending_objects_by_key.values())
+    continuation_decision = resolve_continuation(payload.message, pending_objects)
+    continuation_state_snapshot.update(
+        {
+            "decision": continuation_decision.to_dict(),
+            "active_objects": [
+                {
+                    "object_id": item.object_id,
+                    "object_type": item.object_type,
+                    "status": item.status,
+                    "allowed_continuations": list(item.allowed_continuations),
+                }
+                for item in pending_objects
+            ],
+        }
+    )
+    if continuation_decision.mode == "ambiguous":
+        return finalize(_build_continuation_clarification_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            decision=continuation_decision,
+            pending_objects=pending_objects,
+            actor_context=actor_context,
+        ))
+    if (
+        continuation_decision.mode == "continue_existing"
+        and continuation_decision.continuation_type == "cancel"
+    ):
+        cancel_target = next(
+            (
+                item
+                for item in pending_objects
+                if item.object_type == continuation_decision.object_type
+                and item.object_id == continuation_decision.object_id
+            ),
+            None,
+        )
+        if cancel_target is not None:
+            registry_object_id = cancel_target.object_id
+            if cancel_target.object_type == "source_clarification":
+                registry_object_id = str(latest_source_clarification.get("object_id") or registry_object_id)
+            elif cancel_target.object_type in {"recipient_clarification", "body_clarification"}:
+                registry_object_id = str(latest_field_clarification.get("object_id") or registry_object_id)
+            elif cancel_target.object_type in {"mail_confirmation", "domain_confirmation"}:
+                registry_object_id = str(latest_confirmation.get("object_id") or registry_object_id)
+            consume_pending_object(registry_object_id, actor_context=actor_context, status="cancelled")
+            cancel_mail_plan = dict(cancel_target.payload.get("mail_plan") or {})
+            draft_id = str(cancel_mail_plan.get("draft_id") or "")
+            if draft_id:
+                cancel_mail_draft(draft_id, actor_context=actor_context)
+                _consume_mail_draft_registry_object(draft_id, actor_context)
+            return finalize(_build_pending_object_cancelled_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                display_message=display_message,
+                pending_object=cancel_target,
+                actor_context=actor_context,
+            ))
+    if (
+        continuation_decision.mode == "continue_existing"
+        and continuation_decision.continuation_type == "confirm"
+        and pending_object is not None
+    ):
         if latest_confirmation.get("kind") == "domain":
             pending_domain_confirmation = dict(latest_confirmation.get("payload") or {})
             action = str(pending_domain_confirmation.get("tool_name") or pending_domain_confirmation.get("action_name") or "")
@@ -4728,6 +6049,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 confirmation_payload=pending_domain_confirmation,
                 actor_context=actor_context,
             )
+            consume_pending_object(pending_object.object_id, actor_context=actor_context)
             return finalize(_build_task_agent_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
@@ -4735,6 +6057,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 display_message=display_message,
                 task=task,
                 routing_reason="Confirmed a pending domain-agent action and queued it for governed async execution.",
+                actor_context=actor_context,
             ))
         pending_confirmation = dict(latest_confirmation.get("payload") or {}) if latest_confirmation.get("kind") == "mail" else {}
         pending_mail_plan = dict(pending_confirmation.get("mail_plan") or {})
@@ -4747,6 +6070,13 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 mail_plan=pending_mail_plan,
                 actor_context=actor_context,
             )
+            consume_pending_object(pending_object.object_id, actor_context=actor_context)
+            _consume_mail_draft_registry_object(str(pending_mail_plan.get("draft_id") or ""), actor_context)
+            mail_task_observation = _build_mail_task_created_observation(
+                task=task,
+                mail_plan=pending_mail_plan,
+                actor_context=actor_context,
+            )
             return finalize(_build_task_agent_response(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
@@ -4754,7 +6084,130 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                 display_message=display_message,
                 task=task,
                 routing_reason="Confirmed a pending mail plan and created a governed DLP task.",
+                intent="action_or_draft",
+                current_goal="action_or_draft",
+                routing_source="mail_action",
+                routing_confidence=0.99,
+                candidate_intents=["action_or_draft"],
+                mode_used="mail_action",
+                extra_observations=[mail_task_observation],
+                final_answer_source="mail_task_created_renderer",
+                actor_context=actor_context,
             ))
+    if (
+        continuation_decision.mode == "continue_existing"
+        and continuation_decision.continuation_type == "choose_source"
+        and source_pending_object is not None
+    ):
+        clarified_mail_action_plan = _resolve_pending_mail_source_clarification(
+            user_message=payload.message,
+            pending_payload=dict(source_pending_object.payload),
+            conversation_id=conversation_id,
+        )
+        if clarified_mail_action_plan.get("needs_clarification"):
+            return finalize(_build_mail_clarification_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=str(dict(source_pending_object.payload).get("request_message") or payload.message),
+                display_message=display_message,
+                mail_plan=dict(clarified_mail_action_plan.get("mail_plan") or {}),
+                candidates=list(clarified_mail_action_plan.get("candidates") or source_pending_object.payload.get("candidates") or []),
+                actor_context=actor_context,
+            ))
+        if clarified_mail_action_plan.get("ok") and clarified_mail_action_plan.get("mode") == "confirmation_required":
+            if latest_source_clarification.get("object_id"):
+                consume_pending_object(str(latest_source_clarification.get("object_id")), actor_context=actor_context)
+            return finalize(_build_mail_confirmation_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=str(dict(source_pending_object.payload).get("request_message") or payload.message),
+                display_message=display_message,
+                mail_plan=dict(clarified_mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
+            ))
+        if clarified_mail_action_plan.get("ok") and clarified_mail_action_plan.get("mode") == "draft_only":
+            if latest_source_clarification.get("object_id"):
+                consume_pending_object(str(latest_source_clarification.get("object_id")), actor_context=actor_context)
+            return finalize(_build_mail_draft_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=str(dict(source_pending_object.payload).get("request_message") or payload.message),
+                display_message=display_message,
+                mail_plan=dict(clarified_mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
+            ))
+    if (
+        continuation_decision.mode == "continue_existing"
+        and continuation_decision.continuation_type == "provide_missing_field"
+        and field_pending_object is not None
+    ):
+        clarified_mail_action_plan = _resolve_pending_mail_field_clarification(
+            user_message=payload.message,
+            pending_payload=dict(field_pending_object.payload),
+        )
+        if clarified_mail_action_plan.get("needs_clarification"):
+            return finalize(_build_mail_clarification_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=str(dict(field_pending_object.payload).get("request_message") or payload.message),
+                display_message=display_message,
+                mail_plan=dict(clarified_mail_action_plan.get("mail_plan") or {}),
+                candidates=list(clarified_mail_action_plan.get("candidates") or field_pending_object.payload.get("candidates") or []),
+                actor_context=actor_context,
+            ))
+        if clarified_mail_action_plan.get("ok") and clarified_mail_action_plan.get("mode") == "confirmation_required":
+            if latest_field_clarification.get("object_id"):
+                consume_pending_object(str(latest_field_clarification.get("object_id")), actor_context=actor_context)
+            return finalize(_build_mail_confirmation_response(
+                session_id=payload.session_id,
+                conversation_id=conversation_id,
+                message=str(dict(field_pending_object.payload).get("request_message") or payload.message),
+                display_message=display_message,
+                mail_plan=dict(clarified_mail_action_plan.get("mail_plan") or {}),
+                actor_context=actor_context,
+            ))
+    if (
+        continuation_decision.mode == "continue_existing"
+        and continuation_decision.continuation_type == "patch"
+    ):
+        patch_target = next(
+            (
+                item
+                for item in pending_objects
+                if item.object_type == continuation_decision.object_type
+                and item.object_id == continuation_decision.object_id
+            ),
+            None,
+        )
+        patch_mail_plan = dict((patch_target.payload if patch_target else {}).get("mail_plan") or {})
+        if patch_target is not None and patch_target.object_type == "mail_draft" and patch_mail_plan:
+            patched_mail_plan = patch_pending_mail_plan(
+                message=payload.message,
+                request_message=payload.message,
+                mail_plan=patch_mail_plan,
+                structured_patch=dict(continuation_decision.parameters or {}),
+            )
+            if patched_mail_plan.get("needs_clarification"):
+                return finalize(_build_mail_clarification_response(
+                    session_id=payload.session_id,
+                    conversation_id=conversation_id,
+                    message=payload.message,
+                    display_message=display_message,
+                    mail_plan=dict(patched_mail_plan.get("mail_plan") or patch_mail_plan),
+                    candidates=[],
+                    actor_context=actor_context,
+                ))
+            if patched_mail_plan.get("ok"):
+                return finalize(_build_mail_patch_response(
+                    session_id=payload.session_id,
+                    conversation_id=conversation_id,
+                    message=payload.message,
+                    display_message=display_message,
+                    mail_plan=dict(patched_mail_plan.get("mail_plan") or patch_mail_plan),
+                    patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
+                    actor_context=actor_context,
+                ))
+    multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
     if multi_agent_dag_plan is None and _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
         supplemented = _supplement_dlp_task(
@@ -4778,48 +6231,20 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             display_message=display_message,
             task=supplemented,
             routing_reason="Applied supplemental information to a governed DLP task.",
-        ))
-    if looks_like_pending_draft_edit_request(payload.message) and multi_agent_dag_plan is None:
-        pending_mail_plan = _get_latest_pending_mail_draft(conversation_id, actor_context)
-        if pending_mail_plan:
-            patched_mail_plan = patch_pending_mail_plan(
-                message=payload.message,
-                request_message=payload.message,
-                mail_plan=pending_mail_plan,
-            )
-            if patched_mail_plan.get("needs_clarification"):
-                return finalize(_build_mail_clarification_response(
-                    session_id=payload.session_id,
-                    conversation_id=conversation_id,
-                    message=payload.message,
-                    display_message=display_message,
-                    mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
-                    candidates=[],
-                    actor_context=actor_context,
-                ))
-            if patched_mail_plan.get("ok"):
-                return finalize(_build_mail_patch_response(
-                    session_id=payload.session_id,
-                    conversation_id=conversation_id,
-                    message=payload.message,
-                    display_message=display_message,
-                    mail_plan=dict(patched_mail_plan.get("mail_plan") or {}),
-                    patch_kind=str(patched_mail_plan.get("patch_kind") or "edit_pending_draft"),
-                    actor_context=actor_context,
-                ))
-        return finalize(_build_mail_clarification_response(
-            session_id=payload.session_id,
-            conversation_id=conversation_id,
-            message=payload.message,
-            display_message=display_message,
-            mail_plan={"missing_fields": ["pending_mail_draft"], "mail_action_type": "edit_pending_draft"},
-            candidates=[],
             actor_context=actor_context,
         ))
-    if multi_agent_dag_plan is None and looks_like_mail_action_request(payload.message) and not (
-        _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
-    ):
-        mail_action_plan = _build_mail_action_plan(payload, conversation_id, dict(upload_context or {}))
+    route_decision: dict[str, Any] | None = None
+    rule_mail_action_match = looks_like_mail_action_request(payload.message)
+    is_mail_status_query = _looks_like_outbound_mail_summary_query(payload.message) or _looks_like_inbound_mail_query(payload.message)
+    if multi_agent_dag_plan is None and not rule_mail_action_match and not is_mail_status_query:
+        route_decision = route_agent_request(
+            message=payload.message,
+            safe_message=payload.message,
+            upload_context=upload_context,
+        )
+    semantic_mail_action_match = str((route_decision or {}).get("intent") or "") == "mail_action"
+    if multi_agent_dag_plan is None and (rule_mail_action_match or semantic_mail_action_match) and not is_mail_status_query:
+        mail_action_plan = _build_mail_action_plan(payload, conversation_id, dict(upload_context or {}), actor_context=actor_context)
         if mail_action_plan.get("needs_clarification"):
             return finalize(_build_mail_clarification_response(
                 session_id=payload.session_id,
@@ -4892,11 +6317,12 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     if compound_response is not None:
         return finalize(compound_response)
 
-    route_decision = route_agent_request(
-        message=payload.message,
-        safe_message=payload.message,
-        upload_context=upload_context,
-    )
+    if route_decision is None:
+        route_decision = route_agent_request(
+            message=payload.message,
+            safe_message=payload.message,
+            upload_context=upload_context,
+        )
     if multi_agent_dag_plan is not None:
         route_decision = {
             **route_decision,
@@ -4971,6 +6397,12 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     result["permission_decision"] = permission_decision
     result["rate_limit_decision"] = rate_limit_decision
     result["queue_status"] = queue_status
+    _persist_confirmation_object(
+        session_id=payload.session_id,
+        conversation_id=conversation_id,
+        confirmation_payload=dict(result.get("confirmation_payload") or result.get("pending_confirmation") or {}),
+        actor_context=actor_context,
+    )
     result = attach_trace_evaluation(result, actor_context=actor_context)
     turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id, actor_context=actor_context)
     latency_ms = float(result["node_latencies_ms"]["total"])

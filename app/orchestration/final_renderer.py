@@ -42,6 +42,11 @@ Rules:
   - attachment_source=attachment_only means the attachment text must not be pasted into the email body.
   - reference_source=summarize_only means it may be summarized briefly but not copied verbatim.
   - body_source=user_explicit_only means only explicitly requested body content may be used as direct body text.
+  - assistant_answer_source=rewrite_for_recipient_if_user_explicit_reference means a prior assistant answer is reference material only when the user explicitly references it.
+- Respect compose_mode strictly:
+  - direct_body means preserve explicitly supplied body content unless the user asks for editing.
+  - recipient_ready_summary means rewrite the reference sources into a concise recipient-visible email body. Preserve supported facts, but remove assistant-answer framing, evidence disclaimers, conversational scaffolding, citations, and unrelated text.
+  - verbatim_copy means copy the explicitly selected source without rewriting because the user asked for exact forwarding.
 - For draft/confirmation/patch modes, produce a clean recipient-visible body in Chinese.
 - For clarification mode, produce a short clarification question and no body.
 - Do not mention internal tool names or controller logic.
@@ -232,13 +237,43 @@ def render_mail_authoring(
         "candidate_previews": candidate_previews,
         "observations": observations[-4:],
     }
-    try:
-        response = get_llm().invoke(
+    ok, response, invoke_error, retry_count = run_with_retry(
+        lambda: get_llm().invoke(
             [
                 SystemMessage(content=MAIL_AUTHORING_PROMPT),
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
             ]
+        ),
+        service="llm",
+        operation_name="mail_authoring",
+        attempts=2,
+        retry_delay_seconds=0.2,
+    )
+    if not ok or response is None:
+        error = str(invoke_error or "unknown LLM mail authoring failure")
+        record_llm_error("mail_authoring")
+        record_renderer_fallback("mail_authoring")
+        failure_observation = make_failure_observation(
+            service="llm",
+            operation="mail_authoring",
+            error=error,
+            fallback_strategy="return_mail_authoring_recovery_observation",
+            retry_count=retry_count,
         )
+        fallback = fallback_mail_authoring(
+            question=question,
+            render_mode=render_mode,
+            mail_plan=mail_plan,
+        )
+        return {
+            **fallback,
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+            "used_fallback": True,
+            "failure_observation": failure_observation,
+        }
+    try:
         token_in, token_out = normalize_usage(response)
         raw = str(getattr(response, "content", response)).strip()
         data = _parse_json_object(raw)
@@ -260,7 +295,9 @@ def render_mail_authoring(
             "estimated_cost": estimate_cost(token_in, token_out),
             "used_fallback": False,
         }
-    except Exception:
+    except Exception as exc:
+        record_llm_error("mail_authoring_parse")
+        record_renderer_fallback("mail_authoring_parse")
         fallback = fallback_mail_authoring(
             question=question,
             render_mode=render_mode,
@@ -272,6 +309,13 @@ def render_mail_authoring(
             "token_out": 0,
             "estimated_cost": 0.0,
             "used_fallback": True,
+            "failure_observation": make_failure_observation(
+                service="llm",
+                operation="mail_authoring_parse",
+                error=str(exc),
+                fallback_strategy="return_mail_authoring_recovery_observation",
+                retry_count=0,
+            ),
         }
 
 
@@ -384,6 +428,36 @@ def _trim_mail_plan_for_render(mail_plan: dict[str, Any]) -> dict[str, Any]:
         "body_constraints": dict(mail_plan.get("body_constraints") or {}),
         "body_sources": list(mail_plan.get("body_sources") or []),
         "source_policy": dict(mail_plan.get("source_policy") or {}),
+        "source_resolution": dict(mail_plan.get("source_resolution") or {}),
+        "source_artifacts": [
+            {
+                "role": str(item.get("role") or ""),
+                "kind": str(item.get("kind") or ""),
+                "candidate_id": str(item.get("candidate_id") or ""),
+                "source_turn_id": str(item.get("source_turn_id") or ""),
+                "filename": str(item.get("filename") or ""),
+            }
+            for item in list(mail_plan.get("source_artifacts") or [])[:5]
+        ],
+        "provenance_refs": [
+            {
+                "role": str(item.get("role") or ""),
+                "kind": str(item.get("kind") or ""),
+                "candidate_id": str(item.get("candidate_id") or ""),
+                "source_turn_id": str(item.get("source_turn_id") or ""),
+                "filename": str(item.get("filename") or ""),
+            }
+            for item in list(mail_plan.get("provenance_refs") or [])[:5]
+        ],
+        "compose_mode": str(mail_plan.get("compose_mode") or "direct_body"),
+        "reference_sources": [
+            {
+                "role": str(item.get("role") or ""),
+                "policy": str(item.get("policy") or ""),
+                "content": compact_text(str(item.get("content") or ""), 1800),
+            }
+            for item in list(mail_plan.get("reference_sources") or [])[:3]
+        ],
         "unsupported_reason": str(mail_plan.get("unsupported_reason") or ""),
         "unsupported_code": str(mail_plan.get("unsupported_code") or ""),
         "source_refs": list(mail_plan.get("source_refs") or []),

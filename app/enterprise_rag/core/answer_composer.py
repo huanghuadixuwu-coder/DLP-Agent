@@ -299,6 +299,8 @@ def _split_core_and_secondary_facts(
         if key in seen:
             continue
         seen.add(key)
+        if fact.metadata.get("entity_alignment_required") and not fact.metadata.get("entity_aligned"):
+            continue
         if _fact_matches_focus(fact, focus_labels):
             core.append(fact)
             continue
@@ -769,14 +771,28 @@ def compose_enterprise_answer(
     answer_slots = _build_answer_slots(core_facts) if answer_intent == "recommendation" else {}
     slot_coverage = _measure_slot_coverage(answer_slots) if answer_intent == "recommendation" else {}
     answer_plan = _build_answer_plan(answer_intent, answer_slots, question_focus)
+    entity_alignment_required = any(
+        bool(fact.metadata.get("entity_alignment_required"))
+        for fact in [*evidence.canonical_facts, *evidence.excluded_facts]
+    )
+    aligned_doc_ids = {
+        str(fact.metadata.get("doc_id") or "")
+        for fact in core_facts
+        if str(fact.metadata.get("doc_id") or "")
+    }
+    answer_citations = [
+        item
+        for item in evidence.citations
+        if not entity_alignment_required or item.doc_id in aligned_doc_ids
+    ]
     evidence_text = "\n\n".join(
         [
             f"[{index}] doc_id={item.doc_id} source={item.source_type} title={item.title}\n{item.snippet}"
-            for index, item in enumerate(evidence.citations, start=1)
+            for index, item in enumerate(answer_citations, start=1)
         ]
     )
-    visible_citations = _dedupe_visible_citations(evidence.citations)
-    visible_citation_objects = _dedupe_citation_objects(evidence.citations)
+    visible_citations = _dedupe_visible_citations(answer_citations)
+    visible_citation_objects = _dedupe_citation_objects(answer_citations)
 
     draft_answer = ""
     rewritten_answer = ""
@@ -834,7 +850,7 @@ def compose_enterprise_answer(
     return EnterpriseRagAnswer(
         answer=answer,
         citations=visible_citation_objects,
-        supporting_doc_ids=evidence.supporting_doc_ids,
+        supporting_doc_ids=sorted(aligned_doc_ids) if entity_alignment_required else evidence.supporting_doc_ids,
         missing_evidence=evidence.missing_evidence,
         confidence=evidence.confidence,
         supporting_facts=evidence.supporting_facts,

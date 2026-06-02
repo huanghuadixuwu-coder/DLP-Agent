@@ -71,6 +71,7 @@ def make_failure_observation(
     retry_count: int = 0,
     actor_context: dict[str, Any] | None = None,
     severity: str = "medium",
+    retryable: bool = True,
 ) -> dict[str, Any]:
     record_dependency_failure(service, operation, fallback_strategy)
     circuit = get_circuit_state(service).to_dict()
@@ -80,6 +81,7 @@ def make_failure_observation(
         "error": error,
         "fallback_strategy": fallback_strategy,
         "retry_count": retry_count,
+        "retryable": retryable,
         "circuit_state": circuit,
         "severity": severity,
     }

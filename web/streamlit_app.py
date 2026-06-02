@@ -11,8 +11,9 @@ import streamlit.components.v1 as components
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-EXTERNAL_API_URL = "http://localhost:8010"
-EXTERNAL_PROMETHEUS_URL = "http://localhost:9091"
+EXTERNAL_API_URL = os.getenv("PUBLIC_API_BASE_URL", "http://localhost:8010")
+EXTERNAL_PROMETHEUS_URL = os.getenv("PUBLIC_PROMETHEUS_BASE_URL", "http://localhost:9091")
+EXTERNAL_GOVERNANCE_URL = os.getenv("PUBLIC_GOVERNANCE_BASE_URL", "http://localhost:8512")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 
@@ -49,7 +50,7 @@ def friendly_api_error(exc: Exception) -> str:
     if isinstance(exc, httpx.ConnectError):
         return "API service unavailable. Check `docker compose ps` and the `api` logs."
     if isinstance(exc, httpx.TimeoutException):
-        return "API request timed out. Check whether the `api` service is healthy."
+        return "请求在客户端等待窗口内仍未完成。请刷新任务状态后再决定是否重试；治理台可查看 dependency_failure 与队列状态。"
     if isinstance(exc, httpx.HTTPStatusError):
         detail = exc.response.text.strip()
         return f"API request failed with HTTP {exc.response.status_code}.{f' {detail}' if detail else ''}"
@@ -307,6 +308,7 @@ def render_realtime_task_panel_v2(
     session_id: str,
     conversation_id: str | None,
     api_url: str,
+    governance_url: str,
     height: int = 820,
     *,
     preferred_task_id: str | None = None,
@@ -317,6 +319,7 @@ def render_realtime_task_panel_v2(
         "sessionId": session_id,
         "conversationId": conversation_id or "",
         "apiBase": api_url,
+        "governanceBase": governance_url,
         "preferredTaskId": preferred_task_id,
         "preferredFilter": preferred_filter,
         "focusNonce": focus_nonce,
@@ -734,7 +737,7 @@ def render_realtime_task_panel_v2(
                 </div>
               ` : ""}
               ${selected.status === "pending_approval" ? `
-                <div class="task-empty">该任务需要治理台审核。请在 8512 查看审批、驳回和审计详情；8511 仅展示用户侧进度。</div>
+                <div class="task-empty">该任务需要治理台审核。请打开 <a href="${escapeAttr(cfg.governanceBase)}" target="_blank" rel="noopener noreferrer">治理台</a> 查看审批、驳回和审计详情；当前页面仅展示用户侧进度。</div>
               ` : ""}
               <div class="detail-label" style="margin-top:12px;">最近事件</div>
               <div class="event-list">
@@ -961,11 +964,13 @@ with st.sidebar:
             st.rerun()
     st.caption(f"待治理: {pending_count} / 发送失败: {failed_count} / 全部任务: {len(tasks)}")
 
-    st.caption("8511 只展示用户侧任务进度和补充恢复；高风险审批、驳回、DLQ 重放和审计请打开 8512 治理台。")
+    st.caption("当前页面只展示用户侧任务进度和补充恢复；高风险审批、驳回、DLQ 重放和审计请打开独立治理台。")
+    st.link_button("打开治理台", EXTERNAL_GOVERNANCE_URL, use_container_width=True)
     render_realtime_task_panel_v2(
         st.session_state.session_id,
         st.session_state.current_conversation_id,
         EXTERNAL_API_URL,
+        EXTERNAL_GOVERNANCE_URL,
         preferred_task_id=st.session_state.task_panel_preferred_task_id,
         preferred_filter=st.session_state.task_panel_filter,
         focus_nonce=st.session_state.task_panel_focus_nonce,
@@ -1119,7 +1124,7 @@ with right:
     st.subheader("本轮状态")
     debug = st.session_state.last_debug or {}
     if not debug:
-        st.caption("发起一次对话后，这里会显示用户侧状态摘要。完整治理、DLQ、Provider、Queue 与诊断请打开 8512。")
+        st.caption("发起一次对话后，这里会显示用户侧状态摘要。完整治理、DLQ、Provider、Queue 与诊断请打开独立治理台。")
     else:
         st.metric("Route", debug.get("routing_source", debug.get("intent", "unknown")))
         if debug.get("task_id"):
@@ -1127,9 +1132,9 @@ with right:
             st.metric("Task Status", debug.get("task_status", ""))
             st.metric("Delivery", debug.get("delivery_status", ""))
             if debug.get("task_status") == "pending_approval":
-                st.info("该任务正在等待治理台审核。8511 不提供高风险审批按钮。")
+                st.info("该任务正在等待治理台审核。用户工作台不提供高风险审批按钮。")
             if debug.get("delivery_error"):
                 st.error(debug["delivery_error"])
         if debug.get("latency_ms"):
-            st.caption(f"本轮响应耗时约 {debug.get('latency_ms'):.0f} ms。成本、token 和原始 trace 已迁移到 8512 治理台/Prometheus。")
+            st.caption(f"本轮响应耗时约 {debug.get('latency_ms'):.0f} ms。成本、token 和原始 trace 已迁移到独立治理台/Prometheus。")
 

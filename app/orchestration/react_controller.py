@@ -810,15 +810,28 @@ def _call_tool(
         "error": error,
         "result": payload,
     }
-    citations = list(payload.get("citations") or payload.get("evidence", {}).get("citations", []))
     state.setdefault("tool_calls", []).append(call_record)
+    observation_payload = (
+        dict(payload.get("enterprise_answer_observation") or {})
+        if tool_name == "enterprise_rag_query"
+        else payload
+    )
+    if tool_name == "enterprise_rag_query" and not observation_payload:
+        observation_payload = payload
+    citations = (
+        list(observation_payload.pop("citations_brief", []) or [])
+        if tool_name == "enterprise_rag_query"
+        else list(payload.get("citations") or payload.get("evidence", {}).get("citations", []))
+    )
+    if tool_name == "enterprise_rag_query":
+        observation_payload.pop("retrieval_summary", None)
     tool_observation = make_typed_observation(
         observation_type=definition.returns_observation_type,
         source=tool_name,
         status="completed" if success else "failed",
         grounding_kind="tool",
         summary=summary,
-        payload=payload,
+        payload=observation_payload,
         provenance={"source": tool_name, "reads_from": definition.reads_from, "writes_to": definition.writes_to},
         confidence=0.92 if success else 0.25,
         citations=citations,

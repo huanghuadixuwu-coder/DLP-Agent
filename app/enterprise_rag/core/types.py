@@ -60,6 +60,7 @@ class RetrievalPlan:
     budget_profile: str = "medium"
     dense_top_k: int = 40
     sparse_top_k: int = 20
+    rerank_candidate_top_k: int = 18
     rerank_top_k: int = 8
     evidence_top_k: int = 5
     require_evidence: bool = True

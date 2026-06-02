@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
     api_base_url: str = Field(default="http://localhost:8000", alias="API_BASE_URL")
+    cors_allow_origins: str = Field(
+        default="http://localhost:8511,http://127.0.0.1:8511,http://localhost:8501,http://127.0.0.1:8501",
+        alias="CORS_ALLOW_ORIGINS",
+    )
 
     llm_base_url: str = Field(default="https://open.bigmodel.cn/api/paas/v4", alias="LLM_BASE_URL")
     llm_model_main: str = Field(default="glm-4.5-air", alias="LLM_MODEL_MAIN")
@@ -32,6 +36,7 @@ class Settings(BaseSettings):
     enterprise_embedding_local_dir: str = Field(default="/app/external-models/bge-m3", alias="ENTERPRISE_EMBEDDING_LOCAL_DIR")
     enterprise_reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3", alias="ENTERPRISE_RERANKER_MODEL")
     enterprise_reranker_local_dir: str = Field(default="/app/external-models/bge-reranker-v2-m3", alias="ENTERPRISE_RERANKER_LOCAL_DIR")
+    enterprise_reranker_soft_budget_seconds: float = Field(default=15.0, alias="ENTERPRISE_RERANKER_SOFT_BUDGET_SECONDS")
 
     chroma_host: str = Field(default="localhost", alias="CHROMA_HOST")
     chroma_port: int = Field(default=8000, alias="CHROMA_PORT")
@@ -55,7 +60,7 @@ class Settings(BaseSettings):
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
     langsmith_project: str = Field(default="leetcode-rag-agent", alias="LANGSMITH_PROJECT")
     langsmith_endpoint: str = Field(default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT")
-    langsmith_tracing: bool = Field(default=True, alias="LANGSMITH_TRACING")
+    langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
 
     model_input_cost_per_1m: float = Field(default=0.8, alias="MODEL_INPUT_COST_PER_1M")
     model_output_cost_per_1m: float = Field(default=2.0, alias="MODEL_OUTPUT_COST_PER_1M")

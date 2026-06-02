@@ -248,6 +248,8 @@ class EnterpriseRagQueryResponse(BaseModel):
     rerank_debug: list[dict[str, Any]] = Field(default_factory=list)
     evidence_fact_hits: list[str] = Field(default_factory=list)
     answer_debug: dict[str, Any] = Field(default_factory=dict)
+    enterprise_answer_observation: dict[str, Any] = Field(default_factory=dict)
+    stage_latencies_ms: dict[str, float] = Field(default_factory=dict)
     context_sources: list[str] = Field(default_factory=list)
     workspace_memory_hits: int = 0
     transcript_hits: int = 0

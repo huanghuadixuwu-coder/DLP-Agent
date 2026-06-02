@@ -15,7 +15,7 @@ from app.config import get_settings
 
 
 INIT_DDL_LOCK_KEY = 86420533
-ACTIVE_DRAFT_STATUSES = {"draft", "draft_ready", "needs_clarification", "pending_confirmation", "patch"}
+ACTIVE_DRAFT_STATUSES = {"draft", "draft_ready", "needs_clarification", "pending_confirmation", "patch", "authoring_failed"}
 _INITIALIZED = False
 _INIT_LOCK = Lock()
 
@@ -136,7 +136,7 @@ def upsert_mail_draft(
               AND user_id = %s
               AND conversation_id = %s
               AND draft_id <> %s
-              AND status IN ('draft', 'draft_ready', 'needs_clarification', 'pending_confirmation', 'patch')
+              AND status IN ('draft', 'draft_ready', 'needs_clarification', 'pending_confirmation', 'patch', 'authoring_failed')
             """,
             (now, actor.tenant_id, actor.workspace_id, actor.user_id, conversation_id, draft_id),
         )
@@ -251,6 +251,31 @@ def bind_mail_draft_task(
               AND status IN ('pending_confirmation', 'queued_dlp')
             """,
             (task_id, now, draft_id, actor.tenant_id, actor.workspace_id, actor.user_id, confirmation_key),
+        )
+        conn.commit()
+    return get_mail_draft(draft_id, actor_context=actor.to_dict())
+
+
+def cancel_mail_draft(
+    draft_id: str,
+    *,
+    actor_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    init_mail_draft_store()
+    actor = actor_from_mapping(actor_context or {})
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE mail_drafts
+            SET status = 'cancelled', updated_at = %s
+            WHERE draft_id = %s
+              AND tenant_id = %s
+              AND workspace_id = %s
+              AND user_id = %s
+              AND status IN ('draft', 'draft_ready', 'needs_clarification', 'pending_confirmation', 'patch', 'authoring_failed')
+            """,
+            (now, draft_id, actor.tenant_id, actor.workspace_id, actor.user_id),
         )
         conn.commit()
     return get_mail_draft(draft_id, actor_context=actor.to_dict())

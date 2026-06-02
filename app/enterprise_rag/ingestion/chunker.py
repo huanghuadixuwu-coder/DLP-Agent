@@ -6,7 +6,7 @@ from typing import Callable, Iterable
 from app.config import get_settings
 from app.enterprise_rag.core.types import ENTERPRISE_COLLECTION_VERSION, ENTERPRISE_DOMAIN, EnterpriseChunk, EnterpriseDocument
 from app.enterprise_rag.libs.metadata import chroma_safe_metadata
-from app.enterprise_rag.libs.text_cleaning import clean_text
+from app.enterprise_rag.libs.text_cleaning import clean_text, normalize_serialized_content
 
 
 SOURCE_CHUNK_SIZES = {
@@ -35,7 +35,7 @@ HEADING_RE = re.compile(r"^(#{1,6}\s+.+|[A-Z][A-Za-z0-9 /&()_-]{2,80}\n[-=]{3,}|
 
 
 def chunk_document(document: EnterpriseDocument, *, overlap: int = 120) -> list[EnterpriseChunk]:
-    raw_content = str(document.content or "").replace("\x00", " ").replace("\r\n", "\n").replace("\r", "\n").strip()
+    raw_content = normalize_serialized_content(document.content).replace("\r\n", "\n").replace("\r", "\n").strip()
     if not document.doc_id or not raw_content:
         return []
 

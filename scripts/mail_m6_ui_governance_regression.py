@@ -34,11 +34,12 @@ def assert_ui_contract() -> None:
     user_workspace = (ROOT / "web" / "streamlit_app.py").read_text(encoding="utf-8")
 
     assert_true("governance-web:" in compose, "docker-compose must define governance-web service")
-    assert_true('"8512:8501"' in compose or "- \"8512:8501\"" in compose, "governance-web must expose 8512")
-    assert_true("/admin/mail-dlq" in governance_console, "8512 governance console must expose DLQ diagnostics")
-    assert_true("/admin/mail-provider-health" in governance_console, "8512 governance console must expose provider health")
-    assert_true("/admin/queue-health" in governance_console, "8512 governance console must expose queue health")
-    assert_true("/tasks/{task.get('task_id')}/approve" in governance_console, "8512 governance console must own approval controls")
+    assert_true("GOVERNANCE_WEB_HOST_PORT" in compose, "governance-web host port must be configurable")
+    assert_true("PUBLIC_GOVERNANCE_BASE_URL" in user_workspace, "user workspace must use a configurable governance URL")
+    assert_true("/admin/mail-dlq" in governance_console, "governance console must expose DLQ diagnostics")
+    assert_true("/admin/mail-provider-health" in governance_console, "governance console must expose provider health")
+    assert_true("/admin/queue-health" in governance_console, "governance console must expose queue health")
+    assert_true("/tasks/{task.get('task_id')}/approve" in governance_console, "governance console must own approval controls")
 
     v2_start = user_workspace.index("def render_realtime_task_panel_v2")
     v2_end = user_workspace.index('if "session_id" not in st.session_state:')
@@ -48,7 +49,7 @@ def assert_ui_contract() -> None:
     assert_true("治理台审核" in v2_block, "8511 task panel must show waiting-for-governance-review")
     assert_true("批准并真实发送" not in v2_block, "8511 v2 task panel must not expose high-risk approve button")
     assert_true("驳回并终止" not in v2_block, "8511 v2 task panel must not expose high-risk reject button")
-    assert_true("完整治理、DLQ、Provider、Queue 与诊断请打开 8512" in user_workspace, "8511 debug must point to 8512")
+    assert_true("完整治理、DLQ、Provider、Queue 与诊断请打开独立治理台" in user_workspace, "user workspace must point to the independent governance console")
 
 
 def assert_admin_endpoints() -> None:

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from time import perf_counter
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import get_settings
 from app.conversation_memory import is_memory_follow_up
+from app.enterprise_rag.libs.scoring import extract_query_entity_anchors
 from app.graph import get_llm
 from app.upload_analysis import infer_upload_task_type, looks_like_explicit_outbound_request
 
@@ -30,10 +32,17 @@ Rules:
 - Use fast for uploaded document summarize/qa/critique/rewrite/action-item extraction.
 - Use fast for previous-conversation recall and remembered preference questions.
 - Use fast for mailbox status or task status lookups.
+- Use fast with intent=mail_action for outbound draft, send, reply, forward, or mail-edit requests. Interpret natural phrasing semantically; do not require a fixed send keyword.
+- Route by requested capability, not by whether every downstream mail field is already resolved. A request to deliver, forward, or transfer prior information to an email recipient is mail_action even when the body source is referential or ambiguous. The Mail Agent will resolve the source or ask its own clarification question.
 - Use fast for clear enterprise fact questions that should directly call enterprise_rag_query.
 - Use fast for greetings, self-introduction, capability questions, and simple chit-chat.
 - Use slow only for mixed, multi-step, ambiguous, or planning-heavy requests.
 - If the answer needs external facts, set required_grounding to memory, tool, or retrieval. Never leave it as none in that case.
+
+Examples:
+- "把该信息发送给 user@example.com" -> {"route_mode":"fast","intent":"mail_action","required_grounding":"tool","recommended_tool":"mail_action_resolve"}
+- "劳烦将前面提到的方案转交至 user@example.com" -> {"route_mode":"fast","intent":"mail_action","required_grounding":"tool","recommended_tool":"mail_action_resolve"}
+- "把前两轮讨论整理后发给 user@example.com" -> {"route_mode":"fast","intent":"mail_action","required_grounding":"tool","recommended_tool":"mail_action_resolve"}
 """
 
 
@@ -122,6 +131,38 @@ CONTEXTUAL_MEMORY_HINTS = (
     "remember what we talked about",
 )
 
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+SAFE_REFERENTIAL_MAIL_MARKERS = (
+    "该信息",
+    "该方案",
+    "这个方案",
+    "上述",
+    "前面提到",
+    "刚才提到",
+    "this information",
+    "that information",
+    "this solution",
+    "that solution",
+)
+
+FACT_QUESTION_MARKERS = (
+    "?",
+    "？",
+    "是什么",
+    "如何",
+    "怎么",
+    "哪些",
+    "多少",
+    "时限",
+    "顺序",
+    "what ",
+    "how ",
+    "which ",
+    "when ",
+    "where ",
+    "why ",
+)
+
 
 def route_agent_request(
     *,
@@ -129,26 +170,54 @@ def route_agent_request(
     safe_message: str,
     upload_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    started = perf_counter()
+
+    def _finish(decision: dict[str, Any]) -> dict[str, Any]:
+        decision["router_latency_ms"] = round((perf_counter() - started) * 1000.0, 2)
+        return decision
+
     settings = get_settings()
     upload_context = dict(upload_context or {})
+    heuristic = _heuristic_router_decision(message=message, safe_message=safe_message, upload_context=upload_context)
+    if _is_high_confidence_heuristic_route(heuristic, message=safe_message or message):
+        heuristic["routing_source"] = "fast_router_heuristic"
+        heuristic["degraded_from"] = "none"
+        return _finish(heuristic)
     if settings.enable_fast_path_router:
         try:
-            return _llm_router_decision(message=message, safe_message=safe_message, upload_context=upload_context)
+            return _finish(_llm_router_decision(message=message, safe_message=safe_message, upload_context=upload_context))
         except Exception:
-            decision = _heuristic_router_decision(message=message, safe_message=safe_message, upload_context=upload_context)
-            decision["degraded_from"] = "router"
-            decision["routing_source"] = "fast_router_fallback"
-            return decision
-    decision = _heuristic_router_decision(message=message, safe_message=safe_message, upload_context=upload_context)
-    decision["routing_source"] = "fast_router_disabled"
-    return decision
+            heuristic["degraded_from"] = "router"
+            heuristic["routing_source"] = "fast_router_fallback"
+            return _finish(heuristic)
+    heuristic["routing_source"] = "fast_router_disabled"
+    return _finish(heuristic)
+
+
+def _is_high_confidence_heuristic_route(decision: dict[str, Any], *, message: str) -> bool:
+    intent = str(decision.get("intent") or "")
+    if float(decision.get("confidence") or 0.0) >= 0.9:
+        return True
+    if intent != "enterprise_fact":
+        return False
+    text = (message or "").lower()
+    return sum(1 for hint in ENTERPRISE_HINTS if _matches_hint(message, text, hint)) >= 2
+
+
+def _matches_hint(text: str, lowered: str, hint: str) -> bool:
+    normalized_hint = str(hint or "").strip().lower()
+    if not normalized_hint:
+        return False
+    if len(normalized_hint) <= 3 and normalized_hint.isascii() and normalized_hint.isalpha():
+        return bool(re.search(rf"\b{re.escape(normalized_hint)}\b", lowered))
+    return normalized_hint in lowered or normalized_hint in text
 
 
 def _llm_router_decision(*, message: str, safe_message: str, upload_context: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     llm = get_llm(
         model=settings.llm_model_router,
-        timeout=settings.llm_router_timeout_seconds,
+        timeout=max(settings.llm_router_timeout_seconds, 1.0),
         temperature=0.0,
         max_retries=settings.llm_router_max_retries,
     )
@@ -191,11 +260,24 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
             "degraded_from": "router",
         }
 
-    if is_memory_follow_up(text) or any(hint in lowered or hint in text for hint in CONTEXTUAL_MEMORY_HINTS):
+    if looks_like_explicit_outbound_request(text) or _looks_like_safe_degraded_mail_action(text):
+        return {
+            "route_mode": "fast",
+            "intent": "mail_action",
+            "required_grounding": "tool",
+            "recommended_tool": "mail_action_resolve",
+            "recommended_tool_input": {},
+            "router_reason": "The request should enter the Mail Agent. Downstream source resolution remains responsible for selecting or clarifying the outbound body.",
+            "confidence": 0.82,
+            "routing_source": "fast_router_fallback",
+            "degraded_from": "router",
+        }
+
+    if is_memory_follow_up(text) or any(_matches_hint(text, lowered, hint) for hint in CONTEXTUAL_MEMORY_HINTS):
         recommended_tool = "conversation_recent"
-        if any(hint in text or hint in lowered for hint in PREFERENCE_HINTS):
+        if any(_matches_hint(text, lowered, hint) for hint in PREFERENCE_HINTS):
             recommended_tool = "user_model"
-        elif any(hint in text or hint in lowered for hint in WORKSPACE_MEMORY_HINTS):
+        elif any(_matches_hint(text, lowered, hint) for hint in WORKSPACE_MEMORY_HINTS):
             recommended_tool = "workspace_memory"
         elif any(marker in text for marker in ("之前聊了什么", "之前讨论", "总结一下之前")):
             recommended_tool = "conversation_summary"
@@ -211,7 +293,7 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
             "degraded_from": "router",
         }
 
-    if any(hint in text or hint in lowered for hint in MAILBOX_HINTS):
+    if any(_matches_hint(text, lowered, hint) for hint in MAILBOX_HINTS):
         recommended_tool = "inbound_mail_summary"
         if "发了多少" in text or "外发" in text or "sent" in lowered:
             recommended_tool = "outbound_mail_summary"
@@ -229,7 +311,7 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
             "degraded_from": "router",
         }
 
-    if any(hint in text or hint in lowered for hint in PERSONA_HINTS):
+    if any(_matches_hint(text, lowered, hint) for hint in PERSONA_HINTS):
         return {
             "route_mode": "fast",
             "intent": "persona",
@@ -242,7 +324,7 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
             "degraded_from": "router",
         }
 
-    if any(hint in text or hint in lowered for hint in ENTERPRISE_HINTS):
+    if any(_matches_hint(text, lowered, hint) for hint in ENTERPRISE_HINTS):
         return {
             "route_mode": "fast",
             "intent": "enterprise_fact",
@@ -251,6 +333,19 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
             "recommended_tool_input": {},
             "router_reason": "The request looks like a grounded enterprise fact question that should directly retrieve evidence.",
             "confidence": 0.88,
+            "routing_source": "fast_router_fallback",
+            "degraded_from": "router",
+        }
+
+    if extract_query_entity_anchors(text) and any(marker in text or marker in lowered for marker in FACT_QUESTION_MARKERS):
+        return {
+            "route_mode": "fast",
+            "intent": "enterprise_fact",
+            "required_grounding": "retrieval",
+            "recommended_tool": "enterprise_rag_query",
+            "recommended_tool_input": {},
+            "router_reason": "The request is a fact question with a distinctive entity identifier and should retrieve bounded enterprise evidence directly.",
+            "confidence": 0.9,
             "routing_source": "fast_router_fallback",
             "degraded_from": "router",
         }
@@ -266,6 +361,14 @@ def _heuristic_router_decision(*, message: str, safe_message: str, upload_contex
         "routing_source": "fast_router_fallback",
         "degraded_from": "router",
     }
+
+
+def _looks_like_safe_degraded_mail_action(message: str) -> bool:
+    text = (message or "").strip()
+    lowered = text.lower()
+    if not EMAIL_PATTERN.search(text):
+        return False
+    return any(marker in text or marker in lowered for marker in SAFE_REFERENTIAL_MAIL_MARKERS)
 
 
 def _normalize_router_decision(
@@ -297,7 +400,7 @@ def _normalize_router_decision(
     if normalized["required_grounding"] not in {"none", "memory", "tool", "retrieval"}:
         normalized["required_grounding"] = "none"
 
-    enterprise_hits = sum(1 for hint in ENTERPRISE_HINTS if hint in text or hint in lowered)
+    enterprise_hits = sum(1 for hint in ENTERPRISE_HINTS if _matches_hint(text, lowered, hint))
     if enterprise_hits >= 2 and not is_memory_follow_up(text):
         normalized.update(
             {
@@ -342,9 +445,9 @@ def _normalize_router_decision(
 
 def _memory_tool_for_message(message: str) -> str:
     lowered = message.lower()
-    if any(hint in message or hint in lowered for hint in PREFERENCE_HINTS):
+    if any(_matches_hint(message, lowered, hint) for hint in PREFERENCE_HINTS):
         return "user_model"
-    if any(hint in message or hint in lowered for hint in WORKSPACE_MEMORY_HINTS):
+    if any(_matches_hint(message, lowered, hint) for hint in WORKSPACE_MEMORY_HINTS):
         return "workspace_memory"
     if any(marker in message for marker in ("之前聊了什么", "之前讨论", "总结一下之前")):
         return "conversation_summary"

@@ -1041,6 +1041,17 @@ def enterprise_rag_benchmark_task(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+@celery_app.task(name="app.task_worker.write_conversation_memory_summary_task")
+def write_conversation_memory_summary_task(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.conversation_memory import write_turn_summary
+    from app.metrics import record_turn_summary_write
+
+    written = write_turn_summary(**dict(payload or {}))
+    if written:
+        record_turn_summary_write()
+    return {"ok": bool(written), "written": bool(written)}
+
+
 @celery_app.task(
     bind=True,
     base=GovernedTaskBase,

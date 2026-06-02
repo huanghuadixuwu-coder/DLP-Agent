@@ -21,16 +21,16 @@ SOURCE_HINTS = {
 
 QUESTION_TYPE_HINTS = {
     "conflicting": ("conflicting", "contradict", "冲突", "不一致", "相互矛盾"),
-    "constrained": ("default", "limit", "限制", "最大", "最小", "policy", "规定", "recommend"),
-    "semantic": ("why", "how", "recommend", "建议", "原因", "处理", "flow", "onboarding"),
+    "constrained": ("default", "limit", "限制", "时限", "上限", "最大", "最小", "policy", "规定", "recommend", "切换"),
+    "semantic": ("why", "how", "recommend", "建议", "原因", "处理", "流程", "顺序", "故障转移", "flow", "onboarding"),
     "info_not_found": ("not found", "unknown", "有没有提到", "是否提到"),
 }
 
 BUDGET_PROFILES = {
-    "small": {"dense_top_k": 24, "sparse_top_k": 12, "rerank_top_k": 6, "evidence_top_k": 4},
-    "medium": {"dense_top_k": 40, "sparse_top_k": 24, "rerank_top_k": 10, "evidence_top_k": 5},
-    "large": {"dense_top_k": 60, "sparse_top_k": 40, "rerank_top_k": 16, "evidence_top_k": 8},
-    "expanded": {"dense_top_k": 80, "sparse_top_k": 60, "rerank_top_k": 20, "evidence_top_k": 10},
+    "small": {"dense_top_k": 24, "sparse_top_k": 12, "rerank_candidate_top_k": 8, "rerank_top_k": 6, "evidence_top_k": 4},
+    "medium": {"dense_top_k": 40, "sparse_top_k": 24, "rerank_candidate_top_k": 12, "rerank_top_k": 10, "evidence_top_k": 5},
+    "large": {"dense_top_k": 60, "sparse_top_k": 40, "rerank_candidate_top_k": 16, "rerank_top_k": 16, "evidence_top_k": 8},
+    "expanded": {"dense_top_k": 80, "sparse_top_k": 60, "rerank_candidate_top_k": 20, "rerank_top_k": 20, "evidence_top_k": 10},
 }
 
 
@@ -85,6 +85,7 @@ def build_retrieval_plan(question: str, *, source_types: list[str] | None = None
         budget_profile=budget_profile,
         dense_top_k=budget["dense_top_k"],
         sparse_top_k=budget["sparse_top_k"],
+        rerank_candidate_top_k=budget["rerank_candidate_top_k"],
         rerank_top_k=budget["rerank_top_k"],
         evidence_top_k=budget["evidence_top_k"],
         require_evidence=True,
@@ -99,6 +100,7 @@ def expand_retrieval_plan(plan: RetrievalPlan) -> RetrievalPlan:
         budget_profile="expanded",
         dense_top_k=max(plan.dense_top_k, budget["dense_top_k"]),
         sparse_top_k=max(plan.sparse_top_k, budget["sparse_top_k"]),
+        rerank_candidate_top_k=max(plan.rerank_candidate_top_k, budget["rerank_candidate_top_k"]),
         rerank_top_k=max(plan.rerank_top_k, budget["rerank_top_k"]),
         evidence_top_k=max(plan.evidence_top_k, budget["evidence_top_k"]),
         expansion_enabled=False,

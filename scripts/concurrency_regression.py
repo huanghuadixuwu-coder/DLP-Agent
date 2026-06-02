@@ -16,10 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.enterprise_rag.core.types import EnterpriseDocument  # noqa: E402
-from app.enterprise_rag.ingestion.indexer import upsert_enterprise_documents_hybrid  # noqa: E402
-
-
 BASE_URL = (os.getenv("API_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
 RECIPIENT = os.getenv("REGRESSION_RECIPIENT") or os.getenv("SMTP_USER") or "17388861183@163.com"
 TIMEOUT = httpx.Timeout(240.0, connect=30.0)
@@ -157,36 +153,12 @@ def _metrics_snapshot() -> dict[str, Any]:
     return {name: lines[:12] for name, lines in selected.items() if lines}
 
 
-def _seed_rag_doc(run_id: str) -> dict[str, Any]:
-    doc_id = f"l3_concurrency_doc_{run_id}"
-    marker = f"gamma-{run_id}"
-    content = (
-        f"Concurrency regression marker {marker}. "
-        "The enterprise onboarding owner for this marker is Codex L3 Queue Sentinel. "
-        "The recommended operational response is to keep API requests bounded, observe queue depth, "
-        "and let Celery workers consume mail send tasks asynchronously."
-    )
-    details = upsert_enterprise_documents_hybrid(
-        [
-            EnterpriseDocument(
-                doc_id=doc_id,
-                source_type="google_drive",
-                title=f"L3 concurrency regression note {run_id}",
-                content=content,
-                metadata={
-                    "tenant_id": ACTOR["tenant_id"],
-                    "user_id": ACTOR["user_id"],
-                    "workspace_id": ACTOR["workspace_id"],
-                    "source_type": "google_drive",
-                    "business_domain": "regression",
-                },
-            )
-        ],
-        replace_existing=True,
-        return_details=True,
-        actor_context={**_actor_payload(), "session_id": f"seed_{run_id}"},
-    )
-    return {"doc_id": doc_id, "marker": marker, "details": details}
+RAG_SMOKE_DOC_ID = "dsid_6c4c1c875e704f09b4d791d64d7bc7e5"
+RAG_SMOKE_QUESTION = (
+    "In the meeting about onboarding a SaaS product to Google Cloud Marketplace, "
+    "what did the GCP team recommend for handling delays where a new subscription "
+    "entitlement is not immediately available during the customer onboarding flow?"
+)
 
 
 def _prepare_pending_mail(session_id: str, conversation_id: str, run_id: str) -> dict[str, Any]:
@@ -254,14 +226,17 @@ def main() -> int:
     chat_conversation = _create_conversation(session_id, "L3 concurrency chat")
     rag_conversation = _create_conversation(session_id, "L3 concurrency RAG")
     mail_conversation = _create_conversation(session_id, "L3 concurrency mail")
-    rag_seed = _seed_rag_doc(run_id)
+    rag_fixture = {
+        "doc_id": RAG_SMOKE_DOC_ID,
+        "source": "deterministic_enterprise_rag_slice",
+        "read_only": True,
+    }
 
     before_queue = _queue_health()
     before_metrics = _metrics_snapshot()
     pending_mail = _prepare_pending_mail(session_id, mail_conversation, run_id)
 
-    marker = str(rag_seed["marker"])
-    doc_id = str(rag_seed["doc_id"])
+    doc_id = str(rag_fixture["doc_id"])
 
     def agent_chat_job(index: int) -> dict[str, Any]:
         response = _chat(
@@ -281,7 +256,7 @@ def main() -> int:
             "POST",
             "/enterprise-rag/query",
             json={
-                "question": f"For concurrency marker {marker}, who is the enterprise onboarding owner?",
+                "question": RAG_SMOKE_QUESTION,
                 "top_k": 8,
                 "session_id": session_id,
                 "conversation_id": rag_conversation,
@@ -369,7 +344,7 @@ def main() -> int:
         "run_id": run_id,
         "max_workers": MAX_WORKERS,
         "total_latency_ms": round((time.perf_counter() - started) * 1000, 2),
-        "rag_seed": rag_seed,
+        "rag_fixture": rag_fixture,
         "conversations": {
             "chat": chat_conversation,
             "rag": rag_conversation,

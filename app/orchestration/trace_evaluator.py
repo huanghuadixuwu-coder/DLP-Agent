@@ -24,6 +24,8 @@ def evaluate_agent_trace(result: dict[str, Any], actor_context: dict[str, Any] |
     issues.extend(_check_heavy_tool_overuse(tool_counts))
     issues.extend(_check_failure_recovery(result, observations, tool_calls))
     issues.extend(_check_multi_agent_trace(observations, tool_calls))
+    issues.extend(_check_pending_object_transition(result, tool_calls))
+    issues.extend(_check_mail_confirmation_renderer_contract(result, observations))
 
     severity_score = {"low": 1, "medium": 3, "high": 6}
     penalty = sum(severity_score.get(str(issue.get("severity") or "low"), 1) for issue in issues)
@@ -44,6 +46,8 @@ def evaluate_agent_trace(result: dict[str, Any], actor_context: dict[str, Any] |
             "heavy_tool_budget",
             "failure_recovery",
             "multi_agent_dag_trace",
+            "pending_object_transition",
+            "mail_confirmation_renderer_contract",
         ],
     }
 
@@ -242,6 +246,55 @@ def _check_multi_agent_trace(observations: list[dict[str, Any]], tool_calls: lis
             }
         )
     return issues
+
+
+def _check_pending_object_transition(result: dict[str, Any], tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    task_plan = dict(result.get("task_plan") or {})
+    state = dict(task_plan.get("continuation_state") or {})
+    decision = dict(state.get("decision") or {})
+    active_objects = list(state.get("active_objects") or [])
+    has_pending_confirmation = any(
+        str(item.get("object_type") or "") in {"mail_confirmation", "domain_confirmation"}
+        and str(item.get("status") or "") == "pending_confirmation"
+        for item in active_objects
+        if isinstance(item, dict)
+    )
+    if not has_pending_confirmation or str(decision.get("mode") or "") == "continue_existing":
+        return []
+    bypassed = [
+        str(call.get("tool_name") or "")
+        for call in tool_calls
+        if bool(call.get("success"))
+        and str(call.get("status") or "") not in {"confirmation_required", "pending_confirmation"}
+        and _is_side_effect_action(str(call.get("tool_name") or ""))
+    ]
+    if not bypassed:
+        return []
+    return [
+        {
+            "code": "pending_confirmation_bypassed_by_new_side_effect",
+            "severity": "high",
+            "detail": "A new side-effectful tool completed while an existing pending confirmation remained unresolved: "
+            + ", ".join(bypassed),
+        }
+    ]
+
+
+def _check_mail_confirmation_renderer_contract(result: dict[str, Any], observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    final_answer_source = str(result.get("final_answer_source") or "")
+    tool_names = {str(call.get("tool_name") or "") for call in list(result.get("tool_calls") or [])}
+    if final_answer_source != "mail_task_created_renderer" and "enqueue_dlp_risk_task" not in tool_names:
+        return []
+    observation_types = {str(item.get("observation_type") or "") for item in observations}
+    if "task_status_result" in observation_types and "governed_mail_task_created" not in observation_types:
+        return [
+            {
+                "code": "mail_confirmation_renderer_lost_source_artifact",
+                "severity": "medium",
+                "detail": "Mail confirmation created a governed task, but the renderer trace lacks the preserved mail/source-artifact observation.",
+            }
+        ]
+    return []
 
 
 def _side_effect_action_keys(

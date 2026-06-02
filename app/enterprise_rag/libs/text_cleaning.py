@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 
 
@@ -8,8 +9,27 @@ INLINE_WHITESPACE_RE = re.compile(r"[^\S\r\n]+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?\u3002\uff01\uff1f])\s+")
 
 
+def normalize_serialized_content(value: str) -> str:
+    """Flatten dataset cells that contain serialized lists of source messages."""
+    raw = str(value or "").replace("\x00", " ")
+    stripped = raw.strip()
+    if stripped.startswith(("[", "(")) and stripped.endswith(("]", ")")):
+        try:
+            parsed = ast.literal_eval(stripped)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, (list, tuple)) and all(isinstance(item, str) for item in parsed):
+            raw = "\n\n".join(item for item in parsed if item)
+
+    # Older indexes may contain fixed-window fragments from a serialized list.
+    # Decode escaped line breaks only when they dominate the source fragment.
+    if raw.count("\\n") >= 2 and raw.count("\n") <= 1:
+        raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    return raw
+
+
 def clean_text(value: str, *, limit: int | None = None, preserve_structure: bool = False) -> str:
-    raw = (value or "").replace("\x00", " ").replace("\r\n", "\n").replace("\r", "\n")
+    raw = normalize_serialized_content(value).replace("\r\n", "\n").replace("\r", "\n")
     if preserve_structure:
         lines = [INLINE_WHITESPACE_RE.sub(" ", line).strip() for line in raw.split("\n")]
         text = "\n".join(lines)

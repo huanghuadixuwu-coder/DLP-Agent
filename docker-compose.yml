@@ -20,6 +20,7 @@ services:
     volumes:
       - .:/app
       - ./external-models:/app/external-models
+      - ${ENTERPRISE_DATASET_HOST_ROOT:-./data/enterprise-datasets}:/datasets/enterprise-rag-bench:ro
 
   worker:
     build:
@@ -27,11 +28,12 @@ services:
       dockerfile: Dockerfile
     command: >-
       sh -c "
-      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=dlp_risk_queue --concurrency=$${RISK_WORKER_CONCURRENCY:-4} &
-      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=email_send_queue --concurrency=$${EMAIL_WORKER_CONCURRENCY:-2} &
-      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=mail_inbound_queue --concurrency=$${MAIL_WORKER_CONCURRENCY:-1} &
-      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=enterprise_rag_queue --concurrency=$${ENTERPRISE_WORKER_CONCURRENCY:-1} &
-      celery -A app.task_queue.celery_app worker --loglevel=INFO --queues=meeting_queue --concurrency=$${MEETING_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --hostname=risk@%h --loglevel=INFO --queues=dlp_risk_queue --concurrency=$${RISK_WORKER_CONCURRENCY:-4} &
+      celery -A app.task_queue.celery_app worker --hostname=email@%h --loglevel=INFO --queues=email_send_queue --concurrency=$${EMAIL_WORKER_CONCURRENCY:-2} &
+      celery -A app.task_queue.celery_app worker --hostname=inbound@%h --loglevel=INFO --queues=mail_inbound_queue --concurrency=$${MAIL_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --hostname=enterprise-rag@%h --loglevel=INFO --queues=enterprise_rag_queue --concurrency=$${ENTERPRISE_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --hostname=meeting@%h --loglevel=INFO --queues=meeting_queue --concurrency=$${MEETING_WORKER_CONCURRENCY:-1} &
+      celery -A app.task_queue.celery_app worker --hostname=memory@%h --loglevel=INFO --queues=memory_write_queue --concurrency=$${MEMORY_WORKER_CONCURRENCY:-1} &
       wait
       "
     env_file:
@@ -46,6 +48,7 @@ services:
     volumes:
       - .:/app
       - ./external-models:/app/external-models
+      - ${ENTERPRISE_DATASET_HOST_ROOT:-./data/enterprise-datasets}:/datasets/enterprise-rag-bench:ro
 
   web:
     build:
@@ -57,7 +60,7 @@ services:
     environment:
       API_BASE_URL: http://api:8000
     ports:
-      - "8511:8501"
+      - "${WEB_HOST_PORT:-8511}:8501"
     depends_on:
       - api
     volumes:
@@ -69,18 +72,28 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: streamlit run web/governance_console.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run web/governance_console.py --server.port 8501 --server.address 0.0.0.0 --server.baseUrlPath governance
     env_file:
       - .env
     environment:
       API_BASE_URL: http://api:8000
     ports:
-      - "8512:8501"
+      - "${GOVERNANCE_WEB_HOST_PORT:-8512}:8501"
     depends_on:
       - api
     volumes:
       - .:/app
       - ./external-models:/app/external-models
+
+  gateway:
+    image: nginx:1.27-alpine
+    depends_on:
+      - web
+      - governance-web
+    ports:
+      - "${PUBLIC_GATEWAY_HOST_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
 
   postgres:
     image: postgres:16-alpine

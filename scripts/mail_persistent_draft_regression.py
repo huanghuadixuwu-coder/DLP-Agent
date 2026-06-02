@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -13,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app.main as main_module
+from app.continuation_state import ContinuationDecision, resolve_continuation as resolve_state_continuation
 from app.mail.draft_store import get_latest_active_mail_draft, get_mail_draft
 
 
@@ -51,6 +53,25 @@ def main() -> None:
 
     main_module.enqueue_dlp_risk_task = lambda task_id: enqueued.append(task_id) or task_id
 
+    def _resolve(message: str, pending_objects: list) -> ContinuationDecision:
+        def _semantic_classifier(text: str, candidates: list) -> ContinuationDecision | None:
+            target = next((item for item in candidates if item.object_type == "mail_draft"), None)
+            email = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+            if target is None or email is None:
+                return None
+            return ContinuationDecision(
+                mode="continue_existing",
+                continuation_type="patch",
+                object_id=target.object_id,
+                object_type=target.object_type,
+                confidence=0.99,
+                reason="The isolated persistence harness updates the active draft recipient.",
+                source="test_semantic_classifier",
+                parameters={"recipient": email.group(0)},
+            )
+
+        return resolve_state_continuation(message, pending_objects, semantic_classifier=_semantic_classifier)
+
     def _render_mail_authoring(*, render_mode: str, **_: object) -> dict:
         body = "Patched public body after refresh." if render_mode == "patch" else "Original public body."
         return {
@@ -62,6 +83,7 @@ def main() -> None:
         }
 
     main_module.render_mail_authoring = _render_mail_authoring
+    main_module.resolve_continuation = _resolve
 
     with TestClient(app) as client:
         conversation, _ = main_module._ensure_conversation(session_id, None, {**actor, "session_id": session_id})

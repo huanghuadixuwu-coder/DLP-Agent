@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from time import perf_counter
 from typing import Any
 
 from langchain_core.documents import Document
 
+from app.config import get_settings
 from app.enterprise_rag.core.evidence_pack import build_evidence_pack
 from app.enterprise_rag.core.query_planner import expand_retrieval_plan
 from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID
@@ -12,8 +14,13 @@ from app.enterprise_rag.core.types import ENTERPRISE_DOMAIN, EnterpriseCitation,
 from app.metrics import record_retrieval_expansion
 from app.enterprise_rag.libs.metadata import normalize_source_type
 from app.enterprise_rag.libs.reranker import rerank_pairs
-from app.enterprise_rag.libs.scoring import build_rerank_debug_rows, heuristic_candidate_score
-from app.enterprise_rag.libs.sparse_index import search_enterprise_sparse
+from app.enterprise_rag.libs.scoring import (
+    build_rerank_debug_rows,
+    extract_query_entity_anchors,
+    heuristic_candidate_score,
+    text_matches_entity_anchors,
+)
+from app.enterprise_rag.libs.sparse_index import fetch_enterprise_sparse_neighbor_chunks, search_enterprise_sparse
 from app.enterprise_rag.libs.text_cleaning import query_focused_snippet
 from app.resilience import make_failure_observation
 from app.vectorstore import get_enterprise_collection, get_enterprise_vectorstore
@@ -34,9 +41,11 @@ def _build_filter(plan: RetrievalPlan) -> dict[str, Any]:
 
 
 def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
+    retrieval_started = perf_counter()
     evidence = _retrieve_evidence_once(plan, expansion_triggered=False, expansion_reason="none", first_pass_counts={})
     should_expand, expansion_reason = _should_expand_retrieval(plan, evidence)
     if not should_expand:
+        evidence.retrieval_stage_debug["retrieval_total_ms"] = round((perf_counter() - retrieval_started) * 1000.0, 2)
         return evidence
     first_pass_counts = {
         "dense_hits": int(evidence.retrieval_stage_debug.get("dense_hits", 0)),
@@ -51,6 +60,10 @@ def retrieve_evidence(plan: RetrievalPlan) -> EvidencePack:
         expansion_reason=expansion_reason,
         first_pass_counts=first_pass_counts,
     )
+    expanded.retrieval_stage_debug["retrieval_total_ms"] = round((perf_counter() - retrieval_started) * 1000.0, 2)
+    expanded.retrieval_stage_debug["first_pass_stage_latencies_ms"] = dict(
+        evidence.retrieval_stage_debug.get("stage_latencies_ms") or {}
+    )
     record_retrieval_expansion("enterprise_rag", expansion_reason)
     return expanded
 
@@ -62,8 +75,13 @@ def _retrieve_evidence_once(
     expansion_reason: str,
     first_pass_counts: dict[str, int],
 ) -> EvidencePack:
-    if not _has_enterprise_documents():
-        return build_evidence_pack(
+    pass_started = perf_counter()
+    stage_latencies_ms: dict[str, float] = {}
+    document_check_started = perf_counter()
+    has_enterprise_documents = _has_enterprise_documents()
+    stage_latencies_ms["document_check"] = round((perf_counter() - document_check_started) * 1000.0, 2)
+    if not has_enterprise_documents:
+        evidence = build_evidence_pack(
             plan.query,
             [],
             retrieval_stage_debug={
@@ -80,13 +98,30 @@ def _retrieve_evidence_once(
                 "second_pass_counts": {},
             },
         )
+        stage_latencies_ms["total"] = round((perf_counter() - pass_started) * 1000.0, 2)
+        evidence.retrieval_stage_debug["stage_latencies_ms"] = stage_latencies_ms
+        return evidence
 
+    dense_started = perf_counter()
     dense_docs, dense_meta = _dense_recall(plan)
+    stage_latencies_ms["dense"] = round((perf_counter() - dense_started) * 1000.0, 2)
+    sparse_started = perf_counter()
     sparse_docs, sparse_meta = _sparse_recall(plan)
-    merged_docs, retrieval_sources = _merge_candidates(plan, dense_docs, sparse_docs)
+    stage_latencies_ms["sparse"] = round((perf_counter() - sparse_started) * 1000.0, 2)
+    neighbor_started = perf_counter()
+    neighbor_docs, neighbor_meta = _neighbor_recall(plan, [*dense_docs, *sparse_docs])
+    stage_latencies_ms["neighbor"] = round((perf_counter() - neighbor_started) * 1000.0, 2)
+    merge_started = perf_counter()
+    merged_docs, retrieval_sources = _merge_candidates(plan, dense_docs, sparse_docs, neighbor_docs)
+    stage_latencies_ms["merge"] = round((perf_counter() - merge_started) * 1000.0, 2)
+    rerank_started = perf_counter()
     reranked_docs, rerank_scores, rerank_meta = _rerank_candidates(plan, merged_docs, retrieval_sources)
+    stage_latencies_ms["rerank"] = round((perf_counter() - rerank_started) * 1000.0, 2)
+    evidence_select_started = perf_counter()
     evidence_docs = _select_evidence_docs(reranked_docs, plan.evidence_top_k)
+    stage_latencies_ms["evidence_select"] = round((perf_counter() - evidence_select_started) * 1000.0, 2)
 
+    citation_started = perf_counter()
     citations = [
         EnterpriseCitation(
             doc_id=str(doc.metadata.get("doc_id") or ""),
@@ -115,20 +150,26 @@ def _retrieve_evidence_once(
         )
         for doc in evidence_docs
     ]
+    stage_latencies_ms["citation_build"] = round((perf_counter() - citation_started) * 1000.0, 2)
+    debug_started = perf_counter()
     rerank_debug = build_rerank_debug_rows(
         plan.query,
         reranked_docs,
         [rerank_scores.get(str(doc.metadata.get("chunk_id") or ""), 0.0) for doc in reranked_docs],
         retrieval_sources=retrieval_sources,
     )
-    return build_evidence_pack(
+    stage_latencies_ms["rerank_debug"] = round((perf_counter() - debug_started) * 1000.0, 2)
+    evidence_pack_started = perf_counter()
+    evidence = build_evidence_pack(
         plan.query,
         citations,
         retrieval_stage_debug={
             "dense_hits": len(dense_docs),
             "sparse_hits": len(sparse_docs),
+            "neighbor_hits": len(neighbor_docs),
             "merged_hits": len(merged_docs),
             "rerank_hits": len(reranked_docs),
+            "rerank_candidate_limit": plan.rerank_candidate_top_k,
             "question_type": plan.question_type,
             "budget_profile": plan.budget_profile,
             "source_types": list(plan.source_types),
@@ -151,9 +192,14 @@ def _retrieve_evidence_once(
             **rerank_meta,
             **dense_meta,
             **sparse_meta,
+            **neighbor_meta,
         },
         rerank_debug=rerank_debug[: plan.rerank_top_k],
     )
+    stage_latencies_ms["evidence_pack"] = round((perf_counter() - evidence_pack_started) * 1000.0, 2)
+    stage_latencies_ms["total"] = round((perf_counter() - pass_started) * 1000.0, 2)
+    evidence.retrieval_stage_debug["stage_latencies_ms"] = stage_latencies_ms
+    return evidence
 
 
 def _should_expand_retrieval(plan: RetrievalPlan, evidence: EvidencePack) -> tuple[bool, str]:
@@ -173,11 +219,12 @@ def _should_expand_retrieval(plan: RetrievalPlan, evidence: EvidencePack) -> tup
         return True, "dense_empty_for_high_recall_question"
     if sparse_hits == 0 and plan.question_type in {"constrained", "conflicting"} and single_side_evidence_low:
         return True, "sparse_empty_for_constrained_question"
-    if merged_hits < max(8, plan.rerank_top_k):
+    minimum_citations = min(3, plan.evidence_top_k)
+    if merged_hits < max(4, min(plan.rerank_top_k, 6)) and len(evidence.citations) < minimum_citations:
         return True, "merged_candidates_below_rerank_budget"
-    if rerank_hits < min(plan.rerank_top_k, 6):
+    if rerank_hits < min(plan.rerank_top_k, 4) and len(evidence.citations) < minimum_citations:
         return True, "rerank_hits_too_low"
-    if len(evidence.citations) < min(3, plan.evidence_top_k):
+    if len(evidence.citations) < minimum_citations:
         return True, "selected_evidence_too_low"
     if evidence.missing_evidence and evidence.confidence < 0.35:
         return True, "answerability_confidence_low"
@@ -249,7 +296,70 @@ def _sparse_recall(plan: RetrievalPlan) -> tuple[list[Document], dict[str, Any]]
     return docs, {"sparse_error": "", "sparse_failure_observation": {}}
 
 
-def _merge_candidates(plan: RetrievalPlan, dense_docs: list[Document], sparse_docs: list[Document]) -> tuple[list[Document], dict[str, str]]:
+def _neighbor_recall(plan: RetrievalPlan, docs: list[Document]) -> tuple[list[Document], dict[str, Any]]:
+    anchors = extract_query_entity_anchors(plan.query)
+    if not anchors:
+        return [], {"query_entity_anchors": [], "neighbor_seed_doc_ids": []}
+    seeds: list[dict[str, Any]] = []
+    seen_doc_ids: set[str] = set()
+    for doc in docs:
+        doc_id = str(doc.metadata.get("doc_id") or "")
+        if not doc_id or doc_id in seen_doc_ids:
+            continue
+        if not text_matches_entity_anchors(f"{doc.metadata.get('title') or ''}\n{doc.page_content}", anchors):
+            continue
+        seen_doc_ids.add(doc_id)
+        seeds.append({"doc_id": doc_id, "chunk_index": int(doc.metadata.get("chunk_index") or 0)})
+        if len(seeds) >= 4:
+            break
+    if not seeds:
+        return [], {"query_entity_anchors": anchors, "neighbor_seed_doc_ids": []}
+    try:
+        rows = fetch_enterprise_sparse_neighbor_chunks(
+            seeds,
+            radius=2,
+            tenant_id="" if plan.tenant_id == DEFAULT_TENANT_ID else plan.tenant_id,
+            workspace_id="" if plan.workspace_id == DEFAULT_WORKSPACE_ID else plan.workspace_id,
+            limit=max(plan.rerank_candidate_top_k * 2, 16),
+        )
+    except Exception as exc:
+        return [], {
+            "query_entity_anchors": anchors,
+            "neighbor_seed_doc_ids": sorted(seen_doc_ids),
+            "neighbor_error": str(exc),
+        }
+    neighbor_docs = [
+        Document(
+            page_content=str(row.get("content") or ""),
+            metadata={
+                "chunk_id": str(row.get("chunk_id") or ""),
+                "doc_id": str(row.get("doc_id") or ""),
+                "source_type": str(row.get("source_type") or ""),
+                "title": str(row.get("title") or ""),
+                "chunk_index": int(row.get("chunk_index") or 0),
+                "chunk_strategy": str(row.get("chunk_strategy") or ""),
+                "thread_id": str(row.get("thread_id") or ""),
+                "timestamp": str(row.get("timestamp") or ""),
+                "collection_version": str(row.get("collection_version") or ""),
+                "tenant_id": str(row.get("tenant_id") or ""),
+                "workspace_id": str(row.get("workspace_id") or ""),
+            },
+        )
+        for row in rows
+    ]
+    return neighbor_docs, {
+        "query_entity_anchors": anchors,
+        "neighbor_seed_doc_ids": sorted(seen_doc_ids),
+        "neighbor_error": "",
+    }
+
+
+def _merge_candidates(
+    plan: RetrievalPlan,
+    dense_docs: list[Document],
+    sparse_docs: list[Document],
+    neighbor_docs: list[Document],
+) -> tuple[list[Document], dict[str, str]]:
     merged: dict[str, Document] = {}
     retrieval_sources: dict[str, str] = {}
 
@@ -268,6 +378,8 @@ def _merge_candidates(plan: RetrievalPlan, dense_docs: list[Document], sparse_do
         _remember(doc, "dense")
     for doc in sparse_docs:
         _remember(doc, "sparse")
+    for doc in neighbor_docs:
+        _remember(doc, "neighbor")
 
     score_map = {
         str(doc.metadata.get("chunk_id") or ""): heuristic_candidate_score(
@@ -290,7 +402,7 @@ def _merge_candidates(plan: RetrievalPlan, dense_docs: list[Document], sparse_do
         filtered = [doc for doc in ranked if score_map.get(str(doc.metadata.get("chunk_id") or ""), 0.0) >= score_floor]
         if filtered:
             ranked = filtered
-    diversified = _diversify_candidates(ranked, retrieval_sources, limit=min(60, max(plan.rerank_top_k * 8, 24)))
+    diversified = _diversify_candidates(ranked, retrieval_sources, limit=plan.rerank_candidate_top_k)
     return diversified, retrieval_sources
 
 
@@ -301,10 +413,16 @@ def _rerank_candidates(
 ) -> tuple[list[Document], dict[str, float], dict[str, Any]]:
     if not docs:
         return [], {}, {"rerank_backend": "none", "rerank_error": ""}
+    docs = docs[: plan.rerank_candidate_top_k]
     passages = [
-        f"title: {doc.metadata.get('title') or ''}\nsource: {doc.metadata.get('source_type') or ''}\ncontent: {doc.page_content}"
+        (
+            f"title: {doc.metadata.get('title') or ''}\n"
+            f"source: {doc.metadata.get('source_type') or ''}\n"
+            f"content: {query_focused_snippet(doc.page_content, plan.query, limit=1400)}"
+        )
         for doc in docs
     ]
+    rerank_passage_chars = sum(len(passage) for passage in passages)
     heuristic_scores = {
         str(doc.metadata.get("chunk_id") or ""): heuristic_candidate_score(
             plan.query,
@@ -316,7 +434,9 @@ def _rerank_candidates(
         for doc in docs
     }
     try:
+        rerank_started = perf_counter()
         scores = rerank_pairs(plan.query, passages)
+        rerank_elapsed_ms = round((perf_counter() - rerank_started) * 1000.0, 2)
         paired = []
         for cross_encoder_score, doc in zip(scores, docs):
             chunk_id = str(doc.metadata.get("chunk_id") or "")
@@ -324,10 +444,28 @@ def _rerank_candidates(
             paired.append((combined_score, doc))
         paired.sort(key=lambda item: item[0], reverse=True)
         selected = paired[: plan.rerank_top_k]
+        metadata: dict[str, Any] = {
+            "rerank_backend": "cross_encoder",
+            "rerank_error": "",
+            "rerank_candidates_submitted": len(docs),
+            "rerank_candidate_limit": plan.rerank_candidate_top_k,
+            "rerank_passage_chars": rerank_passage_chars,
+            "rerank_elapsed_ms": rerank_elapsed_ms,
+        }
+        soft_budget_ms = max(float(get_settings().enterprise_reranker_soft_budget_seconds), 0.0) * 1000.0
+        if soft_budget_ms and rerank_elapsed_ms > soft_budget_ms:
+            metadata["failure_observation"] = make_failure_observation(
+                service="reranker",
+                operation="rerank_pairs_soft_budget",
+                error=f"soft_budget_exceeded:{rerank_elapsed_ms:.2f}ms>{soft_budget_ms:.2f}ms",
+                fallback_strategy="keep_cross_encoder_result_and_surface_latency_warning",
+                retry_count=0,
+                severity="low",
+            )
         return (
             [doc for _, doc in selected],
             {str(doc.metadata.get("chunk_id") or ""): float(score) for score, doc in selected},
-            {"rerank_backend": "cross_encoder", "rerank_error": ""},
+            metadata,
         )
     except Exception as exc:
         failure_observation = make_failure_observation(
@@ -344,7 +482,14 @@ def _rerank_candidates(
         return (
             [doc for _, doc in selected],
             {str(doc.metadata.get("chunk_id") or ""): float(score) for score, doc in selected},
-            {"rerank_backend": "heuristic_fallback", "rerank_error": str(exc), "failure_observation": failure_observation},
+            {
+                "rerank_backend": "heuristic_fallback",
+                "rerank_error": str(exc),
+                "failure_observation": failure_observation,
+                "rerank_candidates_submitted": len(docs),
+                "rerank_candidate_limit": plan.rerank_candidate_top_k,
+                "rerank_passage_chars": rerank_passage_chars,
+            },
         )
 
 

@@ -223,6 +223,7 @@ def _enterprise_rag_query(payload: dict[str, Any], context: OrchestrationContext
         session_id=context.session_id,
         conversation_id=context.conversation_id,
         actor_context=context.actor_context,
+        compose_answer=False,
     )
 
 

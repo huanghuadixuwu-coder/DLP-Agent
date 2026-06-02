@@ -202,3 +202,53 @@ def search_enterprise_sparse(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def fetch_enterprise_sparse_neighbor_chunks(
+    seeds: list[dict[str, Any]],
+    *,
+    radius: int = 2,
+    tenant_id: str = "",
+    workspace_id: str = "",
+    limit: int = 32,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch bounded adjacent chunks for entity-aligned source hits."""
+    normalized_seeds = [
+        (str(seed.get("doc_id") or "").strip(), int(seed.get("chunk_index") or 0))
+        for seed in seeds
+        if str(seed.get("doc_id") or "").strip()
+    ]
+    if not normalized_seeds or limit <= 0:
+        return []
+    init_enterprise_sparse_index(db_path)
+    rows_by_chunk_id: dict[str, dict[str, Any]] = {}
+    with _connect(db_path) as conn:
+        for doc_id, chunk_index in normalized_seeds[:8]:
+            params: list[Any] = [doc_id, max(0, chunk_index - radius), chunk_index + radius]
+            where_sql = ""
+            if tenant_id:
+                where_sql += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if workspace_id:
+                where_sql += " AND workspace_id = ?"
+                params.append(workspace_id)
+            rows = conn.execute(
+                f"""
+                SELECT
+                    chunk_id, doc_id, source_type, title, content, chunk_index,
+                    chunk_strategy, business_domain, thread_id, timestamp,
+                    collection_version, tenant_id, workspace_id
+                FROM enterprise_chunks
+                WHERE doc_id = ? AND chunk_index BETWEEN ? AND ?
+                {where_sql}
+                ORDER BY ABS(chunk_index - ?), chunk_index
+                """,
+                [*params, chunk_index],
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                rows_by_chunk_id.setdefault(str(item["chunk_id"]), item)
+                if len(rows_by_chunk_id) >= limit:
+                    return list(rows_by_chunk_id.values())
+    return list(rows_by_chunk_id.values())

@@ -8,7 +8,9 @@ import streamlit as st
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-EXTERNAL_API_URL = "http://localhost:8010"
+EXTERNAL_API_URL = os.getenv("PUBLIC_API_BASE_URL", "http://localhost:8010")
+EXTERNAL_PROMETHEUS_URL = os.getenv("PUBLIC_PROMETHEUS_BASE_URL", "http://localhost:9091")
+EXTERNAL_GOVERNANCE_URL = os.getenv("PUBLIC_GOVERNANCE_BASE_URL", "http://localhost:8512")
 ADMIN_HEADERS = {
     "X-Tenant-Id": os.getenv("GOVERNANCE_TENANT_ID", "local-dev"),
     "X-User-Id": os.getenv("GOVERNANCE_USER_ID", "governance-admin"),
@@ -105,7 +107,7 @@ def load_tasks(status: str | None = None) -> list[dict[str, Any]]:
 
 
 st.title("安全外发治理台")
-st.caption("8512 只承载治理、诊断、恢复与审计；8511 保持用户工作台，不直接暴露高风险审批控件。")
+st.caption(f"治理台 `{EXTERNAL_GOVERNANCE_URL}` 只承载治理、诊断、恢复与审计；用户工作台不直接暴露高风险审批控件。")
 
 top_cols = st.columns(3)
 try:
@@ -235,4 +237,4 @@ with right:
     except Exception as exc:
         st.warning(f"Harness summary unavailable: {exc}")
 
-st.caption(f"API: `{EXTERNAL_API_URL}` · Prometheus: `http://localhost:9091`")
+st.caption(f"API: `{EXTERNAL_API_URL}` · Prometheus: `{EXTERNAL_PROMETHEUS_URL}`")

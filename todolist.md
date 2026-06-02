@@ -208,3 +208,56 @@
 - `[x]` `app/graph.py` 收敛为共享 `get_llm()` client 工厂。
 - `[x]` 统一语料 seed 仅保留 Labs/DLP 证据，不再写入 LeetCode problem 文档。
 - `[x]` Docker 内重新验证 M1-M6、动态工具发现和跨域 DAG 闭环。
+
+## 14. EnterpriseRAG Dataset Governance
+- `[x]` Replace historical mixed indexes with a reproducible canonical dataset -> deterministic slice -> shadow build -> gated publish workflow.
+
+### 14.1 Canonical Dataset
+- `[x]` Add canonical EnterpriseRAG-Bench parquet fetcher with SHA256 manifest.
+- `[x]` Download and retain immutable `documents.parquet / questions.parquet` from the official dataset revision.
+- `[x]` Pin upstream revision `69916e31c68aa5963c00248fd7f0bc12d04fd235` and record file sizes, checksums, and row counts: `511962` documents / `500` questions.
+
+### 14.2 Deterministic Benchmark Slice
+- `[x]` Add deterministic slice builder with stratified questions, required regression cases, and hash-ranked distractors.
+- `[x]` Generate `bench-slice-v1` from canonical parquet files.
+- `[x]` Store slice manifest: selected questions, expected docs, source revision, seed, policy, and checksums.
+
+### 14.3 Shadow Index and Publish Gate
+- `[x]` Add isolated shadow-index builder.
+- `[x]` Add dense / sparse consistency validator.
+- `[x]` Build `enterprise_rag_bench_slice_v1` with a dedicated sparse DB.
+- `[x]` Reject publish when expected docs are missing, dense/sparse chunk IDs drift, metadata is incomplete, or `l3_*` regression docs leak into the index.
+- `[x]` Run Docker benchmark smoke and switch live configuration only after validation passes.
+- `[x]` Publish baseline: `2940` dense chunks / `2940` sparse chunks / `283` documents; retain legacy `enterprise_rag_bench_v2` for rollback.
+- `[-]` Current smoke baseline: `average_doc_recall=1.0`, `average_evidence_fact_coverage=0.25`, `average_answer_fact_coverage=0.0`; next iteration must suppress cross-document fact noise and replace lexical-only answer coverage for Chinese summaries.
+
+### 14.4 Regression Isolation
+- `[x]` Replace mutable L3 RAG seed documents with a read-only fixture from the deterministic EnterpriseRAG slice.
+- `[x]` Ensure concurrency regression never appends test documents to the live EnterpriseRAG index.
+
+## 15. Mail Source Resolution Hardening
+- `[x]` Explicit references to a prior assistant answer default to `recipient_ready_summary` instead of copying the conversational answer into the outbound body.
+- `[x]` Preserve explicit verbatim forwarding through `verbatim_copy` only when the user requests exact text.
+- `[x]` Fail safely when recipient-ready authoring returns an empty body; do not create an empty pending-confirmation draft.
+- `[x]` Add Docker regression coverage for reference resolution, recipient-ready authoring, direct inline body, persistent draft idempotency, and cross-user isolation.
+- `[x]` Replace the boolean-only recent-answer reference path with structured LLM source resolution: `selected_candidate_ids / source_mode / compose_mode / confidence / reason`.
+- `[x]` Keep recent reusable assistant answers as stable `candidate_id / source_turn_id` candidates and allow semantic selection across the recent conversation window.
+- `[x]` When semantic resolution is unavailable, use only narrow high-confidence safe fallback signals; otherwise ask for clarification instead of guessing.
+- `[x]` Allow L0 Router `intent=mail_action` to enter Mail Agent when the legacy keyword gate misses; classify the requested capability before Mail Agent resolves or clarifies the body source.
+- `[x]` Keep degraded routing safe: if the semantic Router is unavailable, use only a recipient-address plus high-confidence referential-source signal before entering Mail Agent.
+- `[x]` Make the governance-console URL deployment-aware: local development keeps `8512`, while the remote deployment exposes the independent governance surface through the single public gateway path `8080/governance`.
+- `[x]` Bind the remote governance console to its allowed tenant/workspace; `admin / approver` can review cross-user tasks inside that workspace while cross-workspace access remains blocked.
+- `[-]` Add conversation-scoped `ContentArtifact` records and semantic `mail_resolve_body_sources(...)` observations for non-adjacent, multi-turn, and ambiguous references. Current slice now reuses actor-scoped durable `answer_artifact` records as outbound source candidates and preserves the selected artifact through post-confirm renderer/task creation.
+- `[ ]` Add explicit artifact selection before any cross-conversation source retrieval.
+
+## 16. Continuation State Foundation Closeout
+- `[x]` Add actor-scoped PostgreSQL `pending_objects` registry reads for active conversation state.
+- `[x]` Register mail drafts, confirmations, source/recipient/body clarifications, DLP tasks, domain tasks, upload artifacts, and answer artifacts.
+- `[x]` Resolve `confirm / cancel / choose_source / provide_missing_field / patch / new_task` before opening a new planner run.
+- `[x]` Keep open-ended draft patch classification structured and bounded: classifier output is state only, never user-visible wording.
+- `[x]` Reject ungrounded classifier fields: recipient, subject, and body overrides must be present in the current user message.
+- `[x]` Fail safely when the semantic continuation classifier times out: do not mutate the old draft or enter the planner; emit typed ambiguity for renderer clarification.
+- `[x]` Expose actor-scoped safe state snapshots through `GET /agent/pending-objects`.
+- `[x]` Add trace guard `pending_confirmation_bypassed_by_new_side_effect`.
+- `[x]` Remote Docker regression covers refresh recovery, semantic patch, new-task isolation, task registration, upload/answer artifact registration, cross-user isolation, and trace guard.
+- `[-]` Keep richer conversation-scoped `ContentArtifact` storage and explicit cross-conversation artifact selection in the next Mail Source Resolution iteration.

@@ -11,6 +11,17 @@
 
 - Web: `http://localhost:8511`
 - Governance console: `http://localhost:8512`
+
+For a public deployment, prefer the gateway surface so only one public port is required: set `PUBLIC_GATEWAY_HOST_PORT=8080` and `PUBLIC_GOVERNANCE_BASE_URL=http://<server>:8080/governance`. The gateway routes `/` to the user workspace and `/governance` to the governance console, while `WEB_HOST_PORT` and `GOVERNANCE_WEB_HOST_PORT` can remain local/debug-only host mappings.
+
+The governance console must also be bound to the tenant/workspace it is allowed to review. `admin` and `approver` can review tasks created by different users inside that workspace, but the API keeps the tenant/workspace filter so governance access never becomes a cross-tenant full-table read:
+
+```env
+GOVERNANCE_TENANT_ID=mail-your_company_com
+GOVERNANCE_USER_ID=governance-admin
+GOVERNANCE_WORKSPACE_ID=mail-your_company_com-default
+GOVERNANCE_ROLES=admin,approver,viewer,user,mail_sender
+```
 - API docs: `http://localhost:8010/docs`
 - Chroma: `http://localhost:8011`
 - Prometheus: `http://localhost:9091`
@@ -390,6 +401,8 @@ Mail Agent V2 now separates the user workspace from the governance surface:
 
 - `http://localhost:8511/` remains the user-facing workspace for chat, inbox status, draft review, explicit confirmation, and simplified outbound task progress.
 - `http://localhost:8512/` is the governance console for high-risk approval/rejection, task timeline, provider health, queue health, recovery observations, DLQ safe replay, and harness diagnostics.
+- Public deployments can expose both through one gateway, e.g. `http://<server>:8080/` for users and `http://<server>:8080/governance` for governance.
+- The governance console is workspace-scoped: configure `GOVERNANCE_TENANT_ID` and `GOVERNANCE_WORKSPACE_ID`. Governance roles can review different users inside that workspace without receiving cross-tenant visibility.
 - `8511` does not expose high-risk exception approval controls or raw trace/token/cost panels.
 - Governance APIs include `/admin/task-stats`, `/admin/mail-provider-health`, `/admin/mail-dlq`, `/admin/mail-dlq/{dlq_id}/replay`, and `/admin/mail-harness-summary`.
 
@@ -397,4 +410,42 @@ Docker validation:
 
 ```powershell
 docker compose exec -T api python scripts/mail_m6_ui_governance_regression.py
+```
+
+## Continuation State Foundation
+
+`/agent/chat` now resolves durable conversation state before opening a new
+planner run. This keeps short follow-up turns such as confirmations,
+clarification replies, and draft edits attached to the correct object after a
+page refresh or process-local debug loss.
+
+The PostgreSQL-backed pending object registry covers:
+
+- mail and domain confirmations
+- mail drafts
+- source, recipient, and body clarifications
+- DLP and domain tasks
+- upload artifacts
+- assistant answer artifacts
+
+Open-ended draft edits use a bounded structured continuation classifier. The
+classifier only decides whether a message patches an existing draft, starts a
+new task, or is ambiguous. It never writes user-visible prose. Recipient,
+subject, and body values are accepted only when they are grounded in the
+current user message. If the classifier times out, the safe fallback preserves
+the old draft and emits a typed ambiguity observation so the renderer can ask
+whether the user wants to edit the draft or start a new task.
+
+Actor-scoped state can be inspected through:
+
+```text
+GET /agent/pending-objects?session_id=<session>&conversation_id=<conversation>
+```
+
+Docker validation:
+
+```powershell
+docker compose run --rm --no-deps api python scripts/continuation_state_foundation_regression.py
+docker compose run --rm --no-deps api python scripts/continuation_state_regression.py
+docker compose run --rm --no-deps api python scripts/continuation_state_live_probe.py
 ```

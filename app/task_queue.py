@@ -12,6 +12,7 @@ EMAIL_QUEUE = "email_send_queue"
 MAIL_QUEUE = "mail_inbound_queue"
 ENTERPRISE_QUEUE = "enterprise_rag_queue"
 MEETING_QUEUE = "meeting_queue"
+MEMORY_QUEUE = "memory_write_queue"
 
 settings = get_settings()
 
@@ -31,6 +32,7 @@ celery_app.conf.update(
         "app.task_worker.enterprise_rag_ingest_task": {"queue": ENTERPRISE_QUEUE},
         "app.task_worker.enterprise_rag_benchmark_task": {"queue": ENTERPRISE_QUEUE},
         "app.task_worker.process_domain_meeting_task": {"queue": MEETING_QUEUE},
+        "app.task_worker.write_conversation_memory_summary_task": {"queue": MEMORY_QUEUE},
     },
     task_serializer="json",
     accept_content=["json"],
@@ -75,8 +77,17 @@ def enqueue_meeting_task(task_id: str) -> str:
     return task_id
 
 
+def enqueue_conversation_memory_summary(payload: dict) -> str:
+    result = _send_task_with_resilience(
+        "app.task_worker.write_conversation_memory_summary_task",
+        args=[payload],
+        queue=MEMORY_QUEUE,
+    )
+    return str(result.id)
+
+
 def get_queue_health() -> dict:
-    queue_names = [RISK_QUEUE, EMAIL_QUEUE, MAIL_QUEUE, ENTERPRISE_QUEUE, MEETING_QUEUE]
+    queue_names = [RISK_QUEUE, EMAIL_QUEUE, MAIL_QUEUE, ENTERPRISE_QUEUE, MEETING_QUEUE, MEMORY_QUEUE]
     try:
         client = Redis.from_url(settings.redis_url, decode_responses=True)
         backlog = {queue_name: int(client.llen(queue_name)) for queue_name in queue_names}

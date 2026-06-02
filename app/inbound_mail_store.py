@@ -259,6 +259,57 @@ def get_inbound_message(message_id: str) -> dict[str, Any] | None:
     return _decode_message(row)
 
 
+def list_thread_messages(thread_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    init_inbound_mail_store()
+    bounded_limit = max(1, min(int(limit or 20), 50))
+    thread_key = str(thread_id or "").strip()
+    if not thread_key:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM inbound_mail_messages
+            WHERE thread_id = %s OR provider_thread_id = %s
+            ORDER BY received_at ASC, created_at ASC
+            LIMIT %s
+            """,
+            (thread_key, thread_key, bounded_limit),
+        ).fetchall()
+    return [_decode_message(row) for row in rows if row]
+
+
+def list_recent_inbound_threads(*, limit: int = 3, messages_per_thread: int = 5) -> list[dict[str, Any]]:
+    init_inbound_mail_store()
+    bounded_limit = max(1, min(int(limit or 3), 10))
+    bounded_messages = max(1, min(int(messages_per_thread or 5), 20))
+    recent_messages = list_inbound_messages(limit=max(20, bounded_limit * bounded_messages * 2))
+    threads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for message in recent_messages:
+        thread_key = str(message.get("thread_id") or message.get("provider_thread_id") or message.get("message_id") or "").strip()
+        if not thread_key or thread_key in seen:
+            continue
+        seen.add(thread_key)
+        messages = list_thread_messages(thread_key, limit=bounded_messages)
+        if not messages:
+            messages = [message]
+        latest = messages[-1] if messages else message
+        first = messages[0] if messages else message
+        threads.append(
+            {
+                "thread_id": str(first.get("thread_id") or thread_key),
+                "provider_thread_id": str(first.get("provider_thread_id") or ""),
+                "subject": str(first.get("subject") or latest.get("subject") or ""),
+                "latest_received_at": str(latest.get("received_at") or message.get("received_at") or ""),
+                "messages": messages,
+            }
+        )
+        if len(threads) >= bounded_limit:
+            break
+    return threads
+
+
 def inbound_summary(since: str, until: str) -> dict[str, Any]:
     messages = list_inbound_messages(since=since, until=until, limit=200)
     important = [

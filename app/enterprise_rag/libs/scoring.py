@@ -8,6 +8,22 @@ from langchain_core.documents import Document
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
+ENTITY_TOKEN_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b")
+ENTITY_STOPWORDS = {
+    "api",
+    "eu",
+    "gcp",
+    "http",
+    "https",
+    "llm",
+    "rpo",
+    "rto",
+    "saas",
+    "sla",
+    "sql",
+    "ui",
+    "us",
+}
 ANSWER_FOCUS_HINTS = (
     "entitlement",
     "pending",
@@ -53,6 +69,27 @@ NOISE_HINTS = (
 
 def tokenize(text: str) -> list[str]:
     return [term.lower() for term in TOKEN_PATTERN.findall(text or "") if len(term) > 1]
+
+
+def extract_query_entity_anchors(query: str) -> list[str]:
+    """Return distinctive identifiers suitable for bounded document scoping."""
+    anchors: list[str] = []
+    for token in ENTITY_TOKEN_PATTERN.findall(query or ""):
+        lowered = token.lower()
+        if lowered in ENTITY_STOPWORDS:
+            continue
+        has_mixed_case = any(char.isupper() for char in token[1:]) and any(char.islower() for char in token)
+        has_identifier_separator = ("-" in token or "_" in token) and any(char.isalpha() for char in token)
+        if not (has_mixed_case or has_identifier_separator):
+            continue
+        if lowered not in anchors:
+            anchors.append(lowered)
+    return anchors[:6]
+
+
+def text_matches_entity_anchors(text: str, anchors: list[str]) -> bool:
+    lowered = (text or "").lower()
+    return any(anchor in lowered for anchor in anchors)
 
 
 def lexical_overlap_score(query: str, text: str) -> float:
@@ -107,6 +144,8 @@ def heuristic_candidate_score(query: str, *, content: str, title: str, source_ty
     source_boost = 0.08 if source_type else 0.0
     source_boost += 0.06 if source_type in {"fireflies", "gmail", "slack"} else 0.0
     retrieval_boost = 0.12 if retrieval_source == "hybrid" else 0.06 if retrieval_source == "sparse" else 0.0
+    entity_anchors = extract_query_entity_anchors(query)
+    entity_boost = 0.24 if entity_anchors and text_matches_entity_anchors(f"{title}\n{content}", entity_anchors) else 0.0
     return max(
         0.0,
         (lexical * 0.35)
@@ -117,6 +156,7 @@ def heuristic_candidate_score(query: str, *, content: str, title: str, source_ty
         + answerability_boost
         + source_boost
         + retrieval_boost
+        + entity_boost
         - noise_penalty,
     )
 
