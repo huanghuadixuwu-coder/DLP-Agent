@@ -84,7 +84,10 @@ Preferred direction:
 
 ## 7. Build And Deploy
 
-- Local and remote runtime use Docker Compose
+- The active verification environment is the local Docker Compose runtime.
+- A remote Docker deployment existed earlier in the project and remains useful
+  as historical evidence, but it is currently offline and not the acceptance
+  target for the upcoming refactor.
 - Public deployment routes user workspace and governance through `deploy/nginx`
 - Models and EnterpriseRAG datasets are mounted into containers
 
@@ -112,6 +115,8 @@ Preferred direction:
 ## 10. Compatibility Boundaries
 
 - Docker-only verification remains mandatory.
+- The current acceptance baseline is local Docker Compose until a new remote
+  environment is explicitly restored.
 - User-visible answer/clarification/draft wording remains LLM-rendered from
   observations.
 - Side effects remain gated by permission, confirmation, DLP/governance, and

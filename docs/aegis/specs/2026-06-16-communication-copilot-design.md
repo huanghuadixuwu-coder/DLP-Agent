@@ -1,6 +1,6 @@
 # Communication Copilot Design Spec
 
-Status: review-ready
+Status: approved
 Date: 2026-06-16
 Design type: product and architecture design spec
 Primary owner target: Communication Copilot platform
@@ -64,6 +64,8 @@ Out of scope for this refactor:
 ## 4. Core Design Principles
 
 - Docker is the only valid verification environment.
+- The active acceptance baseline for this refactor is the local Docker Compose
+  environment while the remote server is offline.
 - Code owns state, constraints, permissions, source boundaries, tool calls, and
   observations.
 - LLMs own normal user-visible wording from structured observations.
@@ -375,6 +377,8 @@ Demote to future interfaces:
 Must stay true during and after refactor:
 
 - Docker-only verification
+- Local Docker Compose is the current acceptance baseline until a remote
+  environment is explicitly restored.
 - LLM-rendered user-visible wording from observations
 - Permission/confirmation/DLP/governance boundaries for side effects
 - Enterprise facts still require grounded evidence from EnterpriseRAG

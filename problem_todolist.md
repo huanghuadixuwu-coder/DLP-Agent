@@ -8,8 +8,10 @@ This file is a problem-driven tracker. It is intentionally separate from
 observed failures, current status, and repair tasks.
 
 Verification rule:
-The remote server Docker deployment is the only acceptance baseline. Local files
-are used only as an editing and synchronization buffer.
+The current local Docker Compose environment is the only acceptance baseline.
+Local Python remains out of bounds. Historical remote-Docker findings stay in
+this tracker as evidence, but they are no longer the active verification target
+while the remote server is offline.
 
 Status legend:
 
