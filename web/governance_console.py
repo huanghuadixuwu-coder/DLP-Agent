@@ -183,6 +183,15 @@ with right:
         health_cols[0].metric("Queue OK", "unknown")
         st.warning(f"Queue health unavailable: {exc}")
     try:
+        rag_health = api_get("/admin/rag-index-health")
+        rag_contract = (rag_health or {}).get("active_index_contract", {}) if isinstance(rag_health, dict) else {}
+        rag_parity = rag_contract.get("parity", {})
+        with st.expander("EnterpriseRAG active index", expanded=False):
+            st.metric("Index parity", "aligned" if rag_parity.get("ok") else "needs attention")
+            st.json(rag_contract)
+    except Exception as exc:
+        st.warning(f"EnterpriseRAG index health unavailable: {exc}")
+    try:
         provider = api_get("/admin/mail-provider-health")
         provider_health = (provider or {}).get("provider_health", {}) if isinstance(provider, dict) else {}
         health_cols[1].metric("Mail Provider", provider_health.get("status", "unknown"))

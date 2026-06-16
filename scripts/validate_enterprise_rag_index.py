@@ -15,8 +15,10 @@ if str(ROOT) not in sys.path:
 
 
 def _configure_environment(args: argparse.Namespace) -> None:
-    os.environ["ENTERPRISE_CHROMA_COLLECTION"] = args.collection
-    os.environ["ENTERPRISE_SPARSE_DB_PATH"] = str(Path(args.sparse_db).resolve())
+    if args.collection:
+        os.environ["ENTERPRISE_CHROMA_COLLECTION"] = args.collection
+    if args.sparse_db:
+        os.environ["ENTERPRISE_SPARSE_DB_PATH"] = str(Path(args.sparse_db).resolve())
 
 
 def _load_dense(collection_name: str) -> tuple[set[str], set[str], dict[str, dict[str, Any]]]:
@@ -48,17 +50,25 @@ def _load_sparse(path: Path) -> tuple[set[str], set[str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate EnterpriseRAG dense/sparse shadow-index consistency.")
-    parser.add_argument("--collection", required=True)
-    parser.add_argument("--sparse-db", required=True)
-    parser.add_argument("--slice-manifest", required=True)
+    parser.add_argument("--collection")
+    parser.add_argument("--sparse-db")
+    parser.add_argument("--slice-manifest")
     parser.add_argument("--forbidden-prefix", action="append", default=["l3_concurrency_", "l3_iso_"])
     args = parser.parse_args()
     _configure_environment(args)
 
-    sparse_db = Path(args.sparse_db).resolve()
-    manifest = json.loads(Path(args.slice_manifest).read_text(encoding="utf-8"))
+    from app.enterprise_rag.core.index_contract import build_active_index_contract
+
+    contract = build_active_index_contract()
+    collection_name = str(args.collection or contract.get("dense_collection") or "")
+    sparse_db = Path(args.sparse_db or str(contract.get("sparse_db_path") or "")).resolve()
+    dataset_root = Path(str(contract.get("dataset_root") or ""))
+    slice_manifest = Path(args.slice_manifest).resolve() if args.slice_manifest else dataset_root / "slice_manifest.json"
+    if not slice_manifest.exists():
+        raise RuntimeError(f"Slice manifest not found: {slice_manifest}")
+    manifest = json.loads(slice_manifest.read_text(encoding="utf-8"))
     expected_doc_ids = {str(item) for item in manifest.get("expected_doc_ids") or [] if str(item)}
-    dense_chunks, dense_docs, dense_metadata = _load_dense(args.collection)
+    dense_chunks, dense_docs, dense_metadata = _load_dense(collection_name)
     sparse_chunks, sparse_docs = _load_sparse(sparse_db)
     forbidden_docs = sorted(
         doc_id
@@ -86,8 +96,9 @@ def main() -> int:
     )
     result = {
         "ok": ok,
-        "collection": args.collection,
+        "collection": collection_name,
         "sparse_db": str(sparse_db),
+        "slice_manifest": str(slice_manifest),
         "slice_id": manifest.get("slice_id"),
         "dense_chunk_count": len(dense_chunks),
         "sparse_chunk_count": len(sparse_chunks),

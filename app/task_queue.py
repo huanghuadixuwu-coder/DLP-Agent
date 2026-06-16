@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from celery import Celery
 from redis import Redis
 
@@ -31,6 +33,7 @@ celery_app.conf.update(
         "app.task_worker.generate_daily_mail_digest_task": {"queue": MAIL_QUEUE},
         "app.task_worker.enterprise_rag_ingest_task": {"queue": ENTERPRISE_QUEUE},
         "app.task_worker.enterprise_rag_benchmark_task": {"queue": ENTERPRISE_QUEUE},
+        "app.task_worker.enterprise_rag_query_task": {"queue": ENTERPRISE_QUEUE},
         "app.task_worker.process_domain_meeting_task": {"queue": MEETING_QUEUE},
         "app.task_worker.write_conversation_memory_summary_task": {"queue": MEMORY_QUEUE},
     },
@@ -70,6 +73,41 @@ def enqueue_enterprise_ingest(payload: dict) -> str:
 def enqueue_enterprise_benchmark(payload: dict) -> str:
     result = _send_task_with_resilience("app.task_worker.enterprise_rag_benchmark_task", args=[payload], queue=ENTERPRISE_QUEUE)
     return str(result.id)
+
+
+def enqueue_enterprise_query(payload: dict) -> str:
+    result = _send_task_with_resilience("app.task_worker.enterprise_rag_query_task", args=[payload], queue=ENTERPRISE_QUEUE)
+    task_id = str(result.id)
+    _record_enterprise_task_submission(task_id, task_kind="query", payload=payload)
+    return task_id
+
+
+def get_enterprise_task_status(task_id: str) -> dict:
+    result = celery_app.AsyncResult(task_id)
+    state = str(result.state or "PENDING").lower()
+    progress = dict(result.info or {}) if isinstance(result.info, dict) else {}
+    response = {
+        "task_id": task_id,
+        "task_kind": "",
+        "state": state,
+        "ready": bool(result.ready()),
+        "successful": bool(result.successful()) if result.ready() else False,
+        "progress": progress if state not in {"success", "failure"} else {},
+        "result": dict(result.result or {}) if state == "success" and isinstance(result.result, dict) else {},
+        "error": str(result.result) if state == "failure" else "",
+        "actor_context": {},
+        "correlation_id": "",
+    }
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        raw = client.get(f"enterprise_rag_task:{task_id}")
+        metadata = json.loads(raw) if raw else {}
+        response["task_kind"] = str(metadata.get("task_kind") or "")
+        response["actor_context"] = dict(metadata.get("actor_context") or {})
+        response["correlation_id"] = str(metadata.get("correlation_id") or "")
+    except Exception as exc:
+        response["metadata_error"] = str(exc)
+    return response
 
 
 def enqueue_meeting_task(task_id: str) -> str:
@@ -127,3 +165,23 @@ def _send_task_with_resilience(task_name: str, *, queue: str, args: list | None 
         retry_count=retry_count,
     )
     raise RuntimeError(observation["payload"]["error"])
+
+
+def _record_enterprise_task_submission(task_id: str, *, task_kind: str, payload: dict) -> None:
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        client.setex(
+            f"enterprise_rag_task:{task_id}",
+            86400,
+            json.dumps(
+                {
+                    "task_kind": task_kind,
+                    "actor_context": dict(payload.get("actor_context") or {}),
+                    "correlation_id": str(payload.get("correlation_id") or ""),
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:
+        # Task execution remains valid if progress metadata is temporarily unavailable.
+        pass

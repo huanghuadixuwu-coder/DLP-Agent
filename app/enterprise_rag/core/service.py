@@ -3,12 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from app.enterprise_rag.core.evidence_pack import build_evidence_pack
 from app.enterprise_rag.core.answer_composer import compose_enterprise_answer
+from app.enterprise_rag.core.index_contract import build_active_index_contract
 from app.enterprise_rag.core.query_planner import build_retrieval_plan
 from app.enterprise_rag.core.retrieval_orchestrator import retrieve_evidence
 from app.hermes_memory import build_runtime_context_bundle
+from app.metrics import record_rag_llm_usage, record_rag_stage_latencies, refresh_rag_index_metrics
 from app.resilience import make_failure_observation
 
 
@@ -37,6 +40,42 @@ def _dependency_failures(result: dict[str, Any]) -> list[dict[str, Any]]:
         seen.add(dedupe_key)
         failures.append(observation)
     return failures[:6]
+
+
+def build_rag_diagnostic_summary(result: dict[str, Any]) -> dict[str, Any]:
+    retrieval_debug = dict(result.get("retrieval_stage_debug") or {})
+    answer_debug = dict(result.get("answer_debug") or {})
+    index_contract = dict(result.get("active_index_contract") or {})
+    parity = dict(index_contract.get("parity") or {})
+    failures = _dependency_failures(result)
+    first_pass = dict(retrieval_debug.get("first_pass_counts") or {})
+    diagnostic_class = "healthy"
+    if not parity.get("ok", True):
+        diagnostic_class = "index_contract_mismatch"
+    elif failures:
+        diagnostic_class = "dependency_degradation"
+    elif not result.get("citations"):
+        diagnostic_class = "retrieval_miss"
+    elif int(first_pass.get("merged_candidates") or 0) and not result.get("canonical_facts"):
+        diagnostic_class = "rerank_or_evidence_loss"
+    elif answer_debug.get("renderer_error"):
+        diagnostic_class = "answer_generation_degradation"
+    elif result.get("missing_evidence") or str(answer_debug.get("fallback_reason") or "none") not in {"", "none"}:
+        diagnostic_class = "answer_composition_weakness"
+    return {
+        "diagnostic_class": diagnostic_class,
+        "index_parity_ok": bool(parity.get("ok", False)),
+        "index_issues": list(parity.get("issues") or []),
+        "dependency_failure_count": len(failures),
+        "missing_evidence": bool(result.get("missing_evidence", False)),
+        "fallback_reason": str(answer_debug.get("fallback_reason") or "none"),
+        "expansion_triggered": bool(retrieval_debug.get("expansion_triggered", False)),
+        "expansion_reason": str(retrieval_debug.get("expansion_reason") or "none"),
+        "timeout_stage": str(retrieval_debug.get("timeout_stage") or ""),
+        "evidence_boundary_owner": "enterprise_rag_citations",
+        "answer_stage_latencies_ms": dict(answer_debug.get("answer_stage_latencies_ms") or {}),
+        "llm_usage": dict(answer_debug.get("llm_usage") or {}),
+    }
 
 
 def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any]:
@@ -68,7 +107,18 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
                 "score": float(citation.get("score") or 0.0),
             }
         )
+    evidence_manifest = [
+        {
+            "doc_id": item["doc_id"],
+            "chunk_id": item["chunk_id"],
+            "source_type": item["source_type"],
+            "title": item["title"],
+            "score": item["score"],
+        }
+        for item in citations_brief
+    ]
     return {
+        "correlation_id": str(result.get("correlation_id") or ""),
         "answer_state": {
             "answerable": bool(answer_debug.get("answerable", not result.get("missing_evidence", False))),
             "missing_evidence": bool(result.get("missing_evidence", False)),
@@ -79,6 +129,8 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
             "final_answer_source": str(answer_debug.get("final_answer_source") or ""),
         },
         "canonical_facts": canonical_facts,
+        "evidence_manifest": evidence_manifest,
+        "selected_evidence": citations_brief,
         "citations_brief": citations_brief,
         "source_doc_ids": [str(item) for item in list(result.get("supporting_doc_ids") or [])[:8]],
         "context_sources": [str(item) for item in list(result.get("context_sources") or [])[:8]],
@@ -94,6 +146,12 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
             "second_pass_counts": dict(retrieval_debug.get("second_pass_counts") or {}),
             "stage_latencies_ms": dict(result.get("stage_latencies_ms") or {}),
         },
+        "active_index_contract": dict(result.get("active_index_contract") or {}),
+        "diagnostic_summary": build_rag_diagnostic_summary(result),
+        "answer_summary": {
+            "stage_latencies_ms": dict(answer_debug.get("answer_stage_latencies_ms") or {}),
+            "llm_usage": dict(answer_debug.get("llm_usage") or {}),
+        },
     }
 
 
@@ -106,7 +164,9 @@ def answer_enterprise_question(
     conversation_id: str = "",
     actor_context: dict | None = None,
     compose_answer: bool = True,
+    correlation_id: str = "",
 ) -> dict:
+    correlation_id = correlation_id or f"rag_{uuid4().hex[:12]}"
     total_started = perf_counter()
     planning_started = perf_counter()
     plan = build_retrieval_plan(question, source_types=source_types, top_k=top_k)
@@ -243,6 +303,7 @@ def answer_enterprise_question(
         "answer_compose": answer_compose_ms,
         "total": _elapsed_ms(total_started),
     }
+    active_index_contract = build_active_index_contract()
     result = {
         **answer_payload,
         "memory_context": context_bundle,
@@ -251,6 +312,45 @@ def answer_enterprise_question(
         "actor_context": dict(actor_context or {}),
         "answer_composition_skipped": not compose_answer,
         "dependency_failures": dependency_failures,
+        "correlation_id": correlation_id,
+        "active_index_contract": active_index_contract,
     }
+    result["diagnostic_summary"] = build_rag_diagnostic_summary(result)
     result["enterprise_answer_observation"] = build_enterprise_answer_observation(result)
+    record_rag_stage_latencies(stage_latencies_ms)
+    record_rag_stage_latencies(dict((result.get("retrieval_stage_debug") or {}).get("stage_latencies_ms") or {}))
+    record_rag_stage_latencies(dict((result.get("answer_debug") or {}).get("answer_stage_latencies_ms") or {}))
+    record_rag_llm_usage(dict((result.get("answer_debug") or {}).get("llm_usage") or {}))
+    refresh_rag_index_metrics(active_index_contract)
     return result
+
+
+def build_public_enterprise_query_payload(result: dict[str, Any], *, include_debug_details: bool = False) -> dict[str, Any]:
+    payload = dict(result)
+    payload["debug_details_available"] = True
+    if include_debug_details:
+        return payload
+    observation = dict(payload.get("enterprise_answer_observation") or {})
+    payload["citations"] = list(observation.get("selected_evidence") or [])
+    payload["supporting_fact_details"] = []
+    payload["retrieval_stage_debug"] = dict(observation.get("retrieval_summary") or {})
+    payload["rerank_debug"] = []
+    payload["memory_context"] = {}
+    answer_debug = dict(payload.get("answer_debug") or {})
+    payload["answer_debug"] = {
+        key: answer_debug.get(key)
+        for key in (
+            "answerable",
+            "answer_intent",
+            "classifier_source",
+            "classifier_confidence",
+            "classifier_reason",
+            "question_focus",
+            "fallback_reason",
+            "final_answer_source",
+            "answer_stage_latencies_ms",
+            "llm_usage",
+        )
+    }
+    payload["debug_details_included"] = False
+    return payload

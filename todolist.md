@@ -117,16 +117,14 @@
 - `[x]` `docker compose exec -T api python scripts/conversation_memory_migration_regression.py`
 
 ## 12. 下一步优先级
-1. `[-]` Mail Agent V2 规格清理与边界锁定：采用渐进式披露规格包，Mail Agent core 与 Workspace/Document Agent 边界已锁定。
-2. `[x]` Mail Harness 第一阶段：fake provider、状态回放、失败注入、重复发送防护、并发隔离。
-3. `[x]` Persistent Mail Draft：将 pending draft 从 conversation debug 迁移到 PostgreSQL draft state，并绑定 confirmation idempotency key。
-4. `[x]` Mail provider abstraction：保留当前 IMAP/SMTP，新增 fake provider contract。
-5. `[ ]` 用当前真实 `.env` 凭据人工演练一次跨域闭环：创建真实腾讯会议 -> 真实 SMTP 发送邀请邮件；必要时先用测试收件箱。
-6. `[ ]` 接入或明确选择真实 calendar provider；没有 provider 时继续保持 provider boundary，不伪造空闲时间。
-7. `[ ]` 扩大 EnterpriseRAG benchmark 与 Agent trace evaluation 样本。
-8. `[x]` 清理旧 V1 Agent、旧 sensitive workflow、旧 LeetCode API 和 8511 legacy 治理面板；保留 Labs/MCP 与未来 Domain Agent 接口。
-9. `[ ]` 增加真实 provider retry / circuit breaker / manual handover 的更大样本回归。
-10. `[x]` 修复 conversation memory collection 的 embedding 维度迁移：拆分独立 `conversation_memory_bge_m3_v1` collection，旧索引只读迁移并保留回滚路径。
+1. `[-]` 完成 Phase 3 RAG runtime contract：active index diagnostics、渐进式 observation disclosure、阶段级 latency/token tracing。
+2. `[-]` 完成全阶段可观测性：复用现有 Prometheus/Admin，覆盖 Supervisor、DAG、Domain Agent、LLM renderer 与异步 worker。
+3. `[ ]` 增加 Trigger 主动工作能力：定时/事件任务统一进入 Supervisor -> DAG，不直接调用副作用工具。
+4. `[ ]` 增加 Reply Channel：将正式业务邮件与系统通知分离，先支持 workspace 与 governance console。
+5. `[ ]` 增加 OpenAPI 工具工厂：先为 Workspace/Document Agent 生成只读工具，并复用现有 dynamic registry。
+6. `[ ]` 用当前真实 `.env` 凭据人工演练一次跨域闭环：创建真实腾讯会议 -> 真实 SMTP 发送邀请邮件；必要时先用测试收件箱。
+7. `[ ]` 接入或明确选择真实 calendar provider；没有 provider 时继续保持 provider boundary，不伪造空闲时间。
+8. `[ ]` 增加真实 provider retry / circuit breaker / manual handover 的更大样本回归。
 
 ## 13. Mail Agent V2
 - `[-]` 已完成规格清理与边界锁定，正式入口为 `spec/MAIL_AGENT_V2_SPEC.md`。
@@ -261,3 +259,55 @@
 - `[x]` Add trace guard `pending_confirmation_bypassed_by_new_side_effect`.
 - `[x]` Remote Docker regression covers refresh recovery, semantic patch, new-task isolation, task registration, upload/answer artifact registration, cross-user isolation, and trace guard.
 - `[-]` Keep richer conversation-scoped `ContentArtifact` storage and explicit cross-conversation artifact selection in the next Mail Source Resolution iteration.
+
+## 17. Phase 3 RAG Recovery And Full-Stage Observability
+- `[-]` Stabilize the existing EnterpriseRAG pipeline before expanding platform capabilities.
+
+### 17.1 Active Index Contract
+- `[x]` Expose active dataset root, dense collection, sparse DB path, latest manifest run, content hash, and parity counts in query/admin diagnostics.
+- `[x]` Ensure benchmark, audit, and ops scripts read the configured sparse DB path instead of the stale default path.
+- `[x]` Mark stale default indexes as non-authoritative and archive them only after diagnostics are stable.
+
+### 17.2 Progressive RAG Observation Disclosure
+- `[x]` Return compact `retrieval_summary / evidence_manifest / selected_evidence` observations to the renderer.
+- `[x]` Keep raw chunks, full citations, rerank rows, and heavy debug payloads behind debug/admin detail reads.
+- `[x]` Keep `/enterprise-rag/query` and `/agent/chat` semantically aligned through the same observation contract.
+
+### 17.3 Full-Stage Observability
+- `[ ]` Record `correlation_id / actor_context / route / agent / tool / provider / observation_type`.
+- `[ ]` Record stage latency for `router / planner / context_bundle / dense / sparse / neighbor / merge / rerank / evidence_pack / answer_compose / final_renderer / total`.
+- `[x]` Record EnterpriseRAG LLM token usage, timeout stage, fallback strategy, active index version, and correlation id.
+- `[x]` Extend the existing Prometheus/Admin surfaces; do not add a second tracing stack.
+- `[x]` Propagate one EnterpriseRAG correlation id through direct query, async worker result, `/agent/chat` fast path response, and typed-observation provenance.
+- `[-]` Continue propagating the same correlation id and normalized stage names across non-RAG Supervisor/DAG domain agents and async workers.
+
+### 17.4 Remote Docker Regression
+- `[x]` Regress GCP onboarding, MedThink EU failover, perf-canary, and multipart upload limits on the remote Docker deployment.
+- `[x]` Distinguish retrieval miss, dense/sparse drift, rerank/evidence loss, and answer-composition weakness.
+- `[x]` Add opt-in progressive async status for heavy RAG requests through the existing `enterprise_rag_queue`.
+- `[x]` Bind async RAG progress metadata to actor context and reject cross-tenant or ownership-unknown status reads.
+
+## 18. Proactive Agent Platform Capabilities
+- `[ ]` Expand the existing Supervisor platform with bounded proactive-work and integration capabilities after Phase 3 stabilizes.
+
+### 18.1 Triggered Agent Work
+- `[ ]` Add `TriggerDefinition`: `trigger_id / tenant_id / workspace_id / trigger_type / schedule_or_event / target_capability / input_payload / status / retry_policy`.
+- `[ ]` Route triggers through Supervisor and DAG executor; never invoke side-effectful tools directly from a trigger.
+- `[ ]` Reuse PostgreSQL task state and Celery workers for mail digest schedules, DLP pending reminders, meeting reminders, and RAG parity audits.
+
+### 18.2 Reply Channel Separation
+- `[ ]` Add `ReplyChannel`: `channel_type / destination / actor_context / correlation_id / payload / delivery_status`.
+- `[ ]` Keep formal outbound business email inside Mail Agent with DLP, approval, confirmation, and SMTP governance.
+- `[ ]` Use Reply Channels for progress, reminders, completion, recovery, and governance notifications.
+- `[ ]` Start with `web_workspace` and `governance_console`; add webhook or IM adapters only after the contract is stable.
+
+### 18.3 OpenAPI Tool Factory
+- `[ ]` Generate read-only tool manifests from OpenAPI operations and register them through the existing dynamic tool registry.
+- `[ ]` Require a governance overlay: `read_only / side_effectful / requires_confirmation / permissions / tenant_scope / timeout / retry_policy / observation_type`.
+- `[ ]` Reject generated write operations unless an explicit governance overlay and confirmation boundary exist.
+- `[ ]` Pilot with one Workspace/Document provider; keep existing Mail, DLP, and Tencent Meeting adapters unchanged unless a concrete need appears.
+
+### 18.4 Scope Guardrails
+- `[x]` Reuse existing Supervisor, DAG executor, registry, Prometheus/Admin, PostgreSQL task state, and Celery workers.
+- `[x]` Avoid a second scheduler, a second tracing stack, or a parallel tool registry in the first implementation.
+- `[x]` Keep new platform contracts small and provider-neutral; add adapters only for verified scenarios.

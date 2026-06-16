@@ -108,6 +108,17 @@ NODE_LATENCY_MS = Histogram(
     ["node"],
     buckets=(10, 25, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000),
 )
+RAG_STAGE_LATENCY_MS = Histogram(
+    "agent_rag_stage_latency_ms",
+    "EnterpriseRAG stage latency in milliseconds.",
+    ["stage"],
+    buckets=(10, 25, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 30000),
+)
+RAG_INDEX_DENSE_CHUNKS = Gauge("agent_rag_index_dense_chunks", "Chunks in the active EnterpriseRAG dense collection.")
+RAG_INDEX_SPARSE_CHUNKS = Gauge("agent_rag_index_sparse_chunks", "Chunks in the active EnterpriseRAG sparse index.")
+RAG_INDEX_PARITY_OK = Gauge("agent_rag_index_parity_ok", "1 if the active EnterpriseRAG dense/sparse index contract is aligned.")
+RAG_LLM_TOKENS_INPUT_TOTAL = Counter("agent_rag_llm_tokens_input_total", "EnterpriseRAG LLM input tokens.")
+RAG_LLM_TOKENS_OUTPUT_TOTAL = Counter("agent_rag_llm_tokens_output_total", "EnterpriseRAG LLM output tokens.")
 
 LAST_REQUEST_LATENCY_MS = Gauge("agent_last_request_latency_ms", "Latency of the last completed request in milliseconds.")
 LAST_REQUEST_TOKENS_INPUT = Gauge("agent_last_request_tokens_input", "Input tokens used by the last completed request.")
@@ -332,6 +343,22 @@ def record_side_effect_blocked(agent: str, action: str) -> None:
 
 def record_dependency_blocked(agent: str, action: str) -> None:
     DEPENDENCY_BLOCKED_TOTAL.labels(agent=agent or "unknown", action=action or "unknown").inc()
+
+
+def record_rag_stage_latencies(stage_latencies_ms: dict[str, float]) -> None:
+    for stage, value in stage_latencies_ms.items():
+        RAG_STAGE_LATENCY_MS.labels(stage=stage or "unknown").observe(float(value or 0.0))
+
+
+def refresh_rag_index_metrics(contract: dict) -> None:
+    RAG_INDEX_DENSE_CHUNKS.set(int((contract.get("dense") or {}).get("chunk_count") or 0))
+    RAG_INDEX_SPARSE_CHUNKS.set(int((contract.get("sparse") or {}).get("chunk_count") or 0))
+    RAG_INDEX_PARITY_OK.set(1 if (contract.get("parity") or {}).get("ok") else 0)
+
+
+def record_rag_llm_usage(usage: dict[str, int]) -> None:
+    RAG_LLM_TOKENS_INPUT_TOTAL.inc(int(usage.get("input_tokens") or 0))
+    RAG_LLM_TOKENS_OUTPUT_TOTAL.inc(int(usage.get("output_tokens") or 0))
 
 
 def record_queue_backlog(backlog: dict[str, int]) -> None:

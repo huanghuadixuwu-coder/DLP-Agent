@@ -163,6 +163,7 @@ class UnifiedAgentResponse(BaseModel):
     delivery_result: str | None = None
     delivery_error: str | None = None
     trace_id: str
+    correlation_id: str = ""
     latency_ms: float
     token_in: int = 0
     token_out: int = 0
@@ -233,10 +234,12 @@ class EnterpriseRagQueryRequest(BaseModel):
     user_id: str = ""
     workspace_id: str = ""
     roles: list[str] = Field(default_factory=list)
+    include_debug_details: bool = False
+    async_mode: bool = False
 
 
 class EnterpriseRagQueryResponse(BaseModel):
-    answer: str
+    answer: str = ""
     citations: list[dict[str, Any]] = Field(default_factory=list)
     supporting_doc_ids: list[str] = Field(default_factory=list)
     missing_evidence: bool = False
@@ -260,6 +263,12 @@ class EnterpriseRagQueryResponse(BaseModel):
     rate_limit_decision: dict[str, Any] = Field(default_factory=dict)
     queue_status: dict[str, Any] = Field(default_factory=dict)
     task_mode: str = "sync"
+    correlation_id: str = ""
+    active_index_contract: dict[str, Any] = Field(default_factory=dict)
+    diagnostic_summary: dict[str, Any] = Field(default_factory=dict)
+    debug_details_available: bool = True
+    debug_details_included: bool = True
+    task_id: str = ""
 
 
 class EnterpriseRagIngestRequest(BaseModel):

@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     hermes_compaction_keep_turns: int = Field(default=16, alias="HERMES_COMPACTION_KEEP_TURNS")
     hermes_reflection_tool_call_interval: int = Field(default=8, alias="HERMES_REFLECTION_TOOL_CALL_INTERVAL")
     enterprise_sparse_db_path: str = Field(default=str(DATA_DIR / "enterprise_sparse.db"), alias="ENTERPRISE_SPARSE_DB_PATH")
+    enterprise_canonical_dataset_root: str = Field(default="", alias="ENTERPRISE_CANONICAL_DATASET_ROOT")
     workspace_memory_sparse_db_path: str = Field(default=str(DATA_DIR / "workspace_memory_sparse.db"), alias="WORKSPACE_MEMORY_SPARSE_DB_PATH")
     user_model_provider_mode: str = Field(default="local", alias="USER_MODEL_PROVIDER_MODE")
     honcho_base_url: str = Field(default="", alias="HONCHO_BASE_URL")

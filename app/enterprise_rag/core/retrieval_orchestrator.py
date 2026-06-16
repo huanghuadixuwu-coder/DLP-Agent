@@ -418,7 +418,7 @@ def _rerank_candidates(
         (
             f"title: {doc.metadata.get('title') or ''}\n"
             f"source: {doc.metadata.get('source_type') or ''}\n"
-            f"content: {query_focused_snippet(doc.page_content, plan.query, limit=1400)}"
+            f"content: {query_focused_snippet(doc.page_content, plan.query, limit=900)}"
         )
         for doc in docs
     ]

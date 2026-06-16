@@ -47,7 +47,8 @@ from app.conversation_store import (
 from app.dlp_entry import classify_dlp_entry, extract_destination_email as dlp_extract_destination_email, looks_like_outbound_action as dlp_looks_like_outbound_action
 from app.dlp_scenarios import build_status_path, evaluate_scenario_task, get_dlp_scenario, list_dlp_scenarios, normalize_fault_injection
 from app.email_sender import send_email_smtp
-from app.enterprise_rag.core.service import answer_enterprise_question, build_enterprise_answer_observation
+from app.enterprise_rag.core.index_contract import audit_active_index_parity, build_active_index_contract
+from app.enterprise_rag.core.service import answer_enterprise_question, build_enterprise_answer_observation, build_public_enterprise_query_payload
 from app.enterprise_rag.eval.benchmark_runner import run_benchmark_sample
 from app.enterprise_rag.eval.casebook import build_casebook
 from app.enterprise_rag.ingestion.manifest_store import load_manifest
@@ -113,6 +114,7 @@ from app.metrics import (
     record_unified_evidence_hits,
     record_queue_backlog,
     record_mail_dlq_replay,
+    refresh_rag_index_metrics,
     refresh_task_metrics,
     render_metrics,
 )
@@ -182,9 +184,11 @@ from app.task_queue import (
     enqueue_email_send_task,
     enqueue_enterprise_benchmark,
     enqueue_enterprise_ingest,
+    enqueue_enterprise_query,
     enqueue_meeting_task,
     enqueue_inbound_mail_sync,
     get_queue_health,
+    get_enterprise_task_status,
 )
 from app.task_store import (
     add_task_event,
@@ -3523,6 +3527,7 @@ def _build_fast_path_response(
         "session_id": session_id,
         "conversation_id": conversation_id,
         "request_id": str(uuid.uuid4()),
+        "correlation_id": str(result.get("correlation_id") or ""),
         "message": message,
         "safe_message": message,
         "display_message": display_message or message,
@@ -3678,6 +3683,7 @@ def _build_fast_path_response(
         delivery_result=None,
         delivery_error=None,
         trace_id=str(synthetic_result["request_id"]),
+        correlation_id=str(synthetic_result["correlation_id"]),
         latency_ms=round(latency_ms, 2),
         token_in=int(synthetic_result["token_in"]),
         token_out=int(synthetic_result["token_out"]),
@@ -3945,12 +3951,14 @@ def _execute_fast_path(
             compose_answer=False,
         )
         observation_payload = _enterprise_renderer_observation_payload(payload_dict)
+        correlation_id = str(payload_dict.get("correlation_id") or "")
         observation = make_typed_observation(
             observation_type="enterprise_answer_observation",
             source="enterprise_rag_query",
             grounding_kind="retrieval",
             summary=_enterprise_renderer_observation_summary(observation_payload),
             payload=observation_payload,
+            provenance={"correlation_id": correlation_id},
             citations=_enterprise_renderer_citations(payload_dict),
             confidence=float(payload_dict.get("confidence", 0.0) or 0.0),
             actor_context=actor_context,
@@ -3970,6 +3978,7 @@ def _execute_fast_path(
             "memory_context": dict(payload_dict.get("memory_context") or {}),
             "final_answer_source": "fast_enterprise_rag_renderer",
             "termination_reason": "direct_answer",
+            "correlation_id": correlation_id,
         }
         return _build_fast_path_response(
             session_id=payload.session_id,
@@ -5313,6 +5322,20 @@ def admin_rag_manifest(request: Request, limit: int = 20) -> dict[str, Any]:
         "actor_context": actor.to_dict(),
         "permission_decision": permission_decision,
         "manifest": manifest,
+        "active_index_contract": build_active_index_contract(),
+    }
+
+
+@app.get("/admin/rag-index-health")
+def admin_rag_index_health(request: Request, include_details: bool = False) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "admin.read", "rag_index_health")
+    contract = audit_active_index_parity() if include_details else build_active_index_contract()
+    return {
+        "ok": bool((contract.get("parity") or {}).get("ok", False)),
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "active_index_contract": contract,
     }
 
 
@@ -5540,6 +5563,25 @@ def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest, request: Reques
     permission_decision = _ensure_permission(actor, "rag.query", "enterprise_rag")
     rate_limit_decision = _ensure_rate_limit(actor, "enterprise_rag_query")
     queue_status = _refresh_queue_metrics()
+    if payload.async_mode:
+        correlation_id = f"rag_async_{uuid.uuid4().hex[:12]}"
+        task_id = enqueue_enterprise_query(
+            {
+                **payload.dict(),
+                "actor_context": actor.to_dict(),
+                "correlation_id": correlation_id,
+            }
+        )
+        return EnterpriseRagQueryResponse(
+            actor_context=actor.to_dict(),
+            permission_decision=permission_decision,
+            rate_limit_decision=rate_limit_decision,
+            queue_status=queue_status,
+            task_mode="async",
+            task_id=task_id,
+            correlation_id=correlation_id,
+            diagnostic_summary={"diagnostic_class": "async_queued"},
+        )
     result = answer_enterprise_question(
         payload.question,
         source_types=payload.source_types,
@@ -5557,7 +5599,26 @@ def enterprise_rag_query_api(payload: EnterpriseRagQueryRequest, request: Reques
             "task_mode": "sync",
         }
     )
-    return EnterpriseRagQueryResponse(**result)
+    public_result = build_public_enterprise_query_payload(result, include_debug_details=payload.include_debug_details)
+    return EnterpriseRagQueryResponse(**public_result)
+
+
+@app.get("/enterprise-rag/tasks/{task_id}")
+def enterprise_rag_task_status_api(task_id: str, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "rag.query", "enterprise_rag")
+    status = get_enterprise_task_status(task_id)
+    owner = dict(status.get("actor_context") or {})
+    if not actor.is_local_dev:
+        if not owner:
+            raise HTTPException(status_code=403, detail="task ownership metadata is unavailable")
+        if (
+            str(owner.get("tenant_id") or "") != actor.tenant_id
+            or str(owner.get("workspace_id") or "") != actor.workspace_id
+            or str(owner.get("user_id") or "") != actor.user_id
+        ):
+            raise HTTPException(status_code=403, detail="task_id does not belong to this actor context")
+    return {**status, "permission_decision": permission_decision}
 
 
 @app.post("/enterprise-rag/ingest", response_model=EnterpriseRagIngestResponse)
@@ -6654,4 +6715,8 @@ def framework_compare(payload: FrameworkCompareRequest) -> FrameworkCompareRespo
 @app.get("/metrics")
 def metrics() -> Response:
     _refresh_async_metrics()
+    try:
+        refresh_rag_index_metrics(build_active_index_contract())
+    except Exception:
+        logger.debug("EnterpriseRAG index metrics refresh failed", exc_info=True)
     return Response(content=render_metrics(), media_type=content_type())

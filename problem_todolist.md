@@ -22,17 +22,19 @@ Status legend:
 Status: `[x]` aligned
 
 Conclusion:
-The problem list matches the current iteration direction. The highest priority is
-the continuation state layer because it affects mail sending, meeting creation,
-DLP recovery, page refresh behavior, and unnecessary LLM calls. RAG latency and
-answer ownership are the next major track after the state layer is stabilized.
+The continuation state foundation and main Mail Agent recovery path are now
+stable enough to move the primary focus to Phase 3. The highest priority is the
+EnterpriseRAG runtime contract: active-index visibility, progressive observation
+disclosure, full-stage latency/token observability, and typed degradation.
+Proactive Agent capabilities follow after this baseline is measurable.
 
 Planned execution order:
 
-1. `[-]` Continuation state layer and safe mail source/body resolution: mail/domain confirmation plus source/recipient/body clarification first slice implemented and remote-Docker-regressed.
-2. `[-]` RAG observation, evidence-boundary repair, and typed timeout recovery are remote-Docker-regressed; progressive async retrieval remains.
-3. `[-]` UI/debug split for route, token, latency, and governance details; remote governance entry now works through `8080/governance`.
-4. `[ ]` Legacy rule/text path cleanup after the new state layer is stable.
+1. `[-]` Phase 3 RAG runtime contract: finish active-index diagnostics, progressive observation disclosure, and stage-level latency/token tracing.
+2. `[-]` UI/debug split: keep user progress on the workspace and expose raw trace, cost, token, and recovery detail through `8080/governance`.
+3. `[ ]` Triggered Agent work: route scheduled/event work through Supervisor and DAG execution.
+4. `[ ]` Reply Channel separation: keep governed business email inside Mail Agent and move system notifications into channel adapters.
+5. `[ ]` OpenAPI tool factory: pilot read-only Workspace/Document tool generation through the existing registry.
 
 ## Full Repair Iteration Plan
 
@@ -342,7 +344,7 @@ Current evidence:
 
 ## 9. RAG Observation Payload Too Heavy
 
-Status: `[ ]` open
+Status: `[x]` resolved on remote Docker
 
 问题：
 EnterpriseRAG payload contains debug, rerank rows, full content, and memory context. When `/agent/chat` sends this to the final renderer, token input becomes too large.
@@ -819,7 +821,7 @@ Latest regression evidence:
   review.
 ## 24. EnterpriseRAG Active Index Contract Is Obscured By Stale Default Paths
 
-Status: `[ ]` open
+Status: `[x]` resolved on remote Docker
 
 Problem:
 Remote EnterpriseRAG is no longer using the old default sparse path, but the
@@ -840,29 +842,30 @@ Current evidence:
   `/app/data/enterprise-indexes/bench-slice-v1/enterprise_sparse.db`.
 - `[x]` The configured sparse DB also contains `3047` chunks and `283`
   distinct `doc_id`s, matching the dense slice build.
-- `[x]` The old default path `/app/data/enterprise_sparse.db` still exists and
-  contains only `10` regression rows from `l3_concurrency_* / l3_iso_*` docs.
+- `[x]` The old default path `/app/data/enterprise_sparse.db` contained only
+  `10` regression rows from `l3_concurrency_* / l3_iso_*` docs and has now
+  been archived under `data/non-authoritative-archive/`.
 - `[x]` `/app/documents.parquet` and `/app/questions.parquet` do not exist on
   the remote deployment, so any audit or script still assuming those paths is
   stale.
 
 Tasks:
 
-1. `[ ]` Expose the active EnterpriseRAG contract in debug/admin surfaces:
+1. `[x]` Expose the active EnterpriseRAG contract in debug/admin surfaces:
    active dataset root, active dense collection, active sparse DB path, latest
    manifest run, and content hash.
-2. `[ ]` Ensure all benchmark/audit/ops scripts read the configured sparse path
+2. `[x]` Ensure all benchmark/audit/ops scripts read the configured sparse path
    instead of falling back to `/app/data/enterprise_sparse.db`.
-3. `[ ]` Make stale default-path indexes explicitly non-authoritative in code
+3. `[x]` Make stale default-path indexes explicitly non-authoritative in code
    and diagnostics, so future audits cannot mistake them for the live index.
-4. `[ ]` Add a remote-Docker parity check that compares active dense count,
+4. `[x]` Add a remote-Docker parity check that compares active dense count,
    active sparse count, distinct doc count, and latest manifest metadata.
-5. `[ ]` Decide whether to delete or archive the stale default sparse DB after
+5. `[x]` Archive the stale default sparse DB after
    the active-contract diagnostics are in place.
 
 ## 25. EnterpriseRAG Canonical Slice Is Aligned, But Answer Quality And Latency Remain Runtime Issues
 
-Status: `[ ]` open
+Status: `[-]` runtime contract complete; continue bounded latency optimization
 
 Problem:
 The remote deployment is now aligned to a canonical deterministic slice
@@ -892,15 +895,108 @@ Current evidence:
 
 Tasks:
 
-1. `[ ]` Promote `bench-slice-v1` to the explicit remote canonical baseline for
+1. `[x]` Promote `bench-slice-v1` to the explicit remote canonical baseline for
    all online audit and benchmark work until a new slice/version is published.
-2. `[ ]` Add active-index and manifest diagnostics to `/enterprise-rag/query`
+2. `[x]` Add active-index and manifest diagnostics to `/enterprise-rag/query`
    and admin/debug views so every slow or weak answer is tied to a concrete
    slice/index version.
-3. `[ ]` Continue Phase 3 observation-contract work: stage latency, expansion
+3. `[x]` Continue Phase 3 observation-contract work: stage latency, expansion
    reason, timeout/degradation observation, and evidence-boundary ownership.
-4. `[ ]` Add representative remote regression cases for GCP onboarding,
+4. `[x]` Add representative remote regression cases for GCP onboarding,
    MedThink EU failover, perf-canary, and multipart upload limits.
-5. `[ ]` Distinguish clearly between retrieval miss, sparse/dense divergence,
+5. `[x]` Distinguish clearly between retrieval miss, sparse/dense divergence,
    rerank/evidence loss, and answer-composition weakness in the returned debug
    contract.
+6. `[x]` Add progressive RAG observation disclosure: return compact
+   `retrieval_summary / evidence_manifest / selected_evidence` by default and
+   expose raw chunks, full citations, and rerank rows only through debug/admin
+   detail reads.
+7. `[-]` Continue end-to-end stage observability for `router / planner /
+   context_bundle / dense / sparse / neighbor / merge / rerank / evidence_pack /
+   answer_compose / final_renderer / total`, including token usage, timeout
+   stage, fallback strategy, index version, and correlation id.
+8. `[x]` Keep implementation bounded: extend the existing EnterpriseRAG service
+   and observation contract; do not add a second retrieval framework or a
+   second tracing stack.
+
+Latest remote regression evidence:
+
+- `[x]` `enterprise_rag_active_contract_regression.py` and
+  `validate_enterprise_rag_index.py` pass against `bench-slice-v1`: `3047`
+  dense chunks, `3047` sparse chunks, `283` documents, no leaked `l3_*` docs.
+- `[x]` GCP onboarding, MedThink EU failover, perf-canary, and multipart upload
+  limit cases all answer successfully without trailing ellipsis.
+- `[x]` Default `/enterprise-rag/query` now returns compact diagnostics; heavy
+  rerank, fact-detail, and memory payloads require `include_debug_details=true`.
+- `[x]` Prometheus exposes active-index parity, RAG stage latency, and RAG LLM
+  token counters without adding a second tracing stack.
+- `[x]` Heavy RAG callers can opt into the existing `enterprise_rag_queue`;
+  `enterprise_rag_async_query_regression.py` observes
+  `pending -> started -> progress -> success` and preserves the same
+  correlation ID in the queued result.
+- `[x]` Async RAG task metadata is actor-scoped and fail-closed: the owning
+  tenant can poll progress, while a different tenant receives `403`; missing
+  ownership metadata also blocks non-local reads.
+- `[x]` Live `/agent/chat` fast EnterpriseRAG smoke preserves one correlation
+  ID across the top-level response, typed-observation provenance, and compact
+  observation payload.
+- `[-]` Remaining latency is measurable rather than opaque: CPU reranking and
+  answer generation are still variable. Generic high-confidence intent
+  short-circuits removed avoidable classifier calls without adding
+  domain-specific answer templates.
+
+## Platform Capability Backlog (Not Failure Issues)
+
+Status: `[ ]` planned after Phase 3 stabilization
+
+Purpose:
+These items are architecture and product-capability work, not newly observed
+failures. They are tracked separately to avoid inflating the issue list or
+mixing feature expansion with current RAG recovery.
+
+### A. Full-Stage Agent Observability
+
+1. `[ ]` Extend the existing Prometheus/Admin trace surfaces instead of adding
+   another observability subsystem.
+2. `[ ]` Record `correlation_id / actor_context / route / agent / tool /
+   provider / duration_ms / token_usage / retry / fallback / observation_type`
+   across Supervisor, DAG executor, domain agents, LLM renderer, and async
+   workers.
+3. `[ ]` Expose user-facing progress only on the 8511/8080 workspace; keep raw
+   trace, cost, token, and failure detail in the governance surface.
+
+### B. Triggered Agent Work
+
+1. `[ ]` Add a small `TriggerDefinition` contract:
+   `trigger_id / tenant_id / workspace_id / trigger_type / schedule_or_event /
+   target_capability / input_payload / status / retry_policy`.
+2. `[ ]` Route every trigger through the existing Supervisor and DAG executor;
+   triggers must not call side-effectful tools directly.
+3. `[ ]` First supported scenarios: mail digest schedule, DLP pending reminder,
+   meeting reminder, and EnterpriseRAG parity audit.
+4. `[ ]` Reuse PostgreSQL task state and Celery workers; do not introduce a
+   second scheduler framework until the first scenarios prove it necessary.
+
+### C. Reply Channel Separation
+
+1. `[ ]` Add a `ReplyChannel` contract for system notifications:
+   `channel_type / destination / actor_context / correlation_id / payload /
+   delivery_status`.
+2. `[ ]` Keep formal outbound business email inside Mail Agent with DLP,
+   approval, confirmation, and SMTP governance.
+3. `[ ]` Use Reply Channels only for task progress, reminders, completion,
+   recovery, and governance notifications.
+4. `[ ]` Start with `web_workspace` and `governance_console`; add webhook or IM
+   adapters only after the contract is stable.
+
+### D. OpenAPI Tool Factory
+
+1. `[ ]` Generate read-only tool manifests from OpenAPI operations and register
+   them through the existing dynamic tool registry.
+2. `[ ]` Require an explicit governance overlay for every generated tool:
+   `read_only / side_effectful / requires_confirmation / permissions /
+   tenant_scope / timeout / retry_policy / observation_type`.
+3. `[ ]` Reject generated write operations unless they have an explicit
+   governance overlay and confirmation boundary.
+4. `[ ]` Pilot the factory with a Workspace/Document provider; do not refactor
+   existing Mail, DLP, or Tencent Meeting adapters merely for uniformity.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from time import perf_counter
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -20,6 +21,7 @@ RECOMMENDATION_RULES = (
     (re.compile(r"\bwhat did .* recommend\b", re.IGNORECASE), "Matched an explicit recommendation question."),
     (re.compile(r"\bhow should (we|the .*|users?) handle\b", re.IGNORECASE), "Matched an explicit handling question."),
     (re.compile(r"\bwhat should (we|the .*|users?) do\b", re.IGNORECASE), "Matched an explicit action question."),
+    (re.compile(r"\bhow (do|can|should) (we|i|you) (deploy|configure|set up|implement)\b", re.IGNORECASE), "Matched an explicit implementation question."),
     (re.compile(r"(建议|如何处理|怎么处理|应该怎么做)"), "Matched a high-confidence recommendation phrase."),
 )
 EXPLANATION_RULES = (
@@ -29,6 +31,8 @@ EXPLANATION_RULES = (
 FACT_LOOKUP_RULES = (
     (re.compile(r"\bdid (the notes|they) mention\b", re.IGNORECASE), "Matched a direct mention lookup."),
     (re.compile(r"\bwhat (was|is) the (text|wording|copy)\b", re.IGNORECASE), "Matched a wording lookup."),
+    (re.compile(r"\bwhat (are|is|was|were) the (default|current|configured|specified)\b", re.IGNORECASE), "Matched an explicit configured-value lookup."),
+    (re.compile(r"\bwhat .* did .* specify\b", re.IGNORECASE), "Matched an explicit specification lookup."),
     (re.compile(r"(是否提到|文案|措辞|错误文案|按钮文案)"), "Matched a fact lookup phrase."),
 )
 MIXED_RULE_HINTS = (
@@ -99,6 +103,32 @@ Rules:
 """
 
 
+def _usage_metadata(response) -> dict[str, int]:
+    usage = dict(getattr(response, "usage_metadata", None) or {})
+    response_metadata = dict(getattr(response, "response_metadata", None) or {})
+    token_usage = dict(response_metadata.get("token_usage") or {})
+    return {
+        "input_tokens": int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or token_usage.get("total_tokens") or 0),
+    }
+
+
+def _invoke_with_diagnostics(messages) -> tuple[object, dict[str, object]]:
+    started = perf_counter()
+    response = get_llm().invoke(messages)
+    return response, {
+        "latency_ms": round((perf_counter() - started) * 1000.0, 2),
+        "llm_usage": _usage_metadata(response),
+    }
+
+
+def _renderer_error_from_diagnostics(diagnostics: dict[str, object]) -> dict[str, object]:
+    if diagnostics.get("error_type") or diagnostics.get("stage") in {"llm_invoke", "postcheck", "empty_output"}:
+        return dict(diagnostics)
+    return {}
+
+
 def _parse_json_object(text: str) -> dict:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -130,6 +160,8 @@ def _classify_answer_intent(question: str, question_type: str) -> dict[str, obje
             "classifier_source": "rule",
             "classifier_confidence": 0.95,
             "classifier_reason": "Matched both recommendation and explanation signals.",
+            "classifier_latency_ms": 0.0,
+            "classifier_llm_usage": {},
         }
     if fact_lookup_match and not recommendation_match:
         return {
@@ -137,6 +169,8 @@ def _classify_answer_intent(question: str, question_type: str) -> dict[str, obje
             "classifier_source": "rule",
             "classifier_confidence": 0.94,
             "classifier_reason": fact_lookup_reason,
+            "classifier_latency_ms": 0.0,
+            "classifier_llm_usage": {},
         }
     if recommendation_match and not fact_lookup_match:
         return {
@@ -144,6 +178,8 @@ def _classify_answer_intent(question: str, question_type: str) -> dict[str, obje
             "classifier_source": "rule",
             "classifier_confidence": 0.94,
             "classifier_reason": recommendation_reason,
+            "classifier_latency_ms": 0.0,
+            "classifier_llm_usage": {},
         }
     if explanation_match and not recommendation_match:
         return {
@@ -151,6 +187,8 @@ def _classify_answer_intent(question: str, question_type: str) -> dict[str, obje
             "classifier_source": "rule",
             "classifier_confidence": 0.93,
             "classifier_reason": explanation_reason,
+            "classifier_latency_ms": 0.0,
+            "classifier_llm_usage": {},
         }
 
     prompt = """Classify the enterprise question into exactly one label.
@@ -171,7 +209,7 @@ Return JSON only:
 {"answer_intent": "...", "classifier_confidence": 0.0, "classifier_reason": "..."}
 """
     try:
-        response = get_llm().invoke(
+        response, invoke_debug = _invoke_with_diagnostics(
             [
                 SystemMessage(content=prompt),
                 HumanMessage(content=json.dumps({"question": question, "question_type": question_type}, ensure_ascii=False)),
@@ -185,6 +223,8 @@ Return JSON only:
                 "classifier_source": "llm",
                 "classifier_confidence": float(parsed.get("classifier_confidence") or 0.72),
                 "classifier_reason": str(parsed.get("classifier_reason") or "LLM classified the answer intent."),
+                "classifier_latency_ms": float(invoke_debug.get("latency_ms") or 0.0),
+                "classifier_llm_usage": dict(invoke_debug.get("llm_usage") or {}),
             }
     except Exception:
         pass
@@ -195,6 +235,8 @@ Return JSON only:
         "classifier_source": "llm",
         "classifier_confidence": 0.51,
         "classifier_reason": "Fell back to the default intent because rule and LLM classification were inconclusive.",
+        "classifier_latency_ms": 0.0,
+        "classifier_llm_usage": {},
     }
 
 
@@ -530,9 +572,9 @@ def _generate_non_recommendation_answer(
     question_focus: dict[str, object],
     context_text: str,
     evidence_text: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, object]]:
     if not core_facts:
-        return INSUFFICIENT_EVIDENCE_TEXT, "insufficient_core_facts"
+        return INSUFFICIENT_EVIDENCE_TEXT, "insufficient_core_facts", {}
     prompt = (
         f"Answer intent: {answer_intent}\n"
         f"Question:\n{question}\n\n"
@@ -548,7 +590,7 @@ def _generate_non_recommendation_answer(
         + "If the intent is mixed, separate the factual confirmation from the recommended handling."
     )
     try:
-        response = get_llm().invoke(
+        response, invoke_debug = _invoke_with_diagnostics(
             [
                 SystemMessage(content=NON_RECOMMENDATION_PROMPT),
                 HumanMessage(content=prompt),
@@ -556,45 +598,14 @@ def _generate_non_recommendation_answer(
         )
         answer = str(response.content).strip()
         if answer:
-            return answer, "none"
-    except Exception:
-        pass
-    return _build_direct_fact_answer(question, core_facts), "generation_error"
-
-
-def _polish_recommendation_template(
-    question: str,
-    template_answer: str,
-    answer_slots: dict[str, list[str]],
-    core_facts: list[CanonicalFact],
-) -> tuple[str, bool, bool, str]:
-    prompt = (
-        "You are polishing a Chinese enterprise answer. "
-        "Keep the existing structure and facts, but make the prose smoother. "
-        "Do not add facts. Do not include speaker names, timestamps, quoted transcript text, or action-item phrasing."
-    )
-    slot_payload = {key: value for key, value in answer_slots.items() if value}
-    try:
-        response = get_llm().invoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(
-                    content=(
-                        f"Question:\n{question}\n\n"
-                        f"Template answer:\n{template_answer}\n\n"
-                        f"Answer slots:\n{json.dumps(slot_payload, ensure_ascii=False)}\n\n"
-                        "Return a concise polished Chinese answer."
-                    )
-                ),
-            ]
-        )
-        polished = str(response.content).strip()
-        accepted, reason = _postcheck_polished_answer(polished, core_facts)
-        if accepted:
-            return polished, True, False, "none"
-        return template_answer, True, True, reason
-    except Exception:
-        return template_answer, False, True, "generation_error"
+            return answer, "none", invoke_debug
+    except Exception as exc:
+        return _build_direct_fact_answer(question, core_facts), "generation_error", {
+            "stage": "llm_invoke",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+    return _build_direct_fact_answer(question, core_facts), "generation_error", {"stage": "empty_output"}
 
 
 def _generate_recommendation_answer_from_state(
@@ -624,7 +635,7 @@ def _generate_recommendation_answer_from_state(
         },
     }
     try:
-        response = get_llm().invoke(
+        response, invoke_debug = _invoke_with_diagnostics(
             [
                 SystemMessage(content=RECOMMENDATION_RENDER_PROMPT),
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
@@ -633,7 +644,7 @@ def _generate_recommendation_answer_from_state(
         answer = str(response.content).strip()
         accepted, reason = _postcheck_polished_answer(answer, core_facts)
         if answer and accepted:
-            return answer, "llm_structured", "none", {}
+            return answer, "llm_structured", "none", invoke_debug
         template_answer, template_source = _build_recommendation_template(question, answer_slots, slot_coverage)
         return template_answer, template_source, "transcript_style_leak" if reason != "none" else "generation_error", {
             "stage": "postcheck",
@@ -802,14 +813,15 @@ def compose_enterprise_answer(
     polish_rejected_reason = "none"
     fallback_reason = "none"
     final_answer_source = "template"
-    renderer_error: dict[str, str] = {}
+    renderer_error: dict[str, object] = {}
+    renderer_diagnostics: dict[str, object] = {}
 
     if evidence.missing_evidence or not core_facts:
         answer = INSUFFICIENT_EVIDENCE_TEXT
         fallback_reason = "insufficient_core_facts"
         final_answer_source = "weak_template"
     elif answer_intent == "recommendation":
-        answer, final_answer_source, fallback_reason, renderer_error = _generate_recommendation_answer_from_state(
+        answer, final_answer_source, fallback_reason, renderer_diagnostics = _generate_recommendation_answer_from_state(
             question=question,
             core_facts=core_facts,
             secondary_facts=secondary_facts,
@@ -827,7 +839,7 @@ def compose_enterprise_answer(
         rewrite_applied = final_answer_source.startswith("llm_structured")
         rewritten_answer = answer if rewrite_applied else ""
     else:
-        answer, fallback_reason = _generate_non_recommendation_answer(
+        answer, fallback_reason, renderer_diagnostics = _generate_non_recommendation_answer(
             answer_intent=answer_intent,
             question=question,
             core_facts=core_facts,
@@ -838,6 +850,7 @@ def compose_enterprise_answer(
         )
         draft_answer = answer
         final_answer_source = "template" if fallback_reason == "none" else "weak_template"
+    renderer_error = _renderer_error_from_diagnostics(renderer_diagnostics)
 
     if _contains_transcript_style(answer, core_facts):
         fallback_reason = "transcript_style_leak"
@@ -865,6 +878,8 @@ def compose_enterprise_answer(
             "classifier_source": classifier["classifier_source"],
             "classifier_confidence": classifier["classifier_confidence"],
             "classifier_reason": classifier["classifier_reason"],
+            "classifier_latency_ms": classifier.get("classifier_latency_ms", 0.0),
+            "classifier_llm_usage": dict(classifier.get("classifier_llm_usage") or {}),
             "question_focus": question_focus,
             "question_focus_override_reason": override_reason,
             "confidence_reason": "Core facts and answer slots were assembled for the final answer." if core_facts else "No core facts were retained.",
@@ -882,6 +897,19 @@ def compose_enterprise_answer(
             "polish_rejected": polish_rejected,
             "polish_rejected_reason": polish_rejected_reason,
             "renderer_error": renderer_error,
+            "renderer_diagnostics": renderer_diagnostics,
+            "answer_stage_latencies_ms": {
+                "answer_intent_classify": float(classifier.get("classifier_latency_ms") or 0.0),
+                "answer_generate": float(renderer_diagnostics.get("latency_ms") or 0.0),
+            },
+            "llm_usage": {
+                "input_tokens": int((classifier.get("classifier_llm_usage") or {}).get("input_tokens") or 0)
+                + int((renderer_diagnostics.get("llm_usage") or {}).get("input_tokens") or 0),
+                "output_tokens": int((classifier.get("classifier_llm_usage") or {}).get("output_tokens") or 0)
+                + int((renderer_diagnostics.get("llm_usage") or {}).get("output_tokens") or 0),
+                "total_tokens": int((classifier.get("classifier_llm_usage") or {}).get("total_tokens") or 0)
+                + int((renderer_diagnostics.get("llm_usage") or {}).get("total_tokens") or 0),
+            },
             "fallback_reason": fallback_reason,
             "final_answer_source": final_answer_source,
             "template_used": answer_intent == "recommendation",

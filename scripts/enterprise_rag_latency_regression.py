@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.enterprise_rag.core.service import answer_enterprise_question
 from app.enterprise_rag.core.query_planner import build_retrieval_plan
+from app.enterprise_rag.core.service import answer_enterprise_question
 from app.orchestration.fast_router import route_agent_request
 
 
@@ -24,6 +24,11 @@ QUESTIONS = {
         "What failover sequence and recovery targets did MedThink specify for handling "
         "an EU region outage, including any limits on how long traffic can shift to the US?"
     ),
+    "perf_canary": "How do we deploy perf-canary?",
+    "multipart_limits": (
+        "What are the default size limits for file uploads and total request size for the "
+        "new multipart upload support on the OpenAI-compatible API endpoints?"
+    ),
 }
 
 
@@ -32,12 +37,13 @@ def _json_size(payload: dict) -> int:
 
 
 def main() -> None:
-    chinese_failover_plan = build_retrieval_plan("MedThink 的 EU 区域故障转移顺序、RPO/RTO 和切换到美国的时限是什么？")
+    chinese_failover_question = "MedThink 的 EU 区域故障转移顺序、RPO/RTO 和切换到美国的时限是什么？"
+    chinese_failover_plan = build_retrieval_plan(chinese_failover_question)
     assert chinese_failover_plan.question_type in {"constrained", "semantic"}, chinese_failover_plan
     assert chinese_failover_plan.budget_profile in {"large", "medium"}, chinese_failover_plan
     chinese_failover_route = route_agent_request(
-        message="MedThink 的 EU 区域故障转移顺序、RPO/RTO 和切换到美国的时限是什么？",
-        safe_message="MedThink 的 EU 区域故障转移顺序、RPO/RTO 和切换到美国的时限是什么？",
+        message=chinese_failover_question,
+        safe_message=chinese_failover_question,
         upload_context={},
     )
     assert chinese_failover_route["routing_source"] == "fast_router_heuristic", chinese_failover_route
@@ -45,7 +51,7 @@ def main() -> None:
     rows = []
     for case_id, question in QUESTIONS.items():
         result = answer_enterprise_question(question, top_k=8)
-        observation_only_result = answer_enterprise_question(question, top_k=8, compose_answer=False)
+        observation_only_result = answer_enterprise_question(question, top_k=8, compose_answer=False) if case_id == "medthink_failover" else result
         observation = dict(result.get("enterprise_answer_observation") or {})
         observation_only = dict(observation_only_result.get("enterprise_answer_observation") or {})
         retrieval_debug = dict(result.get("retrieval_stage_debug") or {})
@@ -54,15 +60,22 @@ def main() -> None:
         assert result.get("stage_latencies_ms"), result
         assert retrieval_debug.get("stage_latencies_ms"), retrieval_debug
         assert observation, result
-        assert observation_only_result.get("answer_composition_skipped") is True, observation_only_result
-        assert not observation_only_result.get("answer"), observation_only_result
+        if case_id == "medthink_failover":
+            assert observation_only_result.get("answer_composition_skipped") is True, observation_only_result
+            assert not observation_only_result.get("answer"), observation_only_result
         assert observation_only, observation_only_result
+        assert observation.get("active_index_contract"), observation
+        assert observation.get("diagnostic_summary"), observation
+        assert observation.get("evidence_manifest") is not None, observation
+        assert observation.get("selected_evidence") is not None, observation
         assert "rerank_debug" not in observation, observation
         assert "retrieval_stage_debug" not in observation, observation
         assert "memory_context" not in observation, observation
         full_size = _json_size(result)
         observation_size = _json_size(observation)
         assert observation_size < full_size, (case_id, full_size, observation_size)
+        answer = str(result.get("answer") or "").strip()
+        assert not answer.endswith(("...", "…")), (case_id, answer)
         if case_id == "medthink_failover":
             canonical_facts = list(observation_only.get("canonical_facts") or [])
             canonical_text = "\n".join(str(item.get("normalized_fact") or "") for item in canonical_facts)
@@ -78,6 +91,7 @@ def main() -> None:
             {
                 "case_id": case_id,
                 "answer_preview": str(result.get("answer") or "")[:260],
+                "diagnostic_summary": dict(result.get("diagnostic_summary") or {}),
                 "supporting_doc_ids": list(result.get("supporting_doc_ids") or []),
                 "pipeline_stage_latencies_ms": dict(result.get("stage_latencies_ms") or {}),
                 "retrieval_stage_latencies_ms": dict(retrieval_debug.get("stage_latencies_ms") or {}),

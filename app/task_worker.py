@@ -1041,6 +1041,25 @@ def enterprise_rag_benchmark_task(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+@celery_app.task(bind=True, name="app.task_worker.enterprise_rag_query_task")
+def enterprise_rag_query_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+    from app.enterprise_rag.core.service import answer_enterprise_question, build_public_enterprise_query_payload
+
+    payload = dict(payload or {})
+    self.update_state(state="PROGRESS", meta={"stage": "retrieval_and_answer"})
+    result = answer_enterprise_question(
+        str(payload.get("question") or ""),
+        source_types=list(payload.get("source_types") or []),
+        top_k=max(1, min(int(payload.get("top_k") or 8), 30)),
+        session_id=str(payload.get("session_id") or ""),
+        conversation_id=str(payload.get("conversation_id") or ""),
+        actor_context=dict(payload.get("actor_context") or {}),
+        compose_answer=True,
+        correlation_id=str(payload.get("correlation_id") or ""),
+    )
+    return build_public_enterprise_query_payload(result, include_debug_details=bool(payload.get("include_debug_details", False)))
+
+
 @celery_app.task(name="app.task_worker.write_conversation_memory_summary_task")
 def write_conversation_memory_summary_task(payload: dict[str, Any]) -> dict[str, Any]:
     from app.conversation_memory import write_turn_summary
