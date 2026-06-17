@@ -305,7 +305,7 @@ def run_thread_store() -> dict[str, Any]:
         list_communication_threads,
         set_active_communication_thread,
     )
-    from app.inbound_mail_store import get_inbound_message, list_notifications
+    from app.inbound_mail_store import create_notification, get_inbound_message, list_notifications
     from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import UnifiedAgentRequest
     from app.orchestration.types import OrchestrationContext
@@ -417,6 +417,13 @@ def run_thread_store() -> dict[str, Any]:
         str(actor_a_digest["notification"].get("notification_id") or ""),
         str(actor_b_digest["notification"].get("notification_id") or ""),
     }
+    direct_leaky_digest = create_notification(
+        "daily_mail_digest",
+        "Leaky Actor A renewal",
+        "customer-a@example.com: Actor A latest renewal summary.",
+        {"summary": actor_a_summary},
+    )
+    digest_notification_ids.add(str(direct_leaky_digest.get("notification_id") or ""))
     outbox_digest_notifications = [
         item
         for item in list_notifications(event_type="daily_mail_digest", limit=200)
@@ -427,8 +434,8 @@ def run_thread_store() -> dict[str, Any]:
         for item in main_module.notification_outbox_api(event_type="daily_mail_digest", limit=200)
         if str(getattr(item, "notification_id", "") or "") in digest_notification_ids
     ]
-    _assert_equal(len(outbox_digest_notifications), 2, "store outbox contains both new digest notifications")
-    _assert_equal(len(api_digest_notifications), 2, "public outbox contains both new digest notifications")
+    _assert_equal(len(outbox_digest_notifications), 3, "store outbox contains new digest notifications")
+    _assert_equal(len(api_digest_notifications), 3, "public outbox contains new digest notifications")
     digest_sensitive_markers = [
         shared_provider_message_id,
         str(actor_a_shared["message_id"] or ""),

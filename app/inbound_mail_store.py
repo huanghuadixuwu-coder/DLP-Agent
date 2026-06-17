@@ -75,7 +75,25 @@ def _decode_notification(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     item = dict(row)
     item["payload_json"] = _decode_json(item.get("payload_json"), {})
+    if item.get("event_type") == "daily_mail_digest":
+        item["title"] = "Mail digest generated"
+        item["body"] = "Digest details are available only in the actor-scoped response."
+        item["payload_json"] = _redacted_digest_payload(item["payload_json"])
     return item
+
+
+def _redacted_digest_payload(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    redacted: dict[str, Any] = {
+        "details_redacted": True,
+        "redaction_reason": "actor_scoped_digest",
+    }
+    for key in ("since", "until"):
+        value = data.get(key) or summary.get(key)
+        if value:
+            redacted[key] = str(value)
+    return redacted
 
 
 def init_inbound_mail_store() -> None:
@@ -474,6 +492,11 @@ def create_notification(
     init_inbound_mail_store()
     now = _now()
     notification_id = _new_id("notify")
+    payload_to_store = payload or {}
+    if event_type == "daily_mail_digest":
+        title = "Mail digest generated"
+        body = "Digest details are available only in the actor-scoped response."
+        payload_to_store = _redacted_digest_payload(payload_to_store)
     with _connect() as conn:
         conn.execute(
             """
@@ -486,7 +509,7 @@ def create_notification(
                 event_type,
                 title,
                 body,
-                json.dumps(payload or {}, ensure_ascii=False),
+                json.dumps(payload_to_store, ensure_ascii=False),
                 status,
                 now,
             ),
