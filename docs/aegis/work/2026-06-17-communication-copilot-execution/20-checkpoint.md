@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 1 reset top-level product framing and freeze the migration boundary.
+- Start Task 2 introduce canonical communication domain contracts.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -15,9 +15,12 @@ Completed todos:
 - Task 0B tracker line-reference fixes landed in `63aa5d2` and `63beb1a`.
 - Task 0B spec compliance review passed after line-reference repair.
 - Task 0B code/document quality review passed after stale tracker references were removed.
+- Task 1 reframed top-level docs around Communication Copilot in `da9be5c`.
+- Task 1 inventory reference repair landed in `f0df72e`.
+- Task 1 spec compliance and code/document quality reviews passed.
 
 Active slice:
-- Task 1 preparation.
+- Task 2 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -27,15 +30,19 @@ Evidence refs:
 - Task 0B touched only allowlisted backend/docs files and did not change frontend style.
 - Task 0B Docker verification passed for compileall, agent runtime regression, and mail authoring regression.
 - Task 0B EnterpriseRAG regression could not complete because `/app/questions.parquet` is missing in the active Docker container; the data gap is recorded in `problem_todolist.md` and `todolist.md`.
+- Task 1 touched only `README.md`, `todolist.md`, and `problem_todolist.md`.
+- Task 1 search verification removed conflicting top-level `LeetCode`, `chat-first`, `RAG Agent`, and `统一聊天入口` framing from active docs.
+- Task 1 clarified that current README framing is Communication Copilot and that pre-Task-1 README identity references are historical inventory, not current carriers.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks RAG-specific regression evidence but not Task 1 docs framing.
 
 Next step:
-- Dispatch Task 1 worker with docs-only scope: reset top-level product framing while preserving migration boundaries and without touching frontend style.
+- Dispatch Task 2 worker to add `app/communication/` contracts and `scripts/communication_copilot_regression.py --case contracts_import`.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
-- Compatibility: no UI style files changed in Task 0A or Task 0B.
+- Compatibility: no UI style files changed in Task 0A, Task 0B, or Task 1.
 - Retirement: Task 0B followed the inventory categories; active runtime dependencies remain quarantined rather than deleted.
+- Product boundary: Task 1 changed docs only; no runtime ownership was moved yet.
 - Decision: continue.

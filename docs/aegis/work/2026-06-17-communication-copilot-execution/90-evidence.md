@@ -22,3 +22,11 @@ Docker verification evidence for Task 0B:
 - `docker compose exec -T api python scripts/agent_runtime_regression.py`: passed.
 - `docker compose exec -T api python scripts/mail_authoring_contract_regression.py`: passed.
 - `docker compose exec -T api python scripts/enterprise_rag_regression.py --limit 4`: blocked by missing `/app/questions.parquet`; recorded as an environment/data gap, not hidden as success.
+
+Task 1 evidence:
+- Worker framing commit: `da9be5c`.
+- Worker inventory reference fix commit: `f0df72e`.
+- Spec compliance reviewer passed Task 1 and confirmed only `README.md`, `todolist.md`, and `problem_todolist.md` changed.
+- Code/document quality reviewer passed after stale README line references were marked as historical pre-Task-1 locations.
+- `rg -n "LeetCode|chat-first|RAG Agent|统一聊天入口|缁熶竴鑱婂ぉ鍏ュ彛" README.md todolist.md problem_todolist.md`: no matches after Task 1.
+- `git diff --check -- README.md todolist.md problem_todolist.md`: passed.
