@@ -304,6 +304,7 @@ def run_thread_store() -> dict[str, Any]:
         set_active_communication_thread,
     )
     from app.inbound_mail_store import get_inbound_message
+    from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import UnifiedAgentRequest
 
     suffix = uuid4().hex[:8]
@@ -376,6 +377,44 @@ def run_thread_store() -> dict[str, Any]:
     _assert_equal(actor_b_shared.get("provider_message_id"), shared_provider_message_id, "actor B provider message id")
     if actor_a_shared["message_id"] == actor_b_shared["message_id"]:
         raise AssertionError("actor-scoped inbound storage keys collided")
+
+    provider = CurrentImapSmtpMailProvider()
+    provider_search_a = provider.search_messages(limit=10, actor_context=actor_a)
+    provider_search_b = provider.search_messages(limit=10, actor_context=actor_b)
+    _assert_true(provider_search_a.ok, "provider actor A search ok")
+    _assert_true(provider_search_b.ok, "provider actor B search ok")
+    provider_a_message_ids = {
+        str(item.get("message_id") or "") for item in list(provider_search_a.data.get("messages") or [])
+    }
+    provider_b_message_ids = {
+        str(item.get("message_id") or "") for item in list(provider_search_b.data.get("messages") or [])
+    }
+    _assert_true(actor_a_shared["message_id"] in provider_a_message_ids, "provider actor A search includes own message")
+    _assert_true(actor_b_shared["message_id"] not in provider_a_message_ids, "provider actor A search excludes actor B message")
+    _assert_true(actor_b_shared["message_id"] in provider_b_message_ids, "provider actor B search includes own message")
+    _assert_true(actor_a_shared["message_id"] not in provider_b_message_ids, "provider actor B search excludes actor A message")
+
+    provider_read_a = provider.read_message(shared_provider_message_id, actor_context=actor_a)
+    provider_read_b = provider.read_message(shared_provider_message_id, actor_context=actor_b)
+    _assert_true(provider_read_a.ok, "provider actor A read shared provider id")
+    _assert_true(provider_read_b.ok, "provider actor B read shared provider id")
+    provider_read_a_message = dict(provider_read_a.data.get("message") or {})
+    provider_read_b_message = dict(provider_read_b.data.get("message") or {})
+    _assert_equal(provider_read_a_message.get("thread_id"), thread_a, "provider actor A read thread")
+    _assert_equal(provider_read_b_message.get("thread_id"), thread_b, "provider actor B read thread")
+    _assert_equal(
+        provider_read_a_message.get("provider_message_id"),
+        shared_provider_message_id,
+        "provider actor A preserved provider id",
+    )
+    _assert_equal(
+        provider_read_b_message.get("provider_message_id"),
+        shared_provider_message_id,
+        "provider actor B preserved provider id",
+    )
+    blocked_cross_read = provider.read_message(str(actor_b_shared["message_id"] or ""), actor_context=actor_a)
+    _assert_equal(blocked_cross_read.ok, False, "provider actor A cannot read actor B storage id")
+    _assert_equal(blocked_cross_read.status, "not_found", "provider cross actor read status")
 
     actor_a_threads = list_communication_threads(actor_context=actor_a, limit=5)
     actor_b_threads = list_communication_threads(actor_context=actor_b, limit=5)

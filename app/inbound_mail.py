@@ -520,8 +520,15 @@ def list_inbound_mail_messages(
     until: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    actor_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    return list_inbound_messages(since=since, until=until, limit=limit, offset=offset)
+    return list_inbound_messages(
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+        actor_context=actor_context,
+    )
 
 
 def get_inbound_mail_summary(since: str | None = None, until: str | None = None) -> dict[str, Any]:

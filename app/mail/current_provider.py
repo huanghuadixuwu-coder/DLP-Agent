@@ -40,7 +40,7 @@ def _message_from_row(row: dict[str, Any]) -> MailMessage:
         labels = ["seen"] if row.get("is_seen") else ["unread"]
     return MailMessage(
         message_id=str(row.get("message_id") or ""),
-        provider_message_id=str(row.get("uid") or row.get("message_id") or ""),
+        provider_message_id=str(row.get("provider_message_id") or row.get("uid") or row.get("message_id") or ""),
         thread_id=str(row.get("thread_id") or _thread_id_for_message(row)),
         provider_thread_id=str(row.get("provider_thread_id") or ""),
         mailbox=str(row.get("mailbox") or "INBOX"),
@@ -111,7 +111,10 @@ class CurrentImapSmtpMailProvider:
     ) -> MailProviderResponse:
         operation = "search_messages"
         try:
-            rows = list_inbound_mail_messages(limit=max(1, min(200, int(limit or 20) * 4)))
+            rows = list_inbound_mail_messages(
+                limit=max(1, min(200, int(limit or 20) * 4)),
+                actor_context=actor_context,
+            )
             needle = str(query or "").strip().lower()
             if needle:
                 rows = [
@@ -143,7 +146,7 @@ class CurrentImapSmtpMailProvider:
     def read_message(self, message_id: str, *, actor_context: dict[str, Any] | None = None) -> MailProviderResponse:
         operation = "read_message"
         try:
-            row = get_inbound_message(str(message_id or ""))
+            row = get_inbound_message(str(message_id or ""), actor_context=actor_context)
             if not row:
                 return self._response(
                     operation=operation,
