@@ -30,3 +30,12 @@ Task 1 evidence:
 - Code/document quality reviewer passed after stale README line references were marked as historical pre-Task-1 locations.
 - `rg -n "LeetCode|chat-first|RAG Agent|统一聊天入口|缁熶竴鑱婂ぉ鍏ュ彛" README.md todolist.md problem_todolist.md`: no matches after Task 1.
 - `git diff --check -- README.md todolist.md problem_todolist.md`: passed.
+
+Task 2 evidence:
+- Worker contract commit: `040b85e`.
+- Spec compliance reviewer passed Task 2 and confirmed required dataclasses, observation builders, and regression script behavior.
+- Code quality reviewer passed Task 2 and confirmed no runtime/API/DB/frontend/style changes.
+- `docker compose exec -T api python -m compileall -q app`: passed.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case contracts_import`: passed.
+- `rg -n "communication_brief|communication_thread" app`: new contract package references only.
+- `git diff --check -- app/communication scripts/communication_copilot_regression.py`: passed.

@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 2 introduce canonical communication domain contracts.
+- Start Task 3 build communication-thread resolution and brief assembly.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -18,9 +18,11 @@ Completed todos:
 - Task 1 reframed top-level docs around Communication Copilot in `da9be5c`.
 - Task 1 inventory reference repair landed in `f0df72e`.
 - Task 1 spec compliance and code/document quality reviews passed.
+- Task 2 added canonical communication contracts and contract regression in `040b85e`.
+- Task 2 spec compliance and code quality reviews passed.
 
 Active slice:
-- Task 2 preparation.
+- Task 3 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -33,16 +35,19 @@ Evidence refs:
 - Task 1 touched only `README.md`, `todolist.md`, and `problem_todolist.md`.
 - Task 1 search verification removed conflicting top-level `LeetCode`, `chat-first`, `RAG Agent`, and `统一聊天入口` framing from active docs.
 - Task 1 clarified that current README framing is Communication Copilot and that pre-Task-1 README identity references are historical inventory, not current carriers.
+- Task 2 added `app/communication/` contracts without API, DB, runtime, frontend, or style changes.
+- Task 2 Docker verification passed for compileall and `scripts/communication_copilot_regression.py --case contracts_import`.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks RAG-specific regression evidence but not Task 1 docs framing.
 
 Next step:
-- Dispatch Task 2 worker to add `app/communication/` contracts and `scripts/communication_copilot_regression.py --case contracts_import`.
+- Dispatch Task 3 worker to add communication-thread resolution and brief assembly using the new contracts.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
 - Compatibility: no UI style files changed in Task 0A, Task 0B, or Task 1.
 - Retirement: Task 0B followed the inventory categories; active runtime dependencies remain quarantined rather than deleted.
 - Product boundary: Task 1 changed docs only; no runtime ownership was moved yet.
+- Contract boundary: Task 2 introduced additive internal types only; no active behavior moved yet.
 - Decision: continue.
