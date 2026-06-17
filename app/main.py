@@ -82,7 +82,7 @@ from app.inbound_mail import (
 )
 from app.inbound_mail_store import init_inbound_mail_store, list_notifications, list_recent_inbound_threads
 from app.mail.current_provider import CurrentImapSmtpMailProvider
-from app.mail.access import is_inbound_mail_tool, mark_mail_read_authorized
+from app.mail.access import is_inbound_mail_tool, is_mail_read_authorized, mark_mail_read_authorized
 from app.mail.draft_store import (
     bind_mail_draft_task,
     build_persisted_confirmation_payload,
@@ -938,7 +938,7 @@ def _collect_outbound_candidates(
                 content_type="application/json",
             )
 
-    if actor_context:
+    if actor_context and is_mail_read_authorized(actor_context):
         with suppress(Exception):
             for thread in list_recent_inbound_threads(limit=3, messages_per_thread=5, actor_context=actor_context):
                 thread_id = str(thread.get("thread_id") or thread.get("provider_thread_id") or "").strip()
@@ -1024,6 +1024,10 @@ def _build_outbound_resolution(
         explicit_summary=_looks_like_summary_reference(payload.message),
         send_both=_looks_like_send_both_request(payload.message),
     )
+
+
+def _contains_inbound_mail_candidates(candidates: list[dict[str, Any]] | None) -> bool:
+    return any(str(item.get("kind") or "") == "mail_thread" for item in list(candidates or []))
 
 
 
@@ -4455,7 +4459,7 @@ def _execute_fast_path(
                 source="inbound_mail_summary",
                 grounding_kind="tool",
                 summary="已获取当前收件箱摘要和同步状态。",
-                payload={"summary": summary, "sync_state": latest_sync_state()},
+                payload={"summary": summary, "sync_state": latest_sync_state(actor_context=actor_context)},
                 citations=[],
                 confidence=0.92,
                 actor_context=actor_context,
@@ -4937,7 +4941,7 @@ def _handle_compound_agent_request(
                     "source": "inbound_mail_summary",
                     "grounding_kind": "tool",
                     "summary": "已获取当前收件箱摘要和同步状态。",
-                    "payload": {"summary": result, "sync_state": latest_sync_state()},
+                    "payload": {"summary": result, "sync_state": latest_sync_state(actor_context=actor_context)},
                     "citations": [],
                     "confidence": 0.92,
                 }
@@ -5006,7 +5010,7 @@ def _handle_compound_agent_request(
             )
         elif subtask.capability == "inbound_mail_summary":
             summary = get_inbound_mail_summary(actor_context=actor_context)
-            sync_state = latest_sync_state()
+            sync_state = latest_sync_state(actor_context=actor_context)
             result = {"summary": summary, "sync_state": sync_state}
             observations.append(
                 _build_mailbox_summary_observation(
@@ -5724,7 +5728,7 @@ def admin_task_stats(request: Request) -> dict[str, Any]:
 def admin_mail_provider_health(request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
     permission_decision = _ensure_permission(actor, "admin.read", "mail_provider_health")
-    response = CurrentImapSmtpMailProvider().get_health()
+    response = CurrentImapSmtpMailProvider().get_health(actor_context=actor.to_dict())
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
@@ -6869,6 +6873,8 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
         and continuation_decision.continuation_type == "choose_source"
         and source_pending_object is not None
     ):
+        if _contains_inbound_mail_candidates(list(source_pending_object.payload.get("candidates") or [])):
+            actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
         clarified_mail_action_plan = _resolve_pending_mail_source_clarification(
             user_message=payload.message,
             pending_payload=dict(source_pending_object.payload),

@@ -428,10 +428,18 @@ def sync_inbound_mail(
     mailbox = settings.imap_mailbox or "INBOX"
     actor = actor_from_mapping(actor_context or {})
     if not settings.imap_enabled:
-        state = update_sync_state(mailbox, last_error="IMAP is disabled. Set IMAP_ENABLED=true after configuring IMAP credentials.")
+        state = update_sync_state(
+            mailbox,
+            last_error="IMAP is disabled. Set IMAP_ENABLED=true after configuring IMAP credentials.",
+            actor_context=actor.to_dict(),
+        )
         return {"enabled": False, "synced": 0, "new": 0, "mailbox": mailbox, "state": state}
     if not settings.imap_username or not settings.imap_password:
-        state = update_sync_state(mailbox, last_error="IMAP credentials are incomplete. Configure IMAP_USERNAME and IMAP_PASSWORD.")
+        state = update_sync_state(
+            mailbox,
+            last_error="IMAP credentials are incomplete. Configure IMAP_USERNAME and IMAP_PASSWORD.",
+            actor_context=actor.to_dict(),
+        )
         return {"enabled": False, "synced": 0, "new": 0, "mailbox": mailbox, "state": state}
 
     start, end = (since, until) if since and until else default_digest_window()
@@ -505,9 +513,9 @@ def sync_inbound_mail(
                                 "redaction_reason": "actor_scoped_inbound_mail",
                             },
                         )
-            state = update_sync_state(mailbox, last_seen_uid=max_uid, last_error="")
+            state = update_sync_state(mailbox, last_seen_uid=max_uid, last_error="", actor_context=actor.to_dict())
     except Exception as exc:
-        state = update_sync_state(mailbox, last_error=str(exc))
+        state = update_sync_state(mailbox, last_error=str(exc), actor_context=actor.to_dict())
         return {"enabled": True, "ok": False, "synced": synced, "new": new_count, "mailbox": mailbox, "error": str(exc), "state": state}
 
     return {"enabled": True, "ok": True, "synced": synced, "new": new_count, "mailbox": mailbox, "state": state}
@@ -566,7 +574,7 @@ def get_inbound_mail_summary(
         until or end.isoformat(),
         actor_context=actor_context,
     )
-    summary["sync_state"] = latest_sync_state()
+    summary["sync_state"] = latest_sync_state(actor_context=actor_context)
     return summary
 
 
@@ -598,6 +606,6 @@ def draft_reply_for_message(message_id: str, *, actor_context: dict[str, Any] | 
     return {"message": message, "draft_reply": draft, "requires_dlp_before_send": True}
 
 
-def latest_sync_state() -> dict[str, Any]:
+def latest_sync_state(actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = get_settings()
-    return get_sync_state(settings.imap_mailbox or "INBOX")
+    return get_sync_state(settings.imap_mailbox or "INBOX", actor_context=actor_context)

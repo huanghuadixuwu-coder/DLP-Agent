@@ -137,11 +137,15 @@ def init_inbound_mail_store() -> None:
                 );
 
                 CREATE TABLE IF NOT EXISTS mail_sync_state (
-                    mailbox TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'local-dev',
+                    user_id TEXT NOT NULL DEFAULT 'local-user',
+                    workspace_id TEXT NOT NULL DEFAULT 'default',
+                    mailbox TEXT NOT NULL,
                     last_seen_uid TEXT NOT NULL DEFAULT '',
                     last_sync_at TEXT NOT NULL DEFAULT '',
                     last_error TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, workspace_id, user_id, mailbox)
                 );
 
                 CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -189,6 +193,58 @@ def init_inbound_mail_store() -> None:
             ]:
                 if column_name not in existing_columns:
                     conn.execute(f"ALTER TABLE inbound_mail_messages ADD COLUMN {column_name} {column_sql}")
+            sync_columns = {
+                row["column_name"]
+                for row in conn.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'mail_sync_state'
+                    """
+                ).fetchall()
+            }
+            for column_name, column_sql in [
+                ("tenant_id", "TEXT NOT NULL DEFAULT 'local-dev'"),
+                ("user_id", "TEXT NOT NULL DEFAULT 'local-user'"),
+                ("workspace_id", "TEXT NOT NULL DEFAULT 'default'"),
+            ]:
+                if column_name not in sync_columns:
+                    conn.execute(f"ALTER TABLE mail_sync_state ADD COLUMN {column_name} {column_sql}")
+            conn.execute(
+                """
+                DO $$
+                DECLARE
+                    mailbox_attnum smallint;
+                    pk_name text;
+                BEGIN
+                    SELECT attnum INTO mailbox_attnum
+                    FROM pg_attribute
+                    WHERE attrelid = 'mail_sync_state'::regclass
+                      AND attname = 'mailbox';
+
+                    SELECT conname INTO pk_name
+                    FROM pg_constraint
+                    WHERE conrelid = 'mail_sync_state'::regclass
+                      AND contype = 'p'
+                      AND conkey = ARRAY[mailbox_attnum];
+
+                    IF pk_name IS NOT NULL THEN
+                        EXECUTE format('ALTER TABLE mail_sync_state DROP CONSTRAINT %I', pk_name);
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'mail_sync_state'::regclass
+                          AND contype = 'p'
+                    ) THEN
+                        ALTER TABLE mail_sync_state
+                        ADD CONSTRAINT mail_sync_state_actor_mailbox_pkey
+                        PRIMARY KEY (tenant_id, workspace_id, user_id, mailbox);
+                    END IF;
+                END $$;
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_inbound_mail_actor_received
@@ -198,6 +254,8 @@ def init_inbound_mail_store() -> None:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_mail_actor_provider_message
                     ON inbound_mail_messages(tenant_id, workspace_id, user_id, provider_message_id)
                     WHERE provider_message_id <> '';
+                CREATE INDEX IF NOT EXISTS idx_mail_sync_state_actor_updated
+                    ON mail_sync_state(tenant_id, workspace_id, user_id, updated_at DESC);
                 """
             )
             conn.commit()
@@ -452,25 +510,51 @@ def inbound_summary(since: str, until: str, *, actor_context: dict[str, Any] | N
     }
 
 
-def get_sync_state(mailbox: str) -> dict[str, Any]:
+def get_sync_state(mailbox: str, *, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
     init_inbound_mail_store()
+    actor = actor_from_mapping(actor_context or {})
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM mail_sync_state WHERE mailbox = %s",
-            (mailbox,),
+            """
+            SELECT *
+            FROM mail_sync_state
+            WHERE tenant_id = %s
+              AND workspace_id = %s
+              AND user_id = %s
+              AND mailbox = %s
+            """,
+            (actor.tenant_id, actor.workspace_id, actor.user_id, mailbox),
         ).fetchone()
-    return dict(row) if row else {"mailbox": mailbox, "last_seen_uid": "", "last_sync_at": "", "last_error": ""}
+    return dict(row) if row else {
+        "tenant_id": actor.tenant_id,
+        "workspace_id": actor.workspace_id,
+        "user_id": actor.user_id,
+        "mailbox": mailbox,
+        "last_seen_uid": "",
+        "last_sync_at": "",
+        "last_error": "",
+    }
 
 
-def update_sync_state(mailbox: str, *, last_seen_uid: str = "", last_error: str = "") -> dict[str, Any]:
+def update_sync_state(
+    mailbox: str,
+    *,
+    last_seen_uid: str = "",
+    last_error: str = "",
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     init_inbound_mail_store()
+    actor = actor_from_mapping(actor_context or {})
     now = _now()
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO mail_sync_state (mailbox, last_seen_uid, last_sync_at, last_error, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (mailbox) DO UPDATE SET
+            INSERT INTO mail_sync_state (
+                tenant_id, workspace_id, user_id, mailbox,
+                last_seen_uid, last_sync_at, last_error, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, workspace_id, user_id, mailbox) DO UPDATE SET
                 last_seen_uid = CASE
                     WHEN EXCLUDED.last_seen_uid <> '' THEN EXCLUDED.last_seen_uid
                     ELSE mail_sync_state.last_seen_uid
@@ -479,10 +563,10 @@ def update_sync_state(mailbox: str, *, last_seen_uid: str = "", last_error: str 
                 last_error = EXCLUDED.last_error,
                 updated_at = EXCLUDED.updated_at
             """,
-            (mailbox, last_seen_uid, now, last_error, now),
+            (actor.tenant_id, actor.workspace_id, actor.user_id, mailbox, last_seen_uid, now, last_error, now),
         )
         conn.commit()
-    return get_sync_state(mailbox)
+    return get_sync_state(mailbox, actor_context=actor.to_dict())
 
 
 def create_notification(

@@ -103,7 +103,7 @@ def _inbound_mail_summary(payload: dict[str, Any], context: OrchestrationContext
         until=payload.get("until"),
         actor_context=context.actor_context,
     )
-    result["sync_state"] = latest_sync_state()
+    result["sync_state"] = latest_sync_state(actor_context=context.actor_context)
     return result
 
 

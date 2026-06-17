@@ -254,7 +254,7 @@ class CurrentImapSmtpMailProvider:
                 data={
                     "mailbox": mailbox,
                     "external_sync_allowed": False,
-                    "local_sync_state": latest_sync_state(),
+                    "local_sync_state": latest_sync_state(actor_context=actor_context),
                 },
                 error_code="external_sync_disabled_for_contract",
                 error_message="Current provider sync is available but disabled for contract/regression execution.",
@@ -374,11 +374,11 @@ class CurrentImapSmtpMailProvider:
             error_message="Current IMAP/SMTP adapter does not support provider-native label writes.",
         )
 
-    def get_health(self) -> MailProviderResponse:
+    def get_health(self, *, actor_context: dict[str, Any] | None = None) -> MailProviderResponse:
         settings = get_settings()
         smtp_configured = bool(settings.smtp_username and settings.smtp_password and (settings.smtp_from or settings.smtp_username))
         imap_configured = bool(settings.imap_enabled and settings.imap_username and settings.imap_password)
-        state = latest_sync_state()
+        state = latest_sync_state(actor_context=actor_context)
         status = "healthy" if (smtp_configured or imap_configured) else "provider_not_configured"
         return self._response(
             operation="get_health",

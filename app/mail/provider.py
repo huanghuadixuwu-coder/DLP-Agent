@@ -154,5 +154,5 @@ class MailProvider(Protocol):
     ) -> MailProviderResponse:
         ...
 
-    def get_health(self) -> MailProviderResponse:
+    def get_health(self, *, actor_context: dict[str, Any] | None = None) -> MailProviderResponse:
         ...

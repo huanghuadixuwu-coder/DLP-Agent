@@ -308,7 +308,13 @@ def run_thread_store() -> dict[str, Any]:
         set_active_communication_thread,
         upsert_thread_projection,
     )
-    from app.inbound_mail_store import create_notification, get_inbound_message, list_notifications
+    from app.inbound_mail_store import (
+        create_notification,
+        get_inbound_message,
+        get_sync_state,
+        list_notifications,
+        update_sync_state,
+    )
     from app.mail.access import mark_mail_read_authorized
     from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import InboundMailSyncRequest, UnifiedAgentRequest
@@ -886,6 +892,50 @@ def run_thread_store() -> dict[str, Any]:
         main_module.render_final_answer = original_main_render_final_answer
         main_module.route_agent_request = original_main_route_agent_request
 
+    sync_state_a_uid = f"sync-state-a-{suffix}"
+    sync_state_b_uid = f"sync-state-b-{suffix}"
+    sync_state_local_uid = f"sync-state-local-{suffix}"
+    update_sync_state("INBOX", last_seen_uid=sync_state_a_uid, actor_context=actor_a)
+    update_sync_state("INBOX", last_seen_uid=sync_state_b_uid, last_error="actor b sync error", actor_context=actor_b)
+    update_sync_state("INBOX", last_seen_uid=sync_state_local_uid, actor_context=ActorContext().to_dict())
+    _assert_equal(
+        get_sync_state("INBOX", actor_context=actor_a).get("last_seen_uid"),
+        sync_state_a_uid,
+        "actor A sync state retained",
+    )
+    _assert_equal(
+        get_sync_state("INBOX", actor_context=actor_b).get("last_seen_uid"),
+        sync_state_b_uid,
+        "actor B sync state retained",
+    )
+    _assert_equal(
+        inbound_mail_module.latest_sync_state(actor_context=actor_a).get("last_seen_uid"),
+        sync_state_a_uid,
+        "actor A latest sync state is actor-scoped",
+    )
+    _assert_equal(
+        inbound_mail_module.latest_sync_state(actor_context=actor_b).get("last_error"),
+        "actor b sync error",
+        "actor B latest sync state error is actor-scoped",
+    )
+    _assert_equal(
+        inbound_mail_module.latest_sync_state().get("last_seen_uid"),
+        sync_state_local_uid,
+        "local-dev default sync state remains compatible",
+    )
+    provider_disabled_sync_b = CurrentImapSmtpMailProvider(allow_external_sync=False).sync_mailbox(actor_context=actor_b)
+    _assert_equal(
+        dict(provider_disabled_sync_b.data.get("local_sync_state") or {}).get("last_seen_uid"),
+        sync_state_b_uid,
+        "provider disabled sync response uses actor-scoped sync state",
+    )
+    provider_health_a = CurrentImapSmtpMailProvider().get_health(actor_context=actor_a)
+    _assert_equal(
+        dict(provider_health_a.data.get("sync_state") or {}).get("last_seen_uid"),
+        sync_state_a_uid,
+        "provider health response uses actor-scoped sync state",
+    )
+
     from datetime import datetime, timezone
 
     sync_provider_message_id = f"sync-provider-msg-{suffix}"
@@ -1058,17 +1108,87 @@ def run_thread_store() -> dict[str, Any]:
         conversation_id=f"conversation-thread-store-{suffix}",
         message="Please summarize the recent customer thread.",
     )
-    actor_a_candidates = main_module._collect_outbound_candidates(
+    actor_a_unauthorized_candidates = main_module._collect_outbound_candidates(
         payload,
         payload.conversation_id or "",
         {},
         actor_context=actor_a,
+    )
+    _assert_equal(
+        [item for item in actor_a_unauthorized_candidates if item.get("kind") == "mail_thread"],
+        [],
+        "unmarked non-local outbound candidates do not include inbound mail threads",
+    )
+    actor_a_candidates = main_module._collect_outbound_candidates(
+        payload,
+        payload.conversation_id or "",
+        {},
+        actor_context=mark_mail_read_authorized(actor_a),
     )
     actor_a_mail_candidate_ids = {
         str(item.get("candidate_id") or "") for item in actor_a_candidates if item.get("kind") == "mail_thread"
     }
     _assert_true(f"mail-thread:{thread_a}" in actor_a_mail_candidate_ids, "actor A outbound candidate includes own thread")
     _assert_true(f"mail-thread:{thread_b}" not in actor_a_mail_candidate_ids, "actor A outbound candidates exclude actor B thread")
+
+    original_mail_renderer = main_module.render_mail_authoring
+    original_source_resolver = main_module.resolve_mail_source_request
+    main_module.render_mail_authoring = lambda **_kwargs: {
+        "clarification_question": "Please provide the mail body or source.",
+        "user_message": "Please provide the mail body or source.",
+        "token_in": 0,
+        "token_out": 0,
+        "estimated_cost": 0.0,
+    }
+    main_module.resolve_mail_source_request = lambda **_kwargs: {
+        "referential_request": True,
+        "selected_candidate_ids": [],
+        "source_mode": "none",
+        "compose_mode": "recipient_ready_summary",
+        "needs_clarification": True,
+        "confidence": 1.0,
+        "reason": "stubbed regression source resolution",
+        "classifier_source": "stubbed_regression",
+    }
+    try:
+        spoof_mail_action_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=f"session-mail-action-spoof-{suffix}",
+                message="Send the recent customer thread to reviewer@example.com",
+                tenant_id=actor_a["tenant_id"],
+                user_id=actor_a["user_id"],
+                workspace_id=actor_a["workspace_id"],
+            ),
+            SimpleNamespace(headers={}),
+        )
+        spoof_mail_action_json = json.dumps(spoof_mail_action_response.model_dump(), ensure_ascii=False, default=str)
+        _assert_true(
+            f"mail-thread:{thread_a}" not in spoof_mail_action_json,
+            "spoofed mail-action chat does not leak inbound candidate id",
+        )
+        _assert_true(
+            "Actor A latest renewal summary" not in spoof_mail_action_json,
+            "spoofed mail-action chat does not leak inbound candidate summary",
+        )
+        authenticated_mail_action_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=f"session-mail-action-auth-{suffix}",
+                message="Send the recent customer thread to reviewer@example.com",
+            ),
+            actor_a_request,
+        )
+        authenticated_mail_action_json = json.dumps(
+            authenticated_mail_action_response.model_dump(),
+            ensure_ascii=False,
+            default=str,
+        )
+        _assert_true(
+            f"mail-thread:{thread_a}" in authenticated_mail_action_json,
+            "authenticated mail-action chat can use inbound candidate",
+        )
+    finally:
+        main_module.render_mail_authoring = original_mail_renderer
+        main_module.resolve_mail_source_request = original_source_resolver
 
     main_module._ensure_internal_communication_thread_access(
         SimpleNamespace(headers={}),

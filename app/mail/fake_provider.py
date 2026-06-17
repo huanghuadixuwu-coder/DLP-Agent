@@ -327,7 +327,7 @@ class FakeMailProvider:
             self._label_results_by_key[idempotency_key] = result
             return self._response(operation=operation, data=result)
 
-    def get_health(self) -> MailProviderResponse:
+    def get_health(self, *, actor_context: dict[str, Any] | None = None) -> MailProviderResponse:
         status = "healthy" if self.failure_mode == "healthy" else "degraded"
         if self.failure_mode == "auth_expired":
             status = "auth_expired"
