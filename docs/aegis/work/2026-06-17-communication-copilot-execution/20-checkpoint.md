@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 6 reframe `/agent/chat` and workspace around communication work.
+- Start Task 7 final retirement of active legacy carriers after proof.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -26,9 +26,13 @@ Completed todos:
 - Task 4 spec compliance and code quality reviews passed after source-precedence regressions were fixed.
 - Task 5 normalized EnterpriseRAG and Meeting as subordinate communication providers in `dc23773`.
 - Task 5 spec compliance and code quality reviews passed.
+- Task 6 reframed `/agent/chat` and the 8511 workspace around communication-thread work in `2a83a7a`.
+- Task 6 copy-consistency polish landed in `814aa0d`.
+- Task 6 spec compliance review passed.
+- Task 6 code quality review passed, including a narrow re-review after the copy polish.
 
 Active slice:
-- Task 6 preparation.
+- Task 7 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -52,12 +56,17 @@ Evidence refs:
 - Task 5 Docker verification passed for communication subordinate input regression, meeting worker regression, and cross-domain workflow regression.
 - Task 5 added structural subordinate role metadata for RAG grounding and Meeting escalation without making either final closeout owner.
 - Task 5 EnterpriseRAG full regression remains blocked only by missing `/app/questions.parquet`.
+- Task 6 Docker verification passed for `communication_copilot_regression.py --case workspace_flow`.
+- Task 6 Docker verification passed for `python -m compileall -q app scripts web`.
+- Task 6 worker verification also passed `agent_runtime_regression.py`, `contracts_import`, `brief_assembly`, `mail_closeout`, `subordinate_inputs`, `governance_preview_ui_regression.py`, and `git diff --check`.
+- Task 6 preserved governance separation: 8511 remains user-side workspace/progress, while high-risk approval authority remains outside the user workspace.
+- Task 6 did not alter frontend style, CSS, layout, theme, or colors; the only post-review UI change was copy consistency from `合并所选对话` to `合并所选沟通线程`.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks full RAG-specific regression evidence but not Task 6 UI/workspace framing.
 
 Next step:
-- Dispatch Task 6 worker to reframe `/agent/chat` and the workspace around communication work without changing front-end visual style.
+- Run drift check, then dispatch Task 7 worker to retire proven legacy carriers without deleting unproven active dependencies.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -68,4 +77,5 @@ DriftCheckDraft:
 - Assembly boundary: Task 3 introduced internal brief assembly only; no public closeout ownership moved yet.
 - Closeout boundary: Task 4 moved Mail closeout toward `communication_brief` while preserving existing Mail/DLP confirmation lifecycle.
 - Subordinate boundary: Task 5 marked RAG as grounding provider and Meeting as escalation provider; Mail remains closeout owner.
+- Workspace boundary: Task 6 made communication-thread context the dominant user workspace state while leaving business authority in backend observations and governance surfaces.
 - Decision: continue.

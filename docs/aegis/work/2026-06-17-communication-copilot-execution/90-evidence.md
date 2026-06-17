@@ -65,3 +65,13 @@ Task 5 evidence:
 - `docker compose exec -T api python scripts/meeting_worker_regression.py`: passed in worker verification.
 - `docker compose exec -T api python scripts/cross_domain_workflow_regression.py`: passed in worker verification.
 - `docker compose exec -T api python scripts/enterprise_rag_regression.py --limit 4`: blocked only by missing `/app/questions.parquet`.
+
+Task 6 evidence:
+- Worker workspace-framing commit: `2a83a7a`.
+- Copy consistency polish commit: `814aa0d`.
+- Spec compliance reviewer passed and confirmed allowed file scope, no frontend style/theme changes, `/agent/chat` communication workspace state, backend-owned workspace authority, and separate governance surface.
+- Code quality reviewer passed and confirmed no fixed business-answer templates, no style/layout/theme/color changes, and preserved governance separation.
+- Narrow re-review passed after changing the merge button copy from `合并所选对话` to `合并所选沟通线程`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case workspace_flow`: passed with `workspace_kind=communication_thread_context` and `primary_work_object=communication_brief`.
+- `docker compose exec -T api python -m compileall -q app scripts web`: passed.
+- Worker verification also passed `agent_runtime_regression.py`, `contracts_import`, `brief_assembly`, `mail_closeout`, `subordinate_inputs`, `governance_preview_ui_regression.py`, and `git diff --check`.
