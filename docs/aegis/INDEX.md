@@ -9,3 +9,9 @@
 
 - `specs/2026-06-16-communication-copilot-design.md` - Product and architecture
   design spec for the Communication Copilot refactor.
+
+## Plans
+
+- `plans/2026-06-17-communication-copilot-implementation.md` - Implementation
+  plan for the Communication Copilot refactor based on the approved top-level
+  design spec.
