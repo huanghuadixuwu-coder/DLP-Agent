@@ -813,6 +813,8 @@ def _collect_outbound_candidates(
             details = _meeting_result_details(completed_meeting_task)
             meeting_content = json.dumps(
                 {
+                    "communication_role": "escalation_provider",
+                    "communication_input_kind": "meeting_result",
                     "task_id": str(completed_meeting_task.get("task_id") or ""),
                     "subject": details.get("subject") or "",
                     "meeting_id": details.get("meeting_id") or "",
@@ -2255,6 +2257,8 @@ def _create_domain_task_from_confirmation(
                 return existing
     domain_payload = {
         **tool_input,
+        "communication_role": "escalation_provider",
+        "communication_input_kind": "meeting_escalation_candidate",
         "_confirmed_action": action,
         "_dag_plan": dict(confirmation_payload.get("dag_plan") or {}),
         "_confirmation_payload": {
@@ -2339,6 +2343,8 @@ def _meeting_result_details(task: dict[str, Any]) -> dict[str, Any]:
     domain_result = dict(task.get("domain_result") or {})
     result = dict(domain_result.get("result") or {})
     details = {
+        "communication_role": str(result.get("communication_role") or "escalation_provider"),
+        "communication_input_kind": str(result.get("communication_input_kind") or "meeting_result"),
         "meeting_id": str(result.get("meeting_id") or ""),
         "meeting_code": str(result.get("meeting_code") or ""),
         "meeting_url": str(result.get("meeting_url") or result.get("join_url") or ""),
@@ -2421,6 +2427,8 @@ def _mail_plan_from_meeting_task(
         subject = f"{subject} - 会议邀请"
     meeting_text = json.dumps(
         {
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_result",
             "topic": meeting.get("topic") or meeting.get("subject") or details.get("subject") or "",
             "meeting_id": meeting.get("meeting_id") or details.get("meeting_id") or "",
             "meeting_code": meeting.get("meeting_code") or details.get("meeting_code") or "",
@@ -2441,6 +2449,9 @@ def _mail_plan_from_meeting_task(
         "patch_kind": "",
         "mail_action_type": "send_meeting_invitation",
         "target_object": "meeting_invitation",
+        "communication_role": "escalation_provider",
+        "communication_input_kind": "meeting_result",
+        "communication_closeout_owner": "mail_agent",
         "resolved_recipients": recipients,
         "resolved_subject": subject,
         "resolved_body": "",
@@ -2454,6 +2465,8 @@ def _mail_plan_from_meeting_task(
         "request_message": request_message,
         "selected_candidate": {
             "kind": "meeting_result",
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_result",
             "candidate_id": f"meeting-task:{task.get('task_id')}",
             "label": subject,
             "filename": "",
@@ -2471,6 +2484,8 @@ def _mail_plan_from_meeting_task(
             {
                 "kind": "reference_source",
                 "role": "meeting_invitation_details",
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
                 "policy": "recipient_ready_summary",
                 "task_id": str(task.get("task_id") or ""),
             }
@@ -2481,6 +2496,8 @@ def _mail_plan_from_meeting_task(
                 "candidate_id": f"meeting-task:{task.get('task_id')}",
                 "source_turn_id": "",
                 "role": "meeting_result",
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
                 "policy": "recipient_ready_summary",
                 "content": meeting_text,
             }
@@ -2489,6 +2506,8 @@ def _mail_plan_from_meeting_task(
             {
                 "role": "meeting_invitation_details",
                 "kind": "meeting_result",
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
                 "candidate_id": f"meeting-task:{task.get('task_id')}",
                 "source_turn_id": "",
                 "filename": "",
@@ -2498,6 +2517,8 @@ def _mail_plan_from_meeting_task(
             {
                 "role": "meeting_invitation_details",
                 "kind": "meeting_result",
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
                 "candidate_id": f"meeting-task:{task.get('task_id')}",
                 "source_turn_id": "",
                 "filename": "",
@@ -2507,6 +2528,7 @@ def _mail_plan_from_meeting_task(
             "meeting_result": "meeting_result_only",
             "attachment_source": "attachment_only",
             "body_source": "user_explicit_or_meeting_result",
+            "closeout_owner": "mail_agent",
         },
         "meeting_result": details,
         "domain_task_id": str(task.get("task_id") or ""),
@@ -2715,6 +2737,9 @@ def _build_meeting_result_response(
         source="domain_meeting_task",
         summary="A completed meeting creation task is available for the current conversation.",
         payload={
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_result",
+            "communication_closeout_owner": "mail_agent",
             "task_id": str(task.get("task_id") or ""),
             "task_status": str(task.get("status") or ""),
             "domain_action": str(task.get("domain_action") or ""),
@@ -2747,7 +2772,13 @@ def _build_meeting_result_response(
                 "success": True,
                 "status": "completed",
                 "error": "",
-                "result": {"meeting": details, "pending_mail_draft": pending_mail_draft},
+                "result": {
+                    "communication_role": "escalation_provider",
+                    "communication_input_kind": "meeting_result",
+                    "communication_closeout_owner": "mail_agent",
+                    "meeting": details,
+                    "pending_mail_draft": pending_mail_draft,
+                },
             }
         ],
         "task_plan": {"pending_mail_draft": pending_mail_draft},

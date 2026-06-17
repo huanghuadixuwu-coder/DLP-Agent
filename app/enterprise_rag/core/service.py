@@ -73,6 +73,8 @@ def build_rag_diagnostic_summary(result: dict[str, Any]) -> dict[str, Any]:
         "expansion_reason": str(retrieval_debug.get("expansion_reason") or "none"),
         "timeout_stage": str(retrieval_debug.get("timeout_stage") or ""),
         "evidence_boundary_owner": "enterprise_rag_citations",
+        "communication_role": "grounding_provider",
+        "communication_input_kind": "grounding_bundle",
         "answer_stage_latencies_ms": dict(answer_debug.get("answer_stage_latencies_ms") or {}),
         "llm_usage": dict(answer_debug.get("llm_usage") or {}),
     }
@@ -119,6 +121,9 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
     ]
     return {
         "correlation_id": str(result.get("correlation_id") or ""),
+        "communication_role": "grounding_provider",
+        "communication_input_kind": "grounding_bundle",
+        "communication_owner": "mail_or_brief_closeout",
         "answer_state": {
             "answerable": bool(answer_debug.get("answerable", not result.get("missing_evidence", False))),
             "missing_evidence": bool(result.get("missing_evidence", False)),

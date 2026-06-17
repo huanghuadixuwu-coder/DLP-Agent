@@ -107,6 +107,11 @@ def main() -> None:
     assert updated is not None
     assert updated["status"] == "completed", updated
     assert updated["domain_result"]["ok"] is True, updated
+    assert updated["domain_result"]["communication_role"] == "escalation_provider", updated
+    assert updated["domain_result"]["communication_input_kind"] == "meeting_result", updated
+    assert updated["domain_result"]["communication_closeout_owner"] == "mail_agent", updated
+    assert updated["domain_result"]["result"]["communication_role"] == "escalation_provider", updated
+    assert updated["domain_result"]["result"]["communication_input_kind"] == "meeting_result", updated
     assert updated["domain_result"]["result"]["meeting_id"] == "fake-meeting-id", updated
     post_results = list(updated["domain_result"].get("post_confirm_results") or [])
     assert post_results and post_results[0]["action"] == "mail_invitation_draft", updated

@@ -17,6 +17,9 @@ class DomainAgentDefinition:
     requires_confirmation: bool = False
     observation_types: list[str] = field(default_factory=list)
     provider_constraints: list[str] = field(default_factory=list)
+    communication_role: str = ""
+    communication_input_kind: str = ""
+    returns_observation_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -70,6 +73,7 @@ def build_domain_agent_catalog() -> dict[str, DomainAgentDefinition]:
     catalog: dict[str, DomainAgentDefinition] = {}
     for agent_name, capabilities in grouped.items():
         tools = [registry[name] for name in capabilities if name in registry]
+        subordinate_metadata = _communication_subordinate_metadata(agent_name)
         catalog[agent_name] = DomainAgentDefinition(
             agent_name=agent_name,
             description=_agent_description(agent_name),
@@ -87,6 +91,9 @@ def build_domain_agent_catalog() -> dict[str, DomainAgentDefinition]:
                     if constraint
                 }
             ),
+            communication_role=subordinate_metadata.get("communication_role", ""),
+            communication_input_kind=subordinate_metadata.get("communication_input_kind", ""),
+            returns_observation_type=subordinate_metadata.get("returns_observation_type", ""),
         )
 
     for name, definition in _DOMAIN_AGENTS.items():
@@ -123,3 +130,18 @@ def _permissions_for_agent(agent_name: str) -> tuple[str, ...]:
         "memory": ("agent.chat",),
         "supervisor": ("agent.chat",),
     }.get(agent_name, ("agent.chat",))
+
+
+def _communication_subordinate_metadata(agent_name: str) -> dict[str, str]:
+    return {
+        "enterprise_rag": {
+            "communication_role": "grounding_provider",
+            "communication_input_kind": "grounding_bundle",
+            "returns_observation_type": "enterprise_answer_observation",
+        },
+        "meeting": {
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_escalation_candidate",
+            "returns_observation_type": "meeting_result",
+        },
+    }.get(agent_name, {})

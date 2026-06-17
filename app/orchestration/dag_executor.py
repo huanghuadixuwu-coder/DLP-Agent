@@ -232,6 +232,7 @@ def _execute_one(
             grounding_kind="guardrail",
             summary=f"Side-effectful step requires confirmation: {item.action or item.capability}",
             payload={
+                **_communication_subordinate_metadata(item.agent, item.action or item.capability),
                 "task_id": item.task_id,
                 "agent": item.agent,
                 "action": item.action or item.capability,
@@ -266,6 +267,7 @@ def _execute_one(
     citations = list(result.get("citations") or [])
     if not citations and isinstance(result.get("evidence"), dict):
         citations = list(result["evidence"].get("citations") or [])
+    communication_metadata = _communication_subordinate_metadata(item.agent, item.action or item.capability)
     return make_typed_observation(
         observation_type=str(dispatched.get("observation_type") or item.expected_observation_type or "tool_result"),
         source=item.action or item.capability,
@@ -274,6 +276,7 @@ def _execute_one(
         summary=str(result.get("summary") or result.get("message") or dispatched.get("error") or f"{item.action or item.capability} completed."),
         payload={
             **result,
+            **communication_metadata,
             "task_id": item.task_id,
             "agent": item.agent,
             "action": item.action or item.capability,
@@ -329,3 +332,17 @@ def _tool_result_from_observation(item: AgentSubtask, observation: dict[str, Any
 def _is_read_only(item: AgentSubtask) -> bool:
     definition = build_tool_registry().get(item.action or item.capability)
     return bool(definition and definition.read_only and not definition.side_effectful and not definition.requires_confirmation and not item.mutating)
+
+
+def _communication_subordinate_metadata(agent: str, action: str) -> dict[str, str]:
+    if agent == "enterprise_rag" or action.startswith("enterprise_"):
+        return {
+            "communication_role": "grounding_provider",
+            "communication_input_kind": "grounding_bundle",
+        }
+    if agent == "meeting" or action.startswith("meeting_"):
+        return {
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_escalation_candidate",
+        }
+    return {}

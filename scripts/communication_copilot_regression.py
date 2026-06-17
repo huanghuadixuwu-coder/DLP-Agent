@@ -505,6 +505,126 @@ def run_mail_closeout() -> dict[str, Any]:
     }
 
 
+def run_subordinate_inputs() -> dict[str, Any]:
+    import app.main as main_module
+    from app.enterprise_rag.core.service import build_enterprise_answer_observation
+    from app.orchestration.dag_executor import execute_dag_plan
+    from app.orchestration.domain_agents import build_domain_agent_catalog_dict
+    from app.orchestration.types import OrchestrationContext
+
+    rag_observation = build_enterprise_answer_observation(
+        {
+            "correlation_id": "rag_subordinate_contract",
+            "confidence": 0.86,
+            "supporting_doc_ids": ["doc-1"],
+            "context_sources": ["enterprise_rag"],
+            "answer_debug": {"answerable": True, "answer_intent": "enterprise_question"},
+            "retrieval_stage_debug": {"budget_profile": "sample"},
+            "canonical_facts": [
+                {
+                    "fact_id": "fact-1",
+                    "fact_type": "policy",
+                    "normalized_fact": "Grounding fact for downstream communication.",
+                    "priority": "high",
+                    "score": 0.9,
+                    "source_fact_ids": ["source-fact-1"],
+                }
+            ],
+            "citations": [
+                {
+                    "doc_id": "doc-1",
+                    "chunk_id": "chunk-1",
+                    "source_type": "policy",
+                    "title": "Policy",
+                    "snippet": "Grounding evidence.",
+                    "score": 0.91,
+                }
+            ],
+        }
+    )
+    _assert_equal(rag_observation.get("communication_role"), "grounding_provider", "rag communication_role")
+    _assert_equal(rag_observation.get("communication_input_kind"), "grounding_bundle", "rag communication_input_kind")
+    _assert_equal(rag_observation.get("communication_owner"), "mail_or_brief_closeout", "rag closeout owner")
+    _assert_equal(
+        dict(rag_observation.get("diagnostic_summary") or {}).get("communication_role"),
+        "grounding_provider",
+        "rag diagnostic role",
+    )
+
+    task = {
+        "task_id": "task_meeting_subordinate_contract",
+        "status": "completed",
+        "task_type": "domain_meeting",
+        "domain_action": "meeting_create_tencent_meeting",
+        "domain_result": {
+            "ok": True,
+            "communication_role": "escalation_provider",
+            "communication_input_kind": "meeting_result",
+            "communication_closeout_owner": "mail_agent",
+            "result": {
+                "meeting_id": "meeting-subordinate-123",
+                "meeting_url": "https://meeting.tencent.com/subordinate",
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
+            },
+            "post_confirm_results": [],
+        },
+    }
+    mail_plan = main_module._mail_plan_from_meeting_task(
+        task=task,
+        conversation_id="conversation_subordinate_contract",
+        request_message="send invitation to alice@example.com",
+        recipient="alice@example.com",
+    )
+    _assert_equal(mail_plan.get("communication_role"), "escalation_provider", "meeting plan role")
+    _assert_equal(mail_plan.get("communication_input_kind"), "meeting_result", "meeting plan input kind")
+    _assert_equal(mail_plan.get("communication_closeout_owner"), "mail_agent", "meeting plan closeout owner")
+    _assert_equal(mail_plan.get("mail_action_type"), "send_meeting_invitation", "mail action type")
+    _assert_true(mail_plan.get("requires_confirmation"), "mail confirmation")
+    _assert_true(dict(mail_plan.get("body_constraints") or {}).get("send_requires_dlp"), "mail DLP")
+    _assert_equal(list(mail_plan.get("reference_sources") or [])[0].get("communication_role"), "escalation_provider", "reference role")
+
+    catalog = build_domain_agent_catalog_dict()
+    _assert_equal(catalog["enterprise_rag"].get("communication_role"), "grounding_provider", "catalog rag role")
+    _assert_equal(catalog["enterprise_rag"].get("communication_input_kind"), "grounding_bundle", "catalog rag kind")
+    _assert_equal(catalog["meeting"].get("communication_role"), "escalation_provider", "catalog meeting role")
+    _assert_equal(catalog["meeting"].get("communication_input_kind"), "meeting_escalation_candidate", "catalog meeting kind")
+
+    context = OrchestrationContext(
+        session_id="session-subordinate",
+        conversation_id="conversation-subordinate",
+        message="create meeting",
+        safe_message="create meeting",
+        actor_context={"tenant_id": "tenant-subordinate", "user_id": "user-subordinate"},
+    )
+    dag_result = execute_dag_plan(
+        {
+            "subtasks": [
+                {
+                    "task_id": "create_meeting",
+                    "agent": "meeting",
+                    "action": "meeting_create_tencent_meeting",
+                    "parameters": {"topic": "subordinate", "idempotency_key": "subordinate-key"},
+                }
+            ]
+        },
+        context,
+        allow_side_effects=False,
+    )
+    payload = dict(list(dag_result.get("observations") or [])[0].get("payload") or {})
+    _assert_equal(payload.get("communication_role"), "escalation_provider", "dag meeting role")
+    _assert_equal(payload.get("communication_input_kind"), "meeting_escalation_candidate", "dag meeting kind")
+    _assert_equal(payload.get("confirmation_required"), True, "dag confirmation")
+
+    return {
+        "ok": True,
+        "case": "subordinate_inputs",
+        "rag_role": rag_observation.get("communication_role"),
+        "meeting_role": mail_plan.get("communication_role"),
+        "closeout_owner": mail_plan.get("communication_closeout_owner"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Communication Copilot regression checks")
     parser.add_argument("--case", required=True, dest="case_name")
@@ -514,6 +634,7 @@ def main() -> int:
         "contracts_import": run_contracts_import,
         "brief_assembly": run_brief_assembly,
         "mail_closeout": run_mail_closeout,
+        "subordinate_inputs": run_subordinate_inputs,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

@@ -63,6 +63,12 @@ def main() -> int:
     try:
         ingest = _request("POST", f"{base_url}/enterprise-rag/ingest", ingest_payload)
         query = _request("POST", f"{base_url}/enterprise-rag/query", query_payload)
+        observation = dict(query.get("enterprise_answer_observation") or {})
+        if observation:
+            if observation.get("communication_role") != "grounding_provider":
+                raise AssertionError(f"enterprise_answer_observation communication_role: {observation!r}")
+            if observation.get("communication_input_kind") != "grounding_bundle":
+                raise AssertionError(f"enterprise_answer_observation communication_input_kind: {observation!r}")
         benchmark = _request("GET", f"{base_url}/enterprise-rag/benchmark?{benchmark_params}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

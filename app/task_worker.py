@@ -1143,6 +1143,10 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
     )
     dispatched = dispatch_tool_call(action, payload, context, {}, allow_side_effects=True)
     result = dict(dispatched.get("result") or {})
+    if action.startswith("meeting_"):
+        result.setdefault("communication_role", "escalation_provider")
+        result.setdefault("communication_input_kind", "meeting_result")
+        result.setdefault("communication_closeout_owner", "mail_agent")
     ok = bool(dispatched.get("ok"))
     post_confirm_results = _run_post_confirm_domain_steps(
         action=action,
@@ -1164,6 +1168,9 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
             "domain_result": {
                 "ok": ok,
                 "action": action,
+                "communication_role": "escalation_provider",
+                "communication_input_kind": "meeting_result",
+                "communication_closeout_owner": "mail_agent",
                 "result": result,
                 "error": error,
                 "post_confirm_results": post_confirm_results,

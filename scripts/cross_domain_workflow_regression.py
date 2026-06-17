@@ -160,9 +160,16 @@ def main() -> None:
 
         meeting_worker_result = task_worker.process_domain_meeting_task.run(meeting_task_id)
         assert meeting_worker_result["status"] == "completed", meeting_worker_result
+        assert meeting_worker_result["result"]["communication_role"] == "escalation_provider", meeting_worker_result
+        assert meeting_worker_result["result"]["communication_input_kind"] == "meeting_result", meeting_worker_result
 
         result_response = _post(client, message="show meeting result", session_id=session_id, conversation_id=conversation_id)
         assert result_response["intent"] == "meeting_result", result_response
+        result_observation = dict(list(result_response.get("tool_observations") or [])[0])
+        result_payload = dict(result_observation.get("payload") or {})
+        assert result_payload.get("communication_role") == "escalation_provider", result_payload
+        assert result_payload.get("communication_input_kind") == "meeting_result", result_payload
+        assert result_payload.get("communication_closeout_owner") == "mail_agent", result_payload
 
         invitation_response = _post(client, message="send to alice@example.com", session_id=session_id, conversation_id=conversation_id)
         pending_mail = dict(invitation_response.get("pending_confirmation") or {})
@@ -170,6 +177,9 @@ def main() -> None:
         assert pending_mail.get("action_name") == "send_mail_plan", pending_mail
         assert mail_plan.get("resolved_recipients") == ["alice@example.com"], mail_plan
         assert mail_plan.get("mail_action_type") == "send_meeting_invitation", mail_plan
+        assert mail_plan.get("communication_role") == "escalation_provider", mail_plan
+        assert mail_plan.get("communication_input_kind") == "meeting_result", mail_plan
+        assert mail_plan.get("communication_closeout_owner") == "mail_agent", mail_plan
 
         confirm_mail = _post(client, message="confirm", session_id=session_id, conversation_id=conversation_id)
         dlp_task_id = str(confirm_mail.get("task_id") or "")
