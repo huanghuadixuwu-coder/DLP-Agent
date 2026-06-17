@@ -910,11 +910,18 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
             "token_out": 0,
             "estimated_cost": 0.0,
         }
+        pre_write_workspace = main_module._refresh_result_communication_workspace(result, conversation_id)
+        _assert_equal(
+            pre_write_workspace.get("primary_work_object", {}).get("kind"),
+            "conversation_context",
+            "pre-write workspace primary kind",
+        )
         turn_id, memory_written = main_module._write_unified_conversation_memory(
             result,
             conversation_id,
             actor_context=actor_context,
         )
+        response_workspace = main_module._refresh_result_communication_workspace(result, conversation_id)
     finally:
         main_module._persist_answer_artifact_object = original_persist_answer_artifact
         main_module.write_dynamic_turn_memory = original_write_dynamic_turn_memory
@@ -931,6 +938,16 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
     _assert_true(memory_written, "runtime memory_written")
     _assert_equal(len(brief_observations), 1, "runtime brief observation count")
     _assert_true(answer in json.dumps(brief_observations[0].get("payload") or {}, ensure_ascii=False), "runtime brief facts")
+    _assert_equal(
+        response_workspace.get("primary_work_object", {}).get("kind"),
+        COMMUNICATION_BRIEF_SOURCE_KIND,
+        "response workspace primary kind",
+    )
+    _assert_equal(
+        dict(result.get("task_plan") or {}).get("communication_workspace", {}).get("primary_work_object", {}).get("kind"),
+        COMMUNICATION_BRIEF_SOURCE_KIND,
+        "response task_plan workspace primary kind",
+    )
 
     assistant_turn = next(
         turn for turn in reversed(get_turns(conversation_id)) if str(turn.get("role") or "") == "assistant"
@@ -977,6 +994,7 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         "case": "runtime_brief_closeout",
         "turn_id": turn_id,
         "primary_work_object": debug_payload.get("primary_work_object", {}).get("kind"),
+        "response_primary_work_object": response_workspace.get("primary_work_object", {}).get("kind"),
         "candidate_count": len(candidates),
         "source_mode": source_resolution["source_mode"],
     }

@@ -5213,6 +5213,15 @@ def _derive_communication_workspace_state(result: dict, conversation_id: str) ->
     }
 
 
+def _refresh_result_communication_workspace(result: dict, conversation_id: str) -> dict[str, Any]:
+    workspace = _derive_communication_workspace_state(result, conversation_id)
+    result["task_plan"] = {
+        **dict(result.get("task_plan") or {}),
+        "communication_workspace": workspace,
+    }
+    return workspace
+
+
 def _collect_result_observations(result: dict, task_plan: dict[str, Any]) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     for source in (
@@ -6916,10 +6925,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     result["permission_decision"] = permission_decision
     result["rate_limit_decision"] = rate_limit_decision
     result["queue_status"] = queue_status
-    result["task_plan"] = {
-        **dict(result.get("task_plan") or {}),
-        "communication_workspace": _derive_communication_workspace_state(result, conversation_id),
-    }
+    _refresh_result_communication_workspace(result, conversation_id)
     _persist_confirmation_object(
         session_id=payload.session_id,
         conversation_id=conversation_id,
@@ -6928,6 +6934,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     )
     result = attach_trace_evaluation(result, actor_context=actor_context)
     turn_id, memory_written = _write_unified_conversation_memory(result, conversation_id, actor_context=actor_context)
+    _refresh_result_communication_workspace(result, conversation_id)
     latency_ms = float(result["node_latencies_ms"]["total"])
     context_budget = result.get("context_budget", {}) or {}
     used_budget = context_budget.get("used") or context_budget.get("packed_tokens")
