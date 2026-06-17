@@ -504,17 +504,16 @@ def generate_daily_mail_digest(
     since_value = since or start.isoformat()
     until_value = until or end.isoformat()
     summary = inbound_summary(since_value, until_value, actor_context=actor_context)
-    title = f"Mail digest: {summary['total']} received, {summary['unread']} unread"
-    important_lines = [
-        f"- {item.get('subject') or '(no subject)'} from {item.get('sender')}: {item.get('summary') or item.get('snippet')}"
-        for item in summary["important_messages"][:5]
-    ]
-    body = "\n".join(important_lines) if important_lines else "No important mail found in this window."
     notification = create_notification(
         "daily_mail_digest",
-        title,
-        body,
-        {"summary": summary},
+        "Mail digest generated",
+        "Digest details are available only in the actor-scoped response.",
+        {
+            "since": since_value,
+            "until": until_value,
+            "details_redacted": True,
+            "redaction_reason": "actor_scoped_digest",
+        },
     )
     return {"summary": summary, "notification": notification}
 

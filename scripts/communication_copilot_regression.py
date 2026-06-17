@@ -305,7 +305,7 @@ def run_thread_store() -> dict[str, Any]:
         list_communication_threads,
         set_active_communication_thread,
     )
-    from app.inbound_mail_store import get_inbound_message
+    from app.inbound_mail_store import get_inbound_message, list_notifications
     from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import UnifiedAgentRequest
     from app.orchestration.types import OrchestrationContext
@@ -401,6 +401,64 @@ def run_thread_store() -> dict[str, Any]:
     )
     _assert_equal(actor_a_summary["total"], 2, "helper actor A summary total")
     _assert_equal(actor_b_summary["total"], 1, "helper actor B summary total")
+    actor_a_digest = inbound_mail_module.generate_daily_mail_digest(
+        "2026-06-17T00:00:00+00:00",
+        "2026-06-18T00:00:00+00:00",
+        actor_context=actor_a,
+    )
+    actor_b_digest = inbound_mail_module.generate_daily_mail_digest(
+        "2026-06-17T00:00:00+00:00",
+        "2026-06-18T00:00:00+00:00",
+        actor_context=actor_b,
+    )
+    _assert_equal(actor_a_digest["summary"]["total"], 2, "digest actor A summary total")
+    _assert_equal(actor_b_digest["summary"]["total"], 1, "digest actor B summary total")
+    digest_notification_ids = {
+        str(actor_a_digest["notification"].get("notification_id") or ""),
+        str(actor_b_digest["notification"].get("notification_id") or ""),
+    }
+    outbox_digest_notifications = [
+        item
+        for item in list_notifications(event_type="daily_mail_digest", limit=200)
+        if str(item.get("notification_id") or "") in digest_notification_ids
+    ]
+    api_digest_notifications = [
+        item.model_dump() if hasattr(item, "model_dump") else item.dict()
+        for item in main_module.notification_outbox_api(event_type="daily_mail_digest", limit=200)
+        if str(getattr(item, "notification_id", "") or "") in digest_notification_ids
+    ]
+    _assert_equal(len(outbox_digest_notifications), 2, "store outbox contains both new digest notifications")
+    _assert_equal(len(api_digest_notifications), 2, "public outbox contains both new digest notifications")
+    digest_sensitive_markers = [
+        shared_provider_message_id,
+        str(actor_a_shared["message_id"] or ""),
+        str(actor_b_shared["message_id"] or ""),
+        thread_a,
+        thread_b,
+        "customer-a@example.com",
+        "employee-a@example.com",
+        "customer-b@example.com",
+        "employee-b@example.com",
+        "Actor A renewal",
+        "Re: Actor A renewal",
+        "Actor B onboarding",
+        "Actor A first renewal question.",
+        "Actor A latest renewal summary.",
+        "Actor B onboarding question.",
+    ]
+    for source_name, notifications in [
+        ("store", outbox_digest_notifications),
+        ("public API", api_digest_notifications),
+    ]:
+        for notification in notifications:
+            payload = dict(notification.get("payload_json") or {})
+            _assert_equal(payload.get("details_redacted"), True, f"{source_name} digest payload redacted")
+            if "summary" in payload or "recent_messages" in payload or "important_messages" in payload:
+                raise AssertionError(f"{source_name} digest notification persisted message summary lists")
+            serialized_notification = json.dumps(notification, ensure_ascii=False)
+            for marker in digest_sensitive_markers:
+                if marker and marker in serialized_notification:
+                    raise AssertionError(f"{source_name} digest notification leaked actor mail content: {marker}")
 
     provider = CurrentImapSmtpMailProvider()
     provider_search_a = provider.search_messages(limit=10, actor_context=actor_a)
