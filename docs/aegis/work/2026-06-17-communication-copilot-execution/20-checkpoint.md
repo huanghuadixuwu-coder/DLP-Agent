@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 3 build communication-thread resolution and brief assembly.
+- Start Task 4 re-own Mail Agent closeout around communication brief.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -20,9 +20,11 @@ Completed todos:
 - Task 1 spec compliance and code/document quality reviews passed.
 - Task 2 added canonical communication contracts and contract regression in `040b85e`.
 - Task 2 spec compliance and code quality reviews passed.
+- Task 3 added communication thread resolution and brief assembly in `dbcb20f`.
+- Task 3 spec compliance and code quality reviews passed.
 
 Active slice:
-- Task 3 preparation.
+- Task 4 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -37,12 +39,15 @@ Evidence refs:
 - Task 1 clarified that current README framing is Communication Copilot and that pre-Task-1 README identity references are historical inventory, not current carriers.
 - Task 2 added `app/communication/` contracts without API, DB, runtime, frontend, or style changes.
 - Task 2 Docker verification passed for compileall and `scripts/communication_copilot_regression.py --case contracts_import`.
+- Task 3 added `app/communication/thread_context.py` and `app/communication/brief_service.py`.
+- Task 3 Docker verification passed for `contracts_import` and `brief_assembly` regression cases.
+- Task 3 did not change public API, DB schema, frontend/style, inbound store persistence, memory behavior, or EnterpriseRAG query behavior.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks RAG-specific regression evidence but not Task 1 docs framing.
 
 Next step:
-- Dispatch Task 3 worker to add communication-thread resolution and brief assembly using the new contracts.
+- Dispatch Task 4 worker to route Mail Agent closeout through communication brief without breaking draft/patch/confirm/DLP lifecycle.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -50,4 +55,5 @@ DriftCheckDraft:
 - Retirement: Task 0B followed the inventory categories; active runtime dependencies remain quarantined rather than deleted.
 - Product boundary: Task 1 changed docs only; no runtime ownership was moved yet.
 - Contract boundary: Task 2 introduced additive internal types only; no active behavior moved yet.
+- Assembly boundary: Task 3 introduced internal brief assembly only; no public closeout ownership moved yet.
 - Decision: continue.

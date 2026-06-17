@@ -39,3 +39,11 @@ Task 2 evidence:
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case contracts_import`: passed.
 - `rg -n "communication_brief|communication_thread" app`: new contract package references only.
 - `git diff --check -- app/communication scripts/communication_copilot_regression.py`: passed.
+
+Task 3 evidence:
+- Worker assembly commit: `dbcb20f`.
+- Spec compliance reviewer passed Task 3 and confirmed explicit thread resolution uses existing inbound store APIs.
+- Code quality reviewer passed Task 3 and confirmed the implementation is bounded, structural, and free of user-visible templates.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case contracts_import`: passed with `ok: true`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case brief_assembly`: passed with `ok: true`.
+- `docker compose exec -T api python -m compileall -q app scripts`: passed in the worker verification.
