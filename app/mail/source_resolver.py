@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.config import get_settings
 from app.conversation_memory import compact_text
 from app.graph import get_llm
+from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
 
 
 SOURCE_RESOLVER_PROMPT = """You resolve content sources for a secure enterprise mail agent.
@@ -18,7 +19,7 @@ Return strict JSON only:
 {
   "referential_request": true,
   "selected_candidate_ids": ["candidate-id"],
-  "source_mode": "inline_body|uploaded_content|prior_assistant_answer|prior_user_text|meeting_result|mail_thread|none",
+  "source_mode": "inline_body|uploaded_content|prior_assistant_answer|prior_user_text|meeting_result|mail_thread|communication_brief|none",
   "compose_mode": "direct_body|recipient_ready_summary|synthesize|verbatim_copy",
   "needs_clarification": false,
   "confidence": 0.0,
@@ -33,15 +34,16 @@ Rules:
 - A prior assistant answer is reference material. Default to recipient_ready_summary so the mail renderer rewrites it for the recipient and removes conversational scaffolding.
 - A meeting_result candidate is reference material for a meeting invitation or meeting follow-up email.
 - A mail_thread candidate is reference material from an existing thread and should keep its provenance boundary.
+- A communication_brief candidate is the preferred structured closeout source. Treat it as reference material for recipient-ready rendering, not direct body text.
 - Use synthesize when the user explicitly asks to combine multiple prior sources.
 - Use verbatim_copy only when the user explicitly requests exact, unchanged forwarding.
 - If multiple candidates are plausible and the user did not identify the intended one, set needs_clarification=true and do not guess.
 - If no candidate supports the request, set source_mode=none and needs_clarification=true.
 """
 
-ALLOWED_SOURCE_MODES = {"inline_body", "uploaded_content", "prior_assistant_answer", "prior_user_text", "meeting_result", "mail_thread", "none"}
+ALLOWED_SOURCE_MODES = {"inline_body", "uploaded_content", "prior_assistant_answer", "prior_user_text", "meeting_result", "mail_thread", "communication_brief", "none"}
 ALLOWED_COMPOSE_MODES = {"direct_body", "recipient_ready_summary", "synthesize", "verbatim_copy"}
-REFERENCE_SOURCE_KINDS = {"assistant_last_answer", "meeting_result", "mail_thread", "user_recent_text"}
+REFERENCE_SOURCE_KINDS = {"assistant_last_answer", "meeting_result", "mail_thread", "user_recent_text", COMMUNICATION_BRIEF_SOURCE_KIND}
 HIGH_CONFIDENCE_REFERENCE_MARKERS = (
     "该信息",
     "该方案",
@@ -96,6 +98,25 @@ def resolve_mail_source_request(
             confidence=1.0,
             reason="No outbound content candidates are available.",
             classifier_source="deterministic_empty_candidates",
+        )
+    brief_candidates = [item for item in normalized_candidates if item["kind"] == COMMUNICATION_BRIEF_SOURCE_KIND]
+    if len(brief_candidates) == 1:
+        return _resolution(
+            selected_candidate_ids=[brief_candidates[0]["candidate_id"]],
+            source_mode="communication_brief",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=0.93,
+            reason="Selected the structured communication brief as the preferred mail closeout source.",
+            classifier_source="deterministic_communication_brief",
+        )
+    if len(brief_candidates) > 1:
+        return _resolution(
+            source_mode="none",
+            needs_clarification=True,
+            confidence=0.9,
+            reason="Multiple communication briefs are available; the intended closeout source is ambiguous.",
+            classifier_source="deterministic_communication_brief_ambiguous",
         )
 
     try:
@@ -259,6 +280,8 @@ def _source_mode_for_kind(kind: str) -> str:
         return "meeting_result"
     if kind == "mail_thread":
         return "mail_thread"
+    if kind == COMMUNICATION_BRIEF_SOURCE_KIND:
+        return "communication_brief"
     if kind == "user_recent_text":
         return "prior_user_text"
     if kind == "assistant_last_answer":

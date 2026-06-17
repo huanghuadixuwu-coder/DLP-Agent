@@ -43,6 +43,7 @@ Rules:
   - reference_source=summarize_only means it may be summarized briefly but not copied verbatim.
   - body_source=user_explicit_only means only explicitly requested body content may be used as direct body text.
   - assistant_answer_source=rewrite_for_recipient_if_user_explicit_reference means a prior assistant answer is reference material only when the user explicitly references it.
+  - communication_brief_source=renderer_reference_only means the brief is structured reference material for the renderer and must not be pasted directly as the email body.
 - Respect compose_mode strictly:
   - direct_body means preserve explicitly supplied body content unless the user asks for editing.
   - recipient_ready_summary means rewrite the reference sources into a concise recipient-visible email body. Preserve supported facts, but remove assistant-answer framing, evidence disclaimers, conversational scaffolding, citations, and unrelated text.
@@ -452,6 +453,8 @@ def _trim_mail_plan_for_render(mail_plan: dict[str, Any]) -> dict[str, Any]:
         "compose_mode": str(mail_plan.get("compose_mode") or "direct_body"),
         "reference_sources": [
             {
+                "candidate_id": str(item.get("candidate_id") or ""),
+                "source_turn_id": str(item.get("source_turn_id") or ""),
                 "role": str(item.get("role") or ""),
                 "policy": str(item.get("policy") or ""),
                 "content": compact_text(str(item.get("content") or ""), 1800),

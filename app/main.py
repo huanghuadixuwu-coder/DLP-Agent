@@ -83,6 +83,7 @@ from app.mail.draft_store import (
     upsert_mail_draft,
 )
 from app.mail.content_parser import parse_message_content_candidates
+from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
 from app.mail.source_resolver import resolve_mail_source_request
 from app.disambiguation_lab import answer_apple_query
 from app.labs_long_doc import allocate_context
@@ -662,6 +663,33 @@ def _collect_outbound_candidates(
     seen: set[tuple[str, str]] = set()
     context_snapshot = dict(upload_context or {})
 
+    def _communication_brief_candidate_content(brief_payload: dict[str, Any]) -> str:
+        thread_ref = dict(brief_payload.get("thread_ref") or {})
+        return json.dumps(
+            {
+                "brief_id": str(brief_payload.get("brief_id") or ""),
+                "conversation_id": str(brief_payload.get("conversation_id") or ""),
+                "thread_ref": {
+                    "thread_id": str(thread_ref.get("thread_id") or ""),
+                    "source": str(thread_ref.get("source") or ""),
+                    "subject": str(thread_ref.get("subject") or ""),
+                    "participants": list(thread_ref.get("participants") or []),
+                    "last_message_at": str(thread_ref.get("last_message_at") or ""),
+                },
+                "employee_goal": str(brief_payload.get("employee_goal") or ""),
+                "customer_context_summary": str(brief_payload.get("customer_context_summary") or ""),
+                "grounding_refs": list(brief_payload.get("grounding_refs") or []),
+                "must_include": list(brief_payload.get("must_include") or []),
+                "must_avoid": list(brief_payload.get("must_avoid") or []),
+                "open_questions": list(brief_payload.get("open_questions") or []),
+                "recommended_next_action": str(brief_payload.get("recommended_next_action") or ""),
+                "source_observation_ids": list(brief_payload.get("source_observation_ids") or []),
+                "confidence": float(brief_payload.get("confidence") or 0.0),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
     def _append_candidate(
         *,
         kind: str,
@@ -819,6 +847,28 @@ def _collect_outbound_candidates(
                 )
 
     turns = get_turns(conversation_id, limit=10)
+    for turn in reversed(turns):
+        if str(turn.get("role") or "").lower() != "assistant":
+            continue
+        turn_id = str(turn.get("turn_id") or "")
+        for observation in list(dict(turn.get("debug_payload") or {}).get("tool_observations") or []):
+            if str(observation.get("observation_type") or observation.get("kind") or "") != COMMUNICATION_BRIEF_SOURCE_KIND:
+                continue
+            brief_payload = dict(observation.get("payload") or {})
+            brief_id = str(brief_payload.get("brief_id") or "").strip()
+            if not brief_id:
+                continue
+            thread_ref = dict(brief_payload.get("thread_ref") or {})
+            label_subject = str(thread_ref.get("subject") or brief_payload.get("employee_goal") or "communication brief")
+            _append_candidate(
+                kind=COMMUNICATION_BRIEF_SOURCE_KIND,
+                candidate_id=f"communication-brief:{brief_id}",
+                source_turn_id=turn_id,
+                content=_communication_brief_candidate_content(brief_payload),
+                label=f"communication brief: {compact_text(label_subject, 72)}",
+                content_type="application/json",
+            )
+            break
     assistant_candidate_count = 0
     for turn in reversed(turns):
         role = str(turn.get("role") or "").lower()
@@ -1459,7 +1509,7 @@ def _build_mail_action_plan(
         legacy_referential_request=referential_request,
         explicit_summary=explicit_summary,
     )
-    return build_mail_action_plan(
+    result = build_mail_action_plan(
         message=str(payload.message or ""),
         request_message=str(payload.message or ""),
         candidates=candidates,
@@ -1470,6 +1520,61 @@ def _build_mail_action_plan(
         conversation_id=conversation_id,
         source_resolution=source_resolution,
     )
+    return _normalize_communication_brief_mail_plan_result(result)
+
+
+def _normalize_communication_brief_mail_plan_result(result: dict[str, Any]) -> dict[str, Any]:
+    mail_plan = dict(result.get("mail_plan") or {})
+    selected_candidate = dict(mail_plan.get("selected_candidate") or {})
+    if str(selected_candidate.get("kind") or "") != COMMUNICATION_BRIEF_SOURCE_KIND:
+        return result
+
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    compose_mode = str(source_resolution.get("compose_mode") or mail_plan.get("compose_mode") or "recipient_ready_summary")
+    if compose_mode == "direct_body":
+        compose_mode = "recipient_ready_summary"
+    reference_source = {
+        "candidate_id": str(selected_candidate.get("candidate_id") or ""),
+        "source_turn_id": str(selected_candidate.get("source_turn_id") or ""),
+        "role": COMMUNICATION_BRIEF_SOURCE_KIND,
+        "policy": compose_mode,
+        "content": str(selected_candidate.get("content") or ""),
+    }
+    artifact = {
+        "role": "selected_source",
+        "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+        "candidate_id": str(selected_candidate.get("candidate_id") or ""),
+        "source_turn_id": str(selected_candidate.get("source_turn_id") or ""),
+        "filename": str(selected_candidate.get("filename") or ""),
+    }
+    mail_plan.update(
+        {
+            "resolved_body": "" if compose_mode != "verbatim_copy" else str(mail_plan.get("resolved_body") or ""),
+            "review_content": "" if compose_mode != "verbatim_copy" else str(mail_plan.get("review_content") or ""),
+            "compose_mode": compose_mode,
+            "reference_sources": [reference_source],
+            "body_sources": [
+                {
+                    "kind": "reference_source",
+                    "role": COMMUNICATION_BRIEF_SOURCE_KIND,
+                    "policy": compose_mode,
+                }
+            ],
+            "source_refs": list(dict.fromkeys([*list(mail_plan.get("source_refs") or []), COMMUNICATION_BRIEF_SOURCE_KIND])),
+            "source_policy": {
+                **dict(mail_plan.get("source_policy") or {}),
+                "communication_brief_source": "renderer_reference_only",
+            },
+            "source_resolution": {
+                **source_resolution,
+                "source_mode": COMMUNICATION_BRIEF_SOURCE_KIND,
+                "compose_mode": compose_mode,
+            },
+            "source_artifacts": [artifact],
+            "provenance_refs": [artifact],
+        }
+    )
+    return {**result, "mail_plan": mail_plan}
 
 
 def _persist_mail_plan(
@@ -2670,13 +2775,22 @@ def _render_mail_plan_with_llm(
     candidates: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     rendered_plan = dict(mail_plan or {})
+    render_candidates = list(candidates or [])
+    selected_candidate = dict(rendered_plan.get("selected_candidate") or {})
+    if str(selected_candidate.get("kind") or "") == COMMUNICATION_BRIEF_SOURCE_KIND:
+        selected_id = str(selected_candidate.get("candidate_id") or "")
+        render_candidates = [
+            item
+            for item in render_candidates
+            if str(item.get("candidate_id") or "") == selected_id
+        ] or [selected_candidate]
     started = perf_counter()
     render_result = render_mail_authoring(
         question=message,
         render_mode=render_mode,
         mail_plan=rendered_plan,
         observations=observations,
-        candidates=candidates,
+        candidates=render_candidates,
     )
     render_result["latency_ms"] = round((perf_counter() - started) * 1000.0, 2)
     body_for_sending = str(render_result.get("body_for_sending") or "").strip()

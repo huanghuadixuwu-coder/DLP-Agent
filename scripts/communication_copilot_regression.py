@@ -254,6 +254,177 @@ def run_brief_assembly() -> dict[str, Any]:
     }
 
 
+def run_mail_closeout() -> dict[str, Any]:
+    import app.main as main_module
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND, MailDraft
+    from app.mail.source_resolver import resolve_mail_source_request
+    from app.outbound_delivery import build_mail_action_plan
+
+    raw_rag_answer = "RAW_RAG_FINAL_ANSWER_SHOULD_NOT_BECOME_MAIL_BODY"
+    brief_payload = {
+        "brief_id": "brief_closeout_123",
+        "conversation_id": "conversation_closeout_123",
+        "thread_ref": {
+            "thread_id": "thread_closeout_123",
+            "source": "mail",
+            "subject": "Renewal planning",
+            "participants": ["customer@example.com", "rep@example.com"],
+            "last_message_at": "2026-06-17T08:05:00+00:00",
+        },
+        "employee_goal": "Prepare a renewal reply",
+        "customer_context_summary": "Customer asked whether renewal pricing can be confirmed this week.",
+        "grounding_refs": [{"kind": "enterprise_fact", "doc_id": "doc_pricing", "chunk_id": "chunk_pricing_1"}],
+        "must_include": ["pricing timeline"],
+        "must_avoid": ["unsupported discounts"],
+        "open_questions": [],
+        "recommended_next_action": "draft_with_grounding",
+        "source_observation_ids": ["obs_brief_closeout"],
+        "confidence": 0.86,
+    }
+    brief_content = json.dumps(brief_payload, ensure_ascii=False, sort_keys=True)
+    candidates = [
+        {
+            "candidate_id": "assistant-turn:raw-answer",
+            "kind": "assistant_last_answer",
+            "label": "raw prior answer",
+            "content": raw_rag_answer,
+            "content_type": "text/plain",
+        },
+        {
+            "candidate_id": "communication-brief:brief_closeout_123",
+            "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+            "label": "communication brief: Renewal planning",
+            "content": brief_content,
+            "content_type": "application/json",
+        },
+    ]
+
+    source_resolution = resolve_mail_source_request(
+        message="Please email the customer at customer@example.com with the closeout.",
+        candidates=candidates,
+        legacy_referential_request=True,
+        explicit_summary=True,
+    )
+    _assert_equal(source_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "source_mode")
+    _assert_equal(source_resolution["compose_mode"], "recipient_ready_summary", "compose_mode")
+    _assert_equal(
+        source_resolution["selected_candidate_ids"],
+        ["communication-brief:brief_closeout_123"],
+        "selected candidate",
+    )
+
+    plan_result = build_mail_action_plan(
+        message="Please email the customer at customer@example.com with the closeout.",
+        request_message="Please email the customer at customer@example.com with the closeout.",
+        candidates=candidates,
+        destination_email="customer@example.com",
+        referential_request=True,
+        explicit_summary=True,
+        send_both=False,
+        conversation_id="conversation_closeout_123",
+        source_resolution=source_resolution,
+    )
+    normalized_result = main_module._normalize_communication_brief_mail_plan_result(plan_result)
+    mail_plan = dict(normalized_result.get("mail_plan") or {})
+
+    _assert_equal(normalized_result.get("mode"), "confirmation_required", "mode")
+    _assert_equal(mail_plan.get("target_object"), COMMUNICATION_BRIEF_SOURCE_KIND, "target_object")
+    _assert_equal(mail_plan.get("compose_mode"), "recipient_ready_summary", "normalized compose_mode")
+    _assert_equal(mail_plan.get("resolved_recipients"), ["customer@example.com"], "recipient")
+    _assert_true(str(mail_plan.get("resolved_subject") or "").strip(), "subject")
+    _assert_equal(mail_plan.get("resolved_body"), "", "body before renderer")
+    _assert_true(mail_plan.get("requires_confirmation"), "confirmation required")
+    _assert_equal(mail_plan.get("status"), "pending_confirmation", "plan status")
+    _assert_equal(dict(mail_plan.get("source_resolution") or {}).get("source_mode"), COMMUNICATION_BRIEF_SOURCE_KIND, "plan source mode")
+    _assert_true(
+        {
+            "kind": "reference_source",
+            "role": COMMUNICATION_BRIEF_SOURCE_KIND,
+            "policy": "recipient_ready_summary",
+        }
+        in list(mail_plan.get("body_sources") or []),
+        "communication brief body source",
+    )
+    _assert_equal(list(mail_plan.get("reference_sources") or [])[0].get("role"), COMMUNICATION_BRIEF_SOURCE_KIND, "reference role")
+    _assert_equal(list(mail_plan.get("source_artifacts") or [])[0].get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "source artifact kind")
+    _assert_equal(list(mail_plan.get("provenance_refs") or [])[0].get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "provenance kind")
+    if raw_rag_answer in str(mail_plan.get("resolved_body") or ""):
+        raise AssertionError("raw RAG answer leaked into resolved body before renderer")
+    if raw_rag_answer in json.dumps(mail_plan.get("reference_sources") or [], ensure_ascii=False):
+        raise AssertionError("raw RAG answer leaked into communication brief reference sources")
+
+    captured: dict[str, Any] = {}
+    original_renderer = main_module.render_mail_authoring
+
+    def _fake_renderer(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        rendered_body = "Customer-ready renewal reply grounded in the communication brief."
+        return {
+            "user_message": "Draft prepared.",
+            "body_for_sending": rendered_body,
+            "clarification_question": "",
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+            "used_fallback": False,
+        }
+
+    main_module.render_mail_authoring = _fake_renderer
+    try:
+        rendered_plan, render_result = main_module._render_mail_plan_with_llm(
+            message="Please email the customer at customer@example.com with the closeout.",
+            mail_plan=mail_plan,
+            render_mode="confirmation",
+            observations=[
+                {
+                    "observation_type": "communication_brief",
+                    "payload": brief_payload,
+                    "summary": "Communication brief captured.",
+                }
+            ],
+            candidates=candidates,
+        )
+    finally:
+        main_module.render_mail_authoring = original_renderer
+
+    captured_plan = dict(captured.get("mail_plan") or {})
+    _assert_equal(captured.get("render_mode"), "confirmation", "render mode")
+    _assert_equal(list(captured_plan.get("reference_sources") or [])[0].get("role"), COMMUNICATION_BRIEF_SOURCE_KIND, "renderer reference role")
+    if raw_rag_answer in str(captured_plan.get("resolved_body") or ""):
+        raise AssertionError("raw RAG answer leaked into renderer body input")
+    if raw_rag_answer in json.dumps(captured.get("candidates") or [], ensure_ascii=False):
+        raise AssertionError("raw RAG answer leaked into renderer candidate previews")
+    _assert_true(str(rendered_plan.get("resolved_body") or "").strip(), "rendered body")
+    _assert_equal(rendered_plan.get("authoring_status"), "completed", "authoring status")
+    _assert_equal(render_result.get("body_for_sending"), rendered_plan.get("resolved_body"), "rendered body lifecycle")
+
+    draft = MailDraft(
+        conversation_id="conversation_closeout_123",
+        to=list(rendered_plan.get("resolved_recipients") or []),
+        subject=str(rendered_plan.get("resolved_subject") or ""),
+        body_text=str(rendered_plan.get("resolved_body") or ""),
+        source_refs=list(rendered_plan.get("source_refs") or []),
+        body_sources=list(rendered_plan.get("body_sources") or []),
+        source_policy=dict(rendered_plan.get("source_policy") or {}),
+        requires_confirmation=True,
+        requires_dlp=True,
+    )
+    _assert_equal(draft.status, "draft_ready", "draft status")
+    _assert_true(draft.requires_confirmation, "draft confirmation boundary")
+    _assert_true(draft.requires_dlp, "draft DLP boundary")
+    _assert_equal(draft.missing_fields, [], "draft missing fields")
+
+    return {
+        "ok": True,
+        "case": "mail_closeout",
+        "source_mode": source_resolution["source_mode"],
+        "compose_mode": mail_plan.get("compose_mode"),
+        "draft_status": draft.status,
+        "requires_confirmation": draft.requires_confirmation,
+        "requires_dlp": draft.requires_dlp,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Communication Copilot regression checks")
     parser.add_argument("--case", required=True, dest="case_name")
@@ -262,6 +433,7 @@ def main() -> int:
     cases = {
         "contracts_import": run_contracts_import,
         "brief_assembly": run_brief_assembly,
+        "mail_closeout": run_mail_closeout,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)
