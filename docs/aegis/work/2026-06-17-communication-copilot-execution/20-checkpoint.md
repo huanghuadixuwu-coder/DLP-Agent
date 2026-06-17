@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 7 final retirement of active legacy carriers after proof.
+- Run final review and branch completion after Task 7.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -30,9 +30,13 @@ Completed todos:
 - Task 6 copy-consistency polish landed in `814aa0d`.
 - Task 6 spec compliance review passed.
 - Task 6 code quality review passed, including a narrow re-review after the copy polish.
+- Task 7 retired the legacy orchestration fallback in `fd19c0a`.
+- Task 7 retirement scan hardening landed in `f64d84f`.
+- Task 7 spec compliance review passed.
+- Task 7 code quality review passed, including a narrow re-review after the scan hardening.
 
 Active slice:
-- Task 7 preparation.
+- Final review preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -61,12 +65,17 @@ Evidence refs:
 - Task 6 worker verification also passed `agent_runtime_regression.py`, `contracts_import`, `brief_assembly`, `mail_closeout`, `subordinate_inputs`, `governance_preview_ui_regression.py`, and `git diff --check`.
 - Task 6 preserved governance separation: 8511 remains user-side workspace/progress, while high-risk approval authority remains outside the user workspace.
 - Task 6 did not alter frontend style, CSS, layout, theme, or colors; the only post-review UI change was copy consistency from `合并所选对话` to `合并所选沟通线程`.
+- Task 7 Docker verification passed for `python -m compileall -q app scripts web`.
+- Task 7 Docker verification passed for `agent_runtime_regression.py`.
+- Task 7 Docker verification passed for `communication_copilot_regression.py --case retirement`, with `mode_used=react_recovery` and `final_answer_source=orchestration_recovery_renderer`.
+- Task 7 removed the retired `legacy_orchestration`, `legacy_aggregator`, and `ENABLE_LEGACY_ORCHESTRATION_FALLBACK` carrier path while preserving active dependency surfaces such as the static tool registry wrappers, `legacy_referential_request`, and runtime memory payload compatibility.
+- Task 7 search verification found no retired carrier tokens in active `app`/`README.md` runtime surfaces.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks full RAG-specific regression evidence but not Task 6 UI/workspace framing.
 
 Next step:
-- Run drift check, then dispatch Task 7 worker to retire proven legacy carriers without deleting unproven active dependencies.
+- Run final Docker verification and final code review before branch completion.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -78,4 +87,5 @@ DriftCheckDraft:
 - Closeout boundary: Task 4 moved Mail closeout toward `communication_brief` while preserving existing Mail/DLP confirmation lifecycle.
 - Subordinate boundary: Task 5 marked RAG as grounding provider and Meeting as escalation provider; Mail remains closeout owner.
 - Workspace boundary: Task 6 made communication-thread context the dominant user workspace state while leaving business authority in backend observations and governance surfaces.
-- Decision: continue.
+- Retirement boundary: Task 7 retired only the proven legacy orchestration fallback; active legacy-named compatibility dependencies remain tracked for future replacement.
+- Decision: continue to final review.

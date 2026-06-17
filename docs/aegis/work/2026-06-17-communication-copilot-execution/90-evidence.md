@@ -75,3 +75,15 @@ Task 6 evidence:
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case workspace_flow`: passed with `workspace_kind=communication_thread_context` and `primary_work_object=communication_brief`.
 - `docker compose exec -T api python -m compileall -q app scripts web`: passed.
 - Worker verification also passed `agent_runtime_regression.py`, `contracts_import`, `brief_assembly`, `mail_closeout`, `subordinate_inputs`, `governance_preview_ui_regression.py`, and `git diff --check`.
+
+Task 7 evidence:
+- Worker retirement commit: `fd19c0a`.
+- Retirement scan hardening commit: `f64d84f`.
+- Spec compliance reviewer passed and confirmed the old planner/executor/aggregator fallback was removed, ReAct failures now return typed recovery, and non-goal active dependency surfaces were preserved.
+- Code quality reviewer passed and confirmed renderer-owned generic recovery output, consistent downstream response shape, clean imports, and no frontend/style changes.
+- Narrow re-review passed after adding uppercase `ENABLE_LEGACY_ORCHESTRATION_FALLBACK` to the retirement scan.
+- `docker compose exec -T api python -m compileall -q app scripts web`: passed.
+- `docker compose exec -T api python scripts/agent_runtime_regression.py`: passed with `ok: true`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case retirement`: passed with `mode_used=react_recovery` and `final_answer_source=orchestration_recovery_renderer`.
+- `rg -n "LeetCode|legacy_orchestration|legacy_aggregator|RAG Agent" app README.md`: no active matches.
+- `git diff --check`: passed with Windows LF/CRLF warnings only.
