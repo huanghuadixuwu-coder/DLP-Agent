@@ -312,6 +312,30 @@ def run_mail_closeout() -> dict[str, Any]:
         ["communication-brief:brief_closeout_123"],
         "selected candidate",
     )
+    upload_resolution = resolve_mail_source_request(
+        message="Please email the uploaded file content to customer@example.com.",
+        candidates=[
+            {
+                "candidate_id": "upload:current",
+                "kind": "uploaded_text",
+                "label": "current upload",
+                "content": "Current uploaded content that must not be overridden by a stale brief.",
+                "content_type": "text/plain",
+            },
+            {
+                "candidate_id": "communication-brief:brief_closeout_123",
+                "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+                "label": "communication brief: Renewal planning",
+                "content": brief_content,
+                "content_type": "application/json",
+            },
+        ],
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    _assert_equal(upload_resolution["source_mode"], "uploaded_content", "upload source mode")
+    _assert_equal(upload_resolution["selected_candidate_ids"], ["upload:current"], "upload selected candidate")
+    _assert_equal(upload_resolution["needs_clarification"], False, "upload clarification")
     prior_answer_resolution = resolve_mail_source_request(
         message="Please forward that information to customer@example.com.",
         candidates=[

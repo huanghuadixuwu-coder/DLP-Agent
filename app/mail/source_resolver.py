@@ -99,8 +99,25 @@ def resolve_mail_source_request(
             reason="No outbound content candidates are available.",
             classifier_source="deterministic_empty_candidates",
         )
+    uploaded = next((item for item in normalized_candidates if item["kind"] == "uploaded_text"), None)
+    if uploaded:
+        return _resolution(
+            selected_candidate_ids=[uploaded["candidate_id"]],
+            source_mode="uploaded_content",
+            compose_mode="direct_body",
+            referential_request=False,
+            confidence=0.9,
+            reason="Selected the explicit uploaded content source before prior communication briefs.",
+            classifier_source="deterministic_uploaded_content",
+        )
     brief_candidates = [item for item in normalized_candidates if item["kind"] == COMMUNICATION_BRIEF_SOURCE_KIND]
-    if len(brief_candidates) == 1:
+    competing_reference_candidates = [
+        item
+        for item in normalized_candidates
+        if item["kind"] in REFERENCE_SOURCE_KINDS
+        and item["kind"] not in {COMMUNICATION_BRIEF_SOURCE_KIND, "assistant_last_answer"}
+    ]
+    if len(brief_candidates) == 1 and not competing_reference_candidates:
         return _resolution(
             selected_candidate_ids=[brief_candidates[0]["candidate_id"]],
             source_mode="communication_brief",
