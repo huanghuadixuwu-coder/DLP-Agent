@@ -1043,6 +1043,20 @@ Task 0A evidence:
   --limit 4` failed before exercising this change because the API container
   could not open `/app/questions.parquet`.
 
+Task 1 evidence:
+
+- `[x]` Wording target is locked: top-level docs must center Communication
+  Copilot, Mail Agent ownership, governed external communication, and the local
+  Docker Compose acceptance baseline.
+- `[x]` Red-flag categories are locked without changing runtime behavior:
+  top-level docs must not make generic conversation or retrieval the product
+  center.
+- `[x]` Migration boundary is locked: this task is docs-only, has no runtime
+  impact, and does not retire active compatibility shims. Compat-shim removal
+  still requires replacement owner paths and Docker regressions in later tasks.
+- `[x]` Task 1 updated only `README.md`, `todolist.md`, and
+  `problem_todolist.md`.
+
 ## Platform Capability Backlog (Not Failure Issues)
 
 Status: `[ ]` planned after Phase 3 stabilization

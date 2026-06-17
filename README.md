@@ -1,11 +1,22 @@
-# 安全外发与邮件协作 Agent
+# Communication Copilot
 
-这是一个 Docker-first 的企业邮件协作与知识问答 Agent。当前主线已经收口为面向企业落地的多用户试用版：
+This repo is a Docker-first Communication Copilot for governed external
+communication. The product center is Mail Agent ownership: inbound mail
+understanding, safe drafting, DLP review, explicit sender confirmation,
+governance approval, provider reliability, and auditable delivery.
 
-- 员工通过统一聊天入口处理企业知识问答、邮件草稿、DLP 外发审批、收件摘要和上传内容分析。
-- 系统通过 `ActorContext` 区分 `tenant_id / user_id / workspace_id / roles / session_id / conversation_id`，支持基础多用户、租户隔离和权限边界。
-- 企业事实问答默认使用 EnterpriseRAG，memory 只能补上下文和项目约定，不能替代企业事实 citation。
-- 所有验收以 Docker 容器内结果为准，不以本机 Python 作为有效基线。
+Framing contract:
+
+- Mail Agent is the primary owner for external communication workflows.
+- EnterpriseRAG, meeting, DLP, memory, uploads, and governance are supporting
+  capabilities that help compose, ground, approve, and recover communication.
+- Local Docker Compose is the acceptance baseline; local host Python is not a
+  valid completion signal.
+- This top-level docs update has no runtime impact and does not retire active
+  compatibility shims. Runtime migration happens only after replacement owner
+  paths are regression-proven.
+- Top-level docs must not present the product as a generic conversation surface
+  or retrieval-centered system.
 
 ## 入口
 
