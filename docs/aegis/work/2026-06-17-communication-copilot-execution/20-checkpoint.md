@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 4 re-own Mail Agent closeout around communication brief.
+- Start Task 5 make EnterpriseRAG and Meeting Agent produce communication inputs.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -22,9 +22,11 @@ Completed todos:
 - Task 2 spec compliance and code quality reviews passed.
 - Task 3 added communication thread resolution and brief assembly in `dbcb20f`.
 - Task 3 spec compliance and code quality reviews passed.
+- Task 4 made Mail Agent consume `communication_brief` as the closeout source across `f39ba37`, `0e35004`, `2cde2ea`, and `f2180aa`.
+- Task 4 spec compliance and code quality reviews passed after source-precedence regressions were fixed.
 
 Active slice:
-- Task 4 preparation.
+- Task 5 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -42,12 +44,15 @@ Evidence refs:
 - Task 3 added `app/communication/thread_context.py` and `app/communication/brief_service.py`.
 - Task 3 Docker verification passed for `contracts_import` and `brief_assembly` regression cases.
 - Task 3 did not change public API, DB schema, frontend/style, inbound store persistence, memory behavior, or EnterpriseRAG query behavior.
+- Task 4 Docker verification passed for `mail_reference_authoring_regression.py` and `communication_copilot_regression.py --case mail_closeout` after final fixes.
+- Task 4 preserved explicit upload/current-source precedence and anchored prior-assistant-answer precedence before `communication_brief`.
+- Task 4 did not commit frontend/style/docs/data transcript changes.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks RAG-specific regression evidence but not Task 1 docs framing.
 
 Next step:
-- Dispatch Task 4 worker to route Mail Agent closeout through communication brief without breaking draft/patch/confirm/DLP lifecycle.
+- Dispatch Task 5 worker to expose EnterpriseRAG grounding bundles and Meeting escalation candidates as communication inputs without taking over Mail closeout.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -56,4 +61,5 @@ DriftCheckDraft:
 - Product boundary: Task 1 changed docs only; no runtime ownership was moved yet.
 - Contract boundary: Task 2 introduced additive internal types only; no active behavior moved yet.
 - Assembly boundary: Task 3 introduced internal brief assembly only; no public closeout ownership moved yet.
+- Closeout boundary: Task 4 moved Mail closeout toward `communication_brief` while preserving existing Mail/DLP confirmation lifecycle.
 - Decision: continue.

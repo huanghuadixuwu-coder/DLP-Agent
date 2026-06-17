@@ -47,3 +47,12 @@ Task 3 evidence:
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case contracts_import`: passed with `ok: true`.
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case brief_assembly`: passed with `ok: true`.
 - `docker compose exec -T api python -m compileall -q app scripts`: passed in the worker verification.
+
+Task 4 evidence:
+- Worker closeout commit: `f39ba37`.
+- Fix commits: `0e35004`, `2cde2ea`, `f2180aa`.
+- Spec compliance reviewer passed after `mail_reference_authoring_regression.py` was restored.
+- Code quality reviewer passed after explicit upload/current-source and anchored prior-assistant-answer precedence were restored before `communication_brief`.
+- `docker compose exec -T api python scripts/mail_reference_authoring_regression.py`: passed with `ok: true`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case mail_closeout`: passed with `ok: true`.
+- Worker verification also passed `mail_authoring_contract_regression.py`, `contracts_import`, `brief_assembly`, compileall, and diff-check for allowed files.
