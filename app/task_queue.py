@@ -55,8 +55,12 @@ def enqueue_email_send_task(task_id: str) -> str:
     return task_id
 
 
-def enqueue_inbound_mail_sync() -> str:
-    result = _send_task_with_resilience("app.task_worker.sync_inbound_mail_task", queue=MAIL_QUEUE)
+def enqueue_inbound_mail_sync(actor_context: dict | None = None) -> str:
+    result = _send_task_with_resilience(
+        "app.task_worker.sync_inbound_mail_task",
+        args=[actor_context or {}],
+        queue=MAIL_QUEUE,
+    )
     return str(result.id)
 
 

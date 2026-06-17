@@ -297,8 +297,10 @@ def run_thread_store() -> dict[str, Any]:
 
     import app.inbound_mail as inbound_mail_module
     import app.main as main_module
+    import app.mail.current_provider as current_provider_module
     import app.orchestration.registry as registry_module
-    from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_USER_ID, ActorContext, actor_from_mapping
+    from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID, ActorContext, actor_from_mapping
+    from app.auth_store import create_login_code, verify_login_code
     from app.communication.thread_store import (
         get_active_communication_thread,
         get_communication_thread,
@@ -308,15 +310,15 @@ def run_thread_store() -> dict[str, Any]:
     )
     from app.inbound_mail_store import create_notification, get_inbound_message, list_notifications
     from app.mail.current_provider import CurrentImapSmtpMailProvider
-    from app.models import UnifiedAgentRequest
+    from app.models import InboundMailSyncRequest, UnifiedAgentRequest
     from app.orchestration.types import OrchestrationContext
 
     suffix = uuid4().hex[:8]
-    actor_a = {
-        "tenant_id": f"tenant-thread-store-{suffix}",
-        "user_id": "employee-a",
-        "workspace_id": "workspace-a",
-    }
+    actor_a_email = f"employee-a-{suffix}@threadstore.example"
+    actor_a_login = create_login_code(actor_a_email)
+    actor_a_auth = verify_login_code(actor_a_email, str(actor_a_login["code"]))
+    actor_a = dict(actor_a_auth["user"])
+    actor_a_session_token = str(actor_a_auth["session_token"])
     actor_b = {
         "tenant_id": f"tenant-thread-store-{suffix}",
         "user_id": "employee-b",
@@ -355,6 +357,14 @@ def run_thread_store() -> dict[str, Any]:
     alias_provider_thread = f"provider-{alias_thread}"
     shared_provider_message_id = f"shared-provider-msg-{suffix}"
     local_shared_provider_message_id = f"shared-local-provider-msg-{suffix}"
+
+    def assert_http_status(fn: Any, expected_status: int, label: str) -> None:
+        try:
+            fn()
+        except Exception as exc:
+            _assert_equal(getattr(exc, "status_code", None), expected_status, label)
+        else:
+            raise AssertionError(f"{label}: expected HTTP {expected_status}")
 
     _seed_thread_store_message(
         actor_context=actor_a,
@@ -705,13 +715,57 @@ def run_thread_store() -> dict[str, Any]:
     finally:
         inbound_mail_module.get_llm = original_inbound_get_llm
 
-    actor_a_request = SimpleNamespace(
+    actor_a_spoof_request = SimpleNamespace(
         headers={
             "x-tenant-id": actor_a["tenant_id"],
             "x-user-id": actor_a["user_id"],
             "x-workspace-id": actor_a["workspace_id"],
         }
     )
+    assert_http_status(
+        lambda: main_module.inbound_mail_summary_api(
+            actor_a_spoof_request,
+            since="2026-06-17T00:00:00+00:00",
+            until="2026-06-18T00:00:00+00:00",
+        ),
+        401,
+        "spoofed non-local public summary requires auth session",
+    )
+    assert_http_status(
+        lambda: main_module.inbound_mail_messages_api(actor_a_spoof_request, limit=10),
+        401,
+        "spoofed non-local public messages require auth session",
+    )
+    assert_http_status(
+        lambda: main_module.draft_inbound_mail_reply_api(shared_provider_message_id, actor_a_spoof_request),
+        401,
+        "spoofed non-local public draft requires auth session",
+    )
+    assert_http_status(
+        lambda: main_module.generate_daily_mail_digest_api(actor_a_spoof_request),
+        401,
+        "spoofed non-local digest requires auth session",
+    )
+    assert_http_status(
+        lambda: main_module.sync_inbound_mail_api(actor_a_spoof_request, InboundMailSyncRequest(limit=1)),
+        401,
+        "spoofed non-local sync requires auth session",
+    )
+    assert_http_status(
+        lambda: main_module.enqueue_inbound_mail_sync_api(actor_a_spoof_request),
+        401,
+        "spoofed non-local async sync requires auth session",
+    )
+    local_request = SimpleNamespace(headers={})
+    local_summary = main_module.inbound_mail_summary_api(
+        local_request,
+        since="2026-06-17T00:00:00+00:00",
+        until="2026-06-18T00:00:00+00:00",
+    )
+    _assert_true(local_summary.total >= 0, "local-dev public summary remains allowed")
+    main_module.inbound_mail_messages_api(local_request, limit=1)
+
+    actor_a_request = SimpleNamespace(headers={"x-auth-session": actor_a_session_token})
     api_summary_a = main_module.inbound_mail_summary_api(
         actor_a_request,
         since="2026-06-17T00:00:00+00:00",
@@ -734,6 +788,145 @@ def run_thread_store() -> dict[str, Any]:
             raise AssertionError("public API actor A drafted actor B storage id")
     finally:
         inbound_mail_module.get_llm = original_inbound_get_llm
+
+    from datetime import datetime, timezone
+
+    sync_provider_message_id = f"sync-provider-msg-{suffix}"
+    sync_thread_id = f"sync-thread-{suffix}"
+
+    class FakeIMAP:
+        def __enter__(self) -> "FakeIMAP":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def login(self, *_args: Any) -> None:
+            return None
+
+        def select(self, *_args: Any, **_kwargs: Any) -> tuple[str, list[bytes]]:
+            return "OK", [b"1"]
+
+        def uid(self, command: str, *_args: Any) -> tuple[str, list[Any]]:
+            if command == "search":
+                return "OK", [b"101"]
+            if command == "fetch":
+                return "OK", [(b"FLAGS () RFC822", b"raw")]
+            return "NO", []
+
+    original_sync_settings = inbound_mail_module.get_settings
+    original_imap_ssl = inbound_mail_module.imaplib.IMAP4_SSL
+    original_parse_fetched = inbound_mail_module._parse_fetched_message
+    inbound_mail_module.get_settings = lambda: SimpleNamespace(
+        imap_enabled=True,
+        imap_mailbox="INBOX",
+        imap_username="sync-user",
+        imap_password="sync-password",
+        imap_host="imap.example.invalid",
+        imap_port=993,
+    )
+    inbound_mail_module.imaplib.IMAP4_SSL = lambda *_args, **_kwargs: FakeIMAP()
+    inbound_mail_module._parse_fetched_message = lambda *_args, **_kwargs: {
+        "message_id": sync_provider_message_id,
+        "mailbox": "INBOX",
+        "uid": f"sync-uid-{suffix}",
+        "thread_id": sync_thread_id,
+        "provider_thread_id": f"provider-{sync_thread_id}",
+        "sender": "sync-customer@example.com",
+        "recipients": "employee-a@example.com",
+        "subject": "Actor sync boundary",
+        "received_at": "2026-06-17T10:00:00+00:00",
+        "snippet": "Actor sync snippet.",
+        "summary": "Actor sync summary.",
+        "body_text": "Actor sync body.",
+        "body_html_sanitized": "",
+        "body_preview": "Actor sync body.",
+        "labels": [],
+        "attachments": [],
+        "headers_json": {},
+        "risk_hint": "",
+        "raw_size": 128,
+        "is_seen": False,
+    }
+    try:
+        sync_result = inbound_mail_module.sync_inbound_mail(
+            since=datetime(2026, 6, 17, tzinfo=timezone.utc),
+            until=datetime(2026, 6, 18, tzinfo=timezone.utc),
+            limit=1,
+            actor_context=actor_a,
+        )
+    finally:
+        inbound_mail_module.get_settings = original_sync_settings
+        inbound_mail_module.imaplib.IMAP4_SSL = original_imap_ssl
+        inbound_mail_module._parse_fetched_message = original_parse_fetched
+    _assert_equal(sync_result.get("ok"), True, "actor sync helper ok")
+    sync_actor_message = get_inbound_message(sync_provider_message_id, actor_context=actor_a)
+    _assert_true(sync_actor_message, "actor sync message stored under actor")
+    _assert_equal(sync_actor_message["thread_id"], sync_thread_id, "actor sync message thread")
+    _assert_equal(
+        get_inbound_message(sync_provider_message_id, actor_context=ActorContext().to_dict()),
+        None,
+        "actor sync message not stored under default actor",
+    )
+
+    original_main_sync = main_module.sync_inbound_mail
+    captured_sync_api: dict[str, Any] = {}
+
+    def fake_main_sync(**kwargs: Any) -> dict[str, Any]:
+        captured_sync_api.clear()
+        captured_sync_api.update(kwargs)
+        return {"enabled": True, "ok": True, "synced": 0, "new": 0, "mailbox": "INBOX", "state": {}}
+
+    main_module.sync_inbound_mail = fake_main_sync
+    try:
+        main_module.sync_inbound_mail_api(local_request, InboundMailSyncRequest(limit=2))
+        _assert_equal(
+            dict(captured_sync_api.get("actor_context") or {}).get("workspace_id"),
+            DEFAULT_WORKSPACE_ID,
+            "local-dev sync API keeps default workspace",
+        )
+        main_module.sync_inbound_mail_api(actor_a_request, InboundMailSyncRequest(limit=2))
+        _assert_equal(
+            dict(captured_sync_api.get("actor_context") or {}).get("tenant_id"),
+            actor_a["tenant_id"],
+            "authenticated sync API forwards actor tenant",
+        )
+    finally:
+        main_module.sync_inbound_mail = original_main_sync
+
+    original_enqueue_sync = main_module.enqueue_inbound_mail_sync
+    captured_enqueue_sync: dict[str, Any] = {}
+    main_module.enqueue_inbound_mail_sync = lambda actor_context=None: (
+        captured_enqueue_sync.clear(),
+        captured_enqueue_sync.update(actor_context or {}),
+        "task-sync-test",
+    )[-1]
+    try:
+        enqueue_sync_response = main_module.enqueue_inbound_mail_sync_api(actor_a_request)
+        _assert_equal(enqueue_sync_response["task_id"], "task-sync-test", "async sync API task id")
+        _assert_equal(captured_enqueue_sync.get("tenant_id"), actor_a["tenant_id"], "async sync forwards actor tenant")
+    finally:
+        main_module.enqueue_inbound_mail_sync = original_enqueue_sync
+
+    original_provider_sync = current_provider_module.sync_inbound_mail
+    captured_provider_sync: dict[str, Any] = {}
+    current_provider_module.sync_inbound_mail = lambda **kwargs: (
+        captured_provider_sync.clear(),
+        captured_provider_sync.update(kwargs),
+        {"enabled": True, "ok": True, "synced": 0, "new": 0, "mailbox": "INBOX", "state": {}},
+    )[-1]
+    try:
+        provider_sync = current_provider_module.CurrentImapSmtpMailProvider(
+            allow_external_sync=True,
+        ).sync_mailbox(actor_context=actor_a)
+        _assert_true(provider_sync.ok, "provider sync wrapper ok")
+        _assert_equal(
+            dict(captured_provider_sync.get("actor_context") or {}).get("tenant_id"),
+            actor_a["tenant_id"],
+            "provider sync forwards actor tenant",
+        )
+    finally:
+        current_provider_module.sync_inbound_mail = original_provider_sync
 
     actor_a_threads = list_communication_threads(actor_context=actor_a, limit=5)
     actor_b_threads = list_communication_threads(actor_context=actor_b, limit=5)

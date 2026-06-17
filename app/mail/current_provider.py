@@ -260,7 +260,7 @@ class CurrentImapSmtpMailProvider:
                 error_message="Current provider sync is available but disabled for contract/regression execution.",
             )
         try:
-            result = sync_inbound_mail(limit=50)
+            result = sync_inbound_mail(limit=50, actor_context=actor_context)
             if not result.get("enabled"):
                 return self._response(
                     operation=operation,

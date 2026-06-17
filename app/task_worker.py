@@ -1005,8 +1005,8 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.task_worker.sync_inbound_mail_task")
-def sync_inbound_mail_task() -> dict[str, Any]:
-    return sync_inbound_mail()
+def sync_inbound_mail_task(actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    return sync_inbound_mail(actor_context=actor_context)
 
 
 @celery_app.task(name="app.task_worker.generate_daily_mail_digest_task")

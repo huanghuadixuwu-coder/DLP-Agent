@@ -13,6 +13,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.actor_context import actor_from_mapping
 from app.config import get_settings
 from app.graph import get_llm
 from app.inbound_mail_store import (
@@ -421,9 +422,11 @@ def sync_inbound_mail(
     since: datetime | None = None,
     until: datetime | None = None,
     limit: int = 50,
+    actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     mailbox = settings.imap_mailbox or "INBOX"
+    actor = actor_from_mapping(actor_context or {})
     if not settings.imap_enabled:
         state = update_sync_state(mailbox, last_error="IMAP is disabled. Set IMAP_ENABLED=true after configuring IMAP credentials.")
         return {"enabled": False, "synced": 0, "new": 0, "mailbox": mailbox, "state": state}
@@ -478,14 +481,30 @@ def sync_inbound_mail(
                 except Exception:
                     pass
                 synced += 1
-                if upsert_inbound_message(parsed):
+                if upsert_inbound_message(parsed, actor_context=actor.to_dict()):
                     new_count += 1
-                    create_notification(
-                        "new_mail_received",
-                        f"New mail: {parsed['subject'] or '(no subject)'}",
-                        parsed["summary"] or parsed["snippet"],
-                        {"message_id": parsed["message_id"], "sender": parsed["sender"], "received_at": parsed["received_at"]},
-                    )
+                    if actor.is_local_dev:
+                        create_notification(
+                            "new_mail_received",
+                            f"New mail: {parsed['subject'] or '(no subject)'}",
+                            parsed["summary"] or parsed["snippet"],
+                            {
+                                "message_id": parsed["message_id"],
+                                "sender": parsed["sender"],
+                                "received_at": parsed["received_at"],
+                            },
+                        )
+                    else:
+                        create_notification(
+                            "new_mail_received",
+                            "New mail received",
+                            "Message details are available only in the actor-scoped inbox.",
+                            {
+                                "received_at": parsed["received_at"],
+                                "details_redacted": True,
+                                "redaction_reason": "actor_scoped_inbound_mail",
+                            },
+                        )
             state = update_sync_state(mailbox, last_seen_uid=max_uid, last_error="")
     except Exception as exc:
         state = update_sync_state(mailbox, last_error=str(exc))

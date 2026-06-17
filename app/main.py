@@ -254,20 +254,49 @@ def _ensure_rate_limit(actor: ActorContext, resource: str) -> dict[str, Any]:
     return decision.to_dict()
 
 
-def _ensure_internal_communication_thread_access(request: Request, actor: ActorContext) -> dict[str, Any]:
+def _ensure_authenticated_actor_access(
+    request: Request,
+    actor: ActorContext,
+    *,
+    resource: str,
+    local_mode: str = "local_dev",
+) -> dict[str, Any]:
     if actor.is_local_dev:
-        return {"allowed": True, "mode": "local_dev_internal"}
+        return {"allowed": True, "mode": local_mode, "resource": resource}
     token = request.headers.get("x-auth-session") or request.headers.get("X-Auth-Session") or ""
     session = resolve_session_token(token)
     if not session:
-        raise HTTPException(status_code=401, detail="authenticated session required for communication thread access")
+        raise HTTPException(status_code=401, detail=f"authenticated session required for {resource}")
     if (
         str(session.get("tenant_id") or "") != actor.tenant_id
         or str(session.get("workspace_id") or "") != actor.workspace_id
         or str(session.get("user_id") or "") != actor.user_id
     ):
         raise HTTPException(status_code=403, detail="auth session does not match actor context")
-    return {"allowed": True, "mode": "authenticated_session", "email": str(session.get("email") or "")}
+    return {
+        "allowed": True,
+        "mode": "authenticated_session",
+        "resource": resource,
+        "email": str(session.get("email") or ""),
+    }
+
+
+def _ensure_internal_communication_thread_access(request: Request, actor: ActorContext) -> dict[str, Any]:
+    return _ensure_authenticated_actor_access(
+        request,
+        actor,
+        resource="communication thread access",
+        local_mode="local_dev_internal",
+    )
+
+
+def _ensure_inbound_mail_access(request: Request, actor: ActorContext, resource: str) -> dict[str, Any]:
+    return _ensure_authenticated_actor_access(
+        request,
+        actor,
+        resource=resource,
+        local_mode="local_dev_mail",
+    )
 
 
 def _attach_landing_context(
@@ -5991,21 +6020,35 @@ def list_dlp_tasks_api(
 
 
 @app.post("/mail/inbound/sync", response_model=InboundMailSyncResponse)
-def sync_inbound_mail_api(payload: InboundMailSyncRequest | None = None) -> InboundMailSyncResponse:
-    request = payload or InboundMailSyncRequest()
-    since = _parse_optional_datetime(request.since, "since")
-    until = _parse_optional_datetime(request.until, "until")
-    return InboundMailSyncResponse(**sync_inbound_mail(since=since, until=until, limit=request.limit))
+def sync_inbound_mail_api(request: Request, payload: InboundMailSyncRequest | None = None) -> InboundMailSyncResponse:
+    actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail sync")
+    _ensure_permission(actor, "mail.read", "inbound_mail_sync")
+    sync_request = payload or InboundMailSyncRequest()
+    since = _parse_optional_datetime(sync_request.since, "since")
+    until = _parse_optional_datetime(sync_request.until, "until")
+    return InboundMailSyncResponse(
+        **sync_inbound_mail(
+            since=since,
+            until=until,
+            limit=sync_request.limit,
+            actor_context=actor.to_dict(),
+        )
+    )
 
 
 @app.post("/mail/inbound/sync/async")
-def enqueue_inbound_mail_sync_api() -> dict[str, str]:
-    return {"task_id": enqueue_inbound_mail_sync(), "queue": MAIL_QUEUE}
+def enqueue_inbound_mail_sync_api(request: Request) -> dict[str, str]:
+    actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail sync")
+    _ensure_permission(actor, "mail.read", "inbound_mail_sync")
+    return {"task_id": enqueue_inbound_mail_sync(actor.to_dict()), "queue": MAIL_QUEUE}
 
 
 @app.post("/mail/inbound/digest")
 def generate_daily_mail_digest_api(request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail digest")
     _ensure_permission(actor, "mail.read", "inbound_mail_digest")
     return generate_daily_mail_digest(actor_context=actor.to_dict())
 
@@ -6013,6 +6056,7 @@ def generate_daily_mail_digest_api(request: Request) -> dict[str, Any]:
 @app.post("/mail/inbound/digest/async")
 def enqueue_daily_mail_digest_api(request: Request) -> dict[str, str]:
     actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail digest")
     _ensure_permission(actor, "mail.read", "inbound_mail_digest")
     return {"task_id": enqueue_daily_mail_digest(actor.to_dict()), "queue": MAIL_QUEUE}
 
@@ -6020,6 +6064,7 @@ def enqueue_daily_mail_digest_api(request: Request) -> dict[str, str]:
 @app.get("/mail/inbound/summary", response_model=InboundMailSummaryResponse)
 def inbound_mail_summary_api(request: Request, since: str | None = None, until: str | None = None) -> InboundMailSummaryResponse:
     actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail summary")
     _ensure_permission(actor, "mail.read", "inbound_mail_summary")
     return InboundMailSummaryResponse(**get_inbound_mail_summary(since, until, actor_context=actor.to_dict()))
 
@@ -6290,6 +6335,7 @@ def inbound_mail_messages_api(
     offset: int = 0,
 ) -> list[InboundMailMessage]:
     actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail messages")
     _ensure_permission(actor, "mail.read", "inbound_mail_messages")
     bounded_limit = max(1, min(limit, 200))
     return [
@@ -6307,6 +6353,7 @@ def inbound_mail_messages_api(
 @app.post("/mail/inbound/{message_id}/draft-reply", response_model=InboundDraftReplyResponse)
 def draft_inbound_mail_reply_api(message_id: str, request: Request) -> InboundDraftReplyResponse:
     actor = build_actor_context(request=request)
+    _ensure_inbound_mail_access(request, actor, "inbound mail draft reply")
     _ensure_permission(actor, "mail.read", f"inbound_mail_message:{message_id}")
     try:
         return InboundDraftReplyResponse(**draft_reply_for_message(message_id, actor_context=actor.to_dict()))

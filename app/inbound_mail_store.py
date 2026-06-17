@@ -204,10 +204,14 @@ def init_inbound_mail_store() -> None:
         _INITIALIZED = True
 
 
-def upsert_inbound_message(message: dict[str, Any]) -> bool:
+def upsert_inbound_message(
+    message: dict[str, Any],
+    *,
+    actor_context: dict[str, Any] | None = None,
+) -> bool:
     init_inbound_mail_store()
     now = _now()
-    actor = actor_from_mapping(message.get("actor_context") or message)
+    actor = actor_from_mapping(actor_context or message.get("actor_context") or message)
     provider_message_id = _clean(message["message_id"])
     storage_message_id = _storage_message_id(provider_message_id, actor.to_dict())
     with _connect() as conn:
