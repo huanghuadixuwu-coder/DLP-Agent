@@ -91,7 +91,7 @@ def _source_message_ids(messages: list[dict[str, Any]], fallback: Any = None) ->
     else:
         values = list(fallback or [])
     if not values:
-        values = [message.get("message_id") for message in messages]
+        values = [message.get("provider_message_id") or message.get("message_id") for message in messages]
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -187,6 +187,7 @@ def upsert_thread_projection(
         or data.get("provider_thread_id")
         or first.get("thread_id")
         or first.get("provider_thread_id")
+        or first.get("provider_message_id")
         or first.get("message_id")
     )
     if not thread_id:

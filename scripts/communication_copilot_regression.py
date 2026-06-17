@@ -293,12 +293,18 @@ def _seed_thread_store_message(
 
 
 def run_thread_store() -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    import app.main as main_module
+    from app.actor_context import ActorContext, actor_from_mapping
     from app.communication.thread_store import (
         get_active_communication_thread,
         get_communication_thread,
         list_communication_threads,
         set_active_communication_thread,
     )
+    from app.inbound_mail_store import get_inbound_message
+    from app.models import UnifiedAgentRequest
 
     suffix = uuid4().hex[:8]
     actor_a = {
@@ -318,10 +324,11 @@ def run_thread_store() -> dict[str, Any]:
     }
     thread_a = f"thread-store-a-{suffix}"
     thread_b = f"thread-store-b-{suffix}"
+    shared_provider_message_id = f"shared-provider-msg-{suffix}"
 
     _seed_thread_store_message(
         actor_context=actor_a,
-        message_id=f"msg-thread-store-a-1-{suffix}",
+        message_id=shared_provider_message_id,
         uid=f"uid-a-1-{suffix}",
         thread_id=thread_a,
         provider_thread_id=f"provider-{thread_a}",
@@ -347,7 +354,7 @@ def run_thread_store() -> dict[str, Any]:
     )
     _seed_thread_store_message(
         actor_context=actor_b,
-        message_id=f"msg-thread-store-b-1-{suffix}",
+        message_id=shared_provider_message_id,
         uid=f"uid-b-1-{suffix}",
         thread_id=thread_b,
         provider_thread_id=f"provider-{thread_b}",
@@ -358,6 +365,17 @@ def run_thread_store() -> dict[str, Any]:
         summary="Actor B onboarding question.",
         risk_hint="high",
     )
+
+    actor_a_shared = get_inbound_message(shared_provider_message_id, actor_context=actor_a)
+    actor_b_shared = get_inbound_message(shared_provider_message_id, actor_context=actor_b)
+    _assert_true(actor_a_shared, "actor A shared provider message retained")
+    _assert_true(actor_b_shared, "actor B shared provider message retained")
+    _assert_equal(actor_a_shared["thread_id"], thread_a, "actor A shared message thread")
+    _assert_equal(actor_b_shared["thread_id"], thread_b, "actor B shared message thread")
+    _assert_equal(actor_a_shared.get("provider_message_id"), shared_provider_message_id, "actor A provider message id")
+    _assert_equal(actor_b_shared.get("provider_message_id"), shared_provider_message_id, "actor B provider message id")
+    if actor_a_shared["message_id"] == actor_b_shared["message_id"]:
+        raise AssertionError("actor-scoped inbound storage keys collided")
 
     actor_a_threads = list_communication_threads(actor_context=actor_a, limit=5)
     actor_b_threads = list_communication_threads(actor_context=actor_b, limit=5)
@@ -386,6 +404,43 @@ def run_thread_store() -> dict[str, Any]:
         None,
         "actor A cannot activate actor B thread",
     )
+
+    payload = UnifiedAgentRequest(
+        session_id=f"session-thread-store-{suffix}",
+        conversation_id=f"conversation-thread-store-{suffix}",
+        message="Please summarize the recent customer thread.",
+    )
+    actor_a_candidates = main_module._collect_outbound_candidates(
+        payload,
+        payload.conversation_id or "",
+        {},
+        actor_context=actor_a,
+    )
+    actor_a_mail_candidate_ids = {
+        str(item.get("candidate_id") or "") for item in actor_a_candidates if item.get("kind") == "mail_thread"
+    }
+    _assert_true(f"mail-thread:{thread_a}" in actor_a_mail_candidate_ids, "actor A outbound candidate includes own thread")
+    _assert_true(f"mail-thread:{thread_b}" not in actor_a_mail_candidate_ids, "actor A outbound candidates exclude actor B thread")
+
+    main_module._ensure_internal_communication_thread_access(
+        SimpleNamespace(headers={}),
+        ActorContext(),
+    )
+    try:
+        main_module._ensure_internal_communication_thread_access(
+            SimpleNamespace(
+                headers={
+                    "x-tenant-id": actor_a["tenant_id"],
+                    "x-user-id": actor_a["user_id"],
+                    "x-workspace-id": actor_a["workspace_id"],
+                }
+            ),
+            actor_from_mapping(actor_a),
+        )
+    except Exception as exc:
+        _assert_equal(getattr(exc, "status_code", None), 401, "non-local internal endpoint requires auth session")
+    else:
+        raise AssertionError("non-local internal endpoint access without auth session was allowed")
 
     selected_a = set_active_communication_thread(thread_a, actor_context=actor_a)
     _assert_true(selected_a, "actor A selected active thread")

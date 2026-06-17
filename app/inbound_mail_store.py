@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -40,10 +41,28 @@ def _decode_json(value: Any, default: Any) -> Any:
     return default if value is None else value
 
 
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _storage_message_id(provider_message_id: str, actor_context: dict[str, Any] | None = None) -> str:
+    actor = actor_from_mapping(actor_context or {})
+    original = _clean(provider_message_id)
+    if not original:
+        return ""
+    if actor.is_local_dev:
+        return original
+    digest = hashlib.sha256(
+        "|".join([actor.tenant_id, actor.workspace_id, actor.user_id, original]).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"inbound_{digest}"
+
+
 def _decode_message(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if not row:
         return None
     item = dict(row)
+    item["provider_message_id"] = str(item.get("provider_message_id") or item.get("message_id") or "")
     item["is_seen"] = bool(item.get("is_seen"))
     item["labels"] = _decode_json(item.get("labels_json"), [])
     item["attachments"] = _decode_json(item.get("attachments_json"), [])
@@ -72,6 +91,7 @@ def init_inbound_mail_store() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS inbound_mail_messages (
                     message_id TEXT PRIMARY KEY,
+                    provider_message_id TEXT NOT NULL DEFAULT '',
                     tenant_id TEXT NOT NULL DEFAULT 'local-dev',
                     user_id TEXT NOT NULL DEFAULT 'local-user',
                     workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -136,6 +156,7 @@ def init_inbound_mail_store() -> None:
                 ).fetchall()
             }
             for column_name, column_sql in [
+                ("provider_message_id", "TEXT NOT NULL DEFAULT ''"),
                 ("tenant_id", "TEXT NOT NULL DEFAULT 'local-dev'"),
                 ("user_id", "TEXT NOT NULL DEFAULT 'local-user'"),
                 ("workspace_id", "TEXT NOT NULL DEFAULT 'default'"),
@@ -156,6 +177,9 @@ def init_inbound_mail_store() -> None:
                     ON inbound_mail_messages(tenant_id, workspace_id, user_id, received_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_inbound_mail_actor_thread
                     ON inbound_mail_messages(tenant_id, workspace_id, user_id, thread_id, provider_thread_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_mail_actor_provider_message
+                    ON inbound_mail_messages(tenant_id, workspace_id, user_id, provider_message_id)
+                    WHERE provider_message_id <> '';
                 """
             )
             conn.commit()
@@ -166,24 +190,28 @@ def upsert_inbound_message(message: dict[str, Any]) -> bool:
     init_inbound_mail_store()
     now = _now()
     actor = actor_from_mapping(message.get("actor_context") or message)
+    provider_message_id = _clean(message["message_id"])
+    storage_message_id = _storage_message_id(provider_message_id, actor.to_dict())
     with _connect() as conn:
         row = conn.execute(
             """
             INSERT INTO inbound_mail_messages (
-                message_id, tenant_id, user_id, workspace_id, mailbox, uid, thread_id,
-                provider_thread_id, sender, recipients, subject, received_at, snippet,
-                summary, body_text, body_html_sanitized, body_preview, labels_json,
-                attachments_json, headers_json, risk_hint,
+                message_id, provider_message_id, tenant_id, user_id, workspace_id,
+                mailbox, uid, thread_id, provider_thread_id, sender, recipients,
+                subject, received_at, snippet, summary, body_text, body_html_sanitized,
+                body_preview, labels_json, attachments_json, headers_json, risk_hint,
                 raw_size, is_seen, created_at, updated_at
             ) VALUES (
-                %(message_id)s, %(tenant_id)s, %(user_id)s, %(workspace_id)s, %(mailbox)s,
-                %(uid)s, %(thread_id)s, %(provider_thread_id)s, %(sender)s, %(recipients)s,
-                %(subject)s, %(received_at)s, %(snippet)s, %(summary)s, %(body_text)s,
+                %(message_id)s, %(provider_message_id)s, %(tenant_id)s, %(user_id)s,
+                %(workspace_id)s, %(mailbox)s, %(uid)s, %(thread_id)s,
+                %(provider_thread_id)s, %(sender)s, %(recipients)s, %(subject)s,
+                %(received_at)s, %(snippet)s, %(summary)s, %(body_text)s,
                 %(body_html_sanitized)s, %(body_preview)s, %(labels_json)s,
                 %(attachments_json)s, %(headers_json)s, %(risk_hint)s,
                 %(raw_size)s, %(is_seen)s, %(created_at)s, %(updated_at)s
             )
             ON CONFLICT (message_id) DO UPDATE SET
+                provider_message_id = EXCLUDED.provider_message_id,
                 tenant_id = EXCLUDED.tenant_id,
                 user_id = EXCLUDED.user_id,
                 workspace_id = EXCLUDED.workspace_id,
@@ -210,7 +238,8 @@ def upsert_inbound_message(message: dict[str, Any]) -> bool:
             RETURNING (xmax = 0) AS inserted
             """,
             {
-                "message_id": message["message_id"],
+                "message_id": storage_message_id,
+                "provider_message_id": provider_message_id,
                 "tenant_id": actor.tenant_id,
                 "user_id": actor.user_id,
                 "workspace_id": actor.workspace_id,
@@ -280,10 +309,14 @@ def list_inbound_messages(
 
 def get_inbound_message(message_id: str, *, actor_context: dict[str, Any] | None = None) -> dict[str, Any] | None:
     init_inbound_mail_store()
+    message_key = _clean(message_id)
     clauses = ["message_id = %s"]
-    params: list[Any] = [message_id]
+    params: list[Any] = [message_key]
     if actor_context is not None:
         actor = actor_from_mapping(actor_context or {})
+        storage_key = _storage_message_id(message_key, actor.to_dict())
+        clauses = ["(message_id = %s OR message_id = %s OR provider_message_id = %s)"]
+        params = [message_key, storage_key, message_key]
         clauses.extend(["tenant_id = %s", "workspace_id = %s", "user_id = %s"])
         params.extend([actor.tenant_id, actor.workspace_id, actor.user_id])
     with _connect() as conn:
@@ -347,7 +380,13 @@ def list_recent_inbound_threads(
     threads: list[dict[str, Any]] = []
     seen: set[str] = set()
     for message in recent_messages:
-        thread_key = str(message.get("thread_id") or message.get("provider_thread_id") or message.get("message_id") or "").strip()
+        thread_key = str(
+            message.get("thread_id")
+            or message.get("provider_thread_id")
+            or message.get("provider_message_id")
+            or message.get("message_id")
+            or ""
+        ).strip()
         if not thread_key or thread_key in seen:
             continue
         seen.add(thread_key)

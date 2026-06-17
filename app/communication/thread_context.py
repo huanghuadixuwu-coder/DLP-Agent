@@ -66,7 +66,7 @@ def _source_message_ids(messages: list[dict[str, Any]]) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
     for message in messages:
-        message_id = _compact(message.get("message_id"))
+        message_id = _compact(message.get("provider_message_id") or message.get("message_id"))
         if message_id and message_id not in seen:
             ids.append(message_id)
             seen.add(message_id)
@@ -114,7 +114,10 @@ def build_thread_ref_from_messages(
     for message in messages:
         if not resolved_thread_id:
             resolved_thread_id = _compact(
-                message.get("thread_id") or message.get("provider_thread_id") or message.get("message_id")
+                message.get("thread_id")
+                or message.get("provider_thread_id")
+                or message.get("provider_message_id")
+                or message.get("message_id")
             )
         if not subject:
             subject = _compact(message.get("subject"))

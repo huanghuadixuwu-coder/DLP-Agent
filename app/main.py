@@ -254,6 +254,22 @@ def _ensure_rate_limit(actor: ActorContext, resource: str) -> dict[str, Any]:
     return decision.to_dict()
 
 
+def _ensure_internal_communication_thread_access(request: Request, actor: ActorContext) -> dict[str, Any]:
+    if actor.is_local_dev:
+        return {"allowed": True, "mode": "local_dev_internal"}
+    token = request.headers.get("x-auth-session") or request.headers.get("X-Auth-Session") or ""
+    session = resolve_session_token(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="authenticated session required for communication thread access")
+    if (
+        str(session.get("tenant_id") or "") != actor.tenant_id
+        or str(session.get("workspace_id") or "") != actor.workspace_id
+        or str(session.get("user_id") or "") != actor.user_id
+    ):
+        raise HTTPException(status_code=403, detail="auth session does not match actor context")
+    return {"allowed": True, "mode": "authenticated_session", "email": str(session.get("email") or "")}
+
+
 def _attach_landing_context(
     response: UnifiedAgentResponse,
     *,
@@ -844,7 +860,7 @@ def _collect_outbound_candidates(
 
     if actor_context:
         with suppress(Exception):
-            for thread in list_recent_inbound_threads(limit=3, messages_per_thread=5):
+            for thread in list_recent_inbound_threads(limit=3, messages_per_thread=5, actor_context=actor_context):
                 thread_id = str(thread.get("thread_id") or thread.get("provider_thread_id") or "").strip()
                 if not thread_id:
                     continue
@@ -6192,10 +6208,12 @@ def internal_communication_threads_api(
     refresh: bool = True,
 ) -> dict[str, Any]:
     actor = build_actor_context(request=request)
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
     permission_decision = _ensure_permission(actor, "mail.read", "communication_threads")
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
+        "access_decision": access_decision,
         "permission_decision": permission_decision,
         "threads": list_communication_threads(
             actor_context=actor.to_dict(),
@@ -6208,10 +6226,12 @@ def internal_communication_threads_api(
 @app.get("/internal/communication/threads/active")
 def internal_active_communication_thread_api(request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
     permission_decision = _ensure_permission(actor, "mail.read", "active_communication_thread")
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
+        "access_decision": access_decision,
         "permission_decision": permission_decision,
         "active_thread": get_active_communication_thread(actor_context=actor.to_dict()),
     }
@@ -6220,6 +6240,7 @@ def internal_active_communication_thread_api(request: Request) -> dict[str, Any]
 @app.post("/internal/communication/threads/{thread_id}/active")
 def internal_set_active_communication_thread_api(thread_id: str, request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
     permission_decision = _ensure_permission(actor, "mail.read", f"communication_thread:{thread_id}")
     thread = set_active_communication_thread(thread_id, actor_context=actor.to_dict())
     if not thread:
@@ -6227,6 +6248,7 @@ def internal_set_active_communication_thread_api(thread_id: str, request: Reques
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
+        "access_decision": access_decision,
         "permission_decision": permission_decision,
         "active_thread": thread,
     }
@@ -6239,6 +6261,7 @@ def internal_communication_thread_detail_api(
     refresh: bool = True,
 ) -> dict[str, Any]:
     actor = build_actor_context(request=request)
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
     permission_decision = _ensure_permission(actor, "mail.read", f"communication_thread:{thread_id}")
     thread = get_communication_thread(thread_id, actor_context=actor.to_dict(), refresh=refresh)
     if not thread:
@@ -6246,6 +6269,7 @@ def internal_communication_thread_detail_api(
     return {
         "ok": True,
         "actor_context": actor.to_dict(),
+        "access_decision": access_decision,
         "permission_decision": permission_decision,
         "thread": thread,
     }
