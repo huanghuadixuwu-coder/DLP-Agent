@@ -389,10 +389,10 @@ def list_recent_inbound_threads(
     actor_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     init_inbound_mail_store()
-    bounded_limit = max(1, min(int(limit or 3), 10))
+    bounded_limit = max(1, min(int(limit or 3), 100))
     bounded_messages = max(1, min(int(messages_per_thread or 5), 20))
     recent_messages = list_inbound_messages(
-        limit=max(20, bounded_limit * bounded_messages * 2),
+        limit=max(20, min(bounded_limit * bounded_messages * 2, 1000)),
         actor_context=actor_context,
     )
     threads: list[dict[str, Any]] = []

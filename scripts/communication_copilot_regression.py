@@ -304,6 +304,7 @@ def run_thread_store() -> dict[str, Any]:
         get_communication_thread,
         list_communication_threads,
         set_active_communication_thread,
+        upsert_thread_projection,
     )
     from app.inbound_mail_store import create_notification, get_inbound_message, list_notifications
     from app.mail.current_provider import CurrentImapSmtpMailProvider
@@ -336,10 +337,22 @@ def run_thread_store() -> dict[str, Any]:
         "user_id": DEFAULT_USER_ID,
         "workspace_id": f"local-workspace-b-{suffix}",
     }
+    bulk_actor = {
+        "tenant_id": f"tenant-thread-store-bulk-{suffix}",
+        "user_id": "employee-bulk",
+        "workspace_id": "workspace-bulk",
+    }
+    alias_actor = {
+        "tenant_id": f"tenant-thread-store-alias-{suffix}",
+        "user_id": "employee-alias",
+        "workspace_id": "workspace-alias",
+    }
     thread_a = f"thread-store-a-{suffix}"
     thread_b = f"thread-store-b-{suffix}"
     local_thread_a = f"thread-store-local-a-{suffix}"
     local_thread_b = f"thread-store-local-b-{suffix}"
+    alias_thread = f"thread-store-alias-{suffix}"
+    alias_provider_thread = f"provider-{alias_thread}"
     shared_provider_message_id = f"shared-provider-msg-{suffix}"
     local_shared_provider_message_id = f"shared-local-provider-msg-{suffix}"
 
@@ -465,6 +478,57 @@ def run_thread_store() -> dict[str, Any]:
     _assert_true(local_thread_b not in local_a_thread_ids, "local workspace A cannot list workspace B thread")
     _assert_true(local_thread_b in local_b_thread_ids, "local workspace B thread listed")
     _assert_true(local_thread_a not in local_b_thread_ids, "local workspace B cannot list workspace A thread")
+
+    bulk_thread_ids: list[str] = []
+    for index in range(15):
+        bulk_thread_id = f"thread-store-bulk-{index:02d}-{suffix}"
+        bulk_thread_ids.append(bulk_thread_id)
+        _seed_thread_store_message(
+            actor_context=bulk_actor,
+            message_id=f"msg-thread-store-bulk-{index:02d}-{suffix}",
+            uid=f"uid-bulk-{index:02d}-{suffix}",
+            thread_id=bulk_thread_id,
+            provider_thread_id=f"provider-{bulk_thread_id}",
+            sender=f"bulk-customer-{index:02d}@example.com",
+            recipients="employee-bulk@example.com",
+            subject=f"Bulk thread {index:02d}",
+            received_at=f"2026-06-17T09:{index:02d}:00+00:00",
+            summary=f"Bulk thread {index:02d} summary.",
+            risk_hint="",
+        )
+    bulk_threads_limit_12 = list_communication_threads(actor_context=bulk_actor, limit=12)
+    bulk_threads_limit_20 = list_communication_threads(actor_context=bulk_actor, limit=20)
+    _assert_equal(len(bulk_threads_limit_12), 12, "cold refresh projects more than 10 threads for limit 12")
+    _assert_equal(len(bulk_threads_limit_20), 15, "cold refresh projects all seeded threads for limit 20")
+    bulk_limit_20_ids = {str(item.get("thread_id") or "") for item in bulk_threads_limit_20}
+    _assert_true(set(bulk_thread_ids).issubset(bulk_limit_20_ids), "bulk cold refresh includes every seeded thread")
+
+    _seed_thread_store_message(
+        actor_context=alias_actor,
+        message_id=f"msg-thread-store-alias-{suffix}",
+        uid=f"uid-alias-{suffix}",
+        thread_id=alias_thread,
+        provider_thread_id=alias_provider_thread,
+        sender="alias-customer@example.com",
+        recipients="employee-alias@example.com",
+        subject="Alias projection",
+        received_at="2026-06-17T09:40:00+00:00",
+        summary="Alias projection canonical summary.",
+        risk_hint="",
+    )
+    upsert_thread_projection(
+        {"thread_id": alias_provider_thread, "subject": "Stale alias projection"},
+        actor_context=alias_actor,
+    )
+    alias_detail = get_communication_thread(alias_provider_thread, actor_context=alias_actor)
+    _assert_true(alias_detail, "provider thread alias detail resolves")
+    _assert_equal(alias_detail["thread_id"], alias_thread, "provider thread alias resolves to canonical thread")
+    alias_projection_ids = [
+        str(item.get("thread_id") or "")
+        for item in list_communication_threads(actor_context=alias_actor, limit=5, refresh=False)
+    ]
+    _assert_equal(alias_projection_ids.count(alias_thread), 1, "alias actor has one canonical projection")
+    _assert_true(alias_provider_thread not in alias_projection_ids, "alias actor has no provider-id projection")
 
     actor_a_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_a, limit=10)
     actor_b_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_b, limit=10)

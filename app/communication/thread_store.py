@@ -183,9 +183,9 @@ def upsert_thread_projection(
     latest = _latest_message(messages)
     first = messages[0] if messages else {}
     thread_id = _compact(
-        data.get("thread_id")
+        first.get("thread_id")
+        or data.get("thread_id")
         or data.get("provider_thread_id")
-        or first.get("thread_id")
         or first.get("provider_thread_id")
         or first.get("provider_message_id")
         or first.get("message_id")
@@ -254,17 +254,35 @@ def _refresh_recent_thread_projections(
     messages_per_thread: int,
 ) -> None:
     for thread in list_recent_inbound_threads(
-        limit=max(1, min(int(limit or 20), 50)),
+        limit=max(1, min(int(limit or 20), 100)),
         messages_per_thread=max(1, min(int(messages_per_thread or 5), 20)),
         actor_context=actor.to_dict(),
     ):
         upsert_thread_projection(thread, actor_context=actor.to_dict())
 
 
-def _refresh_thread_projection(thread_id: str, *, actor: ActorContext, limit: int = 20) -> None:
+def _refresh_thread_projection(thread_id: str, *, actor: ActorContext, limit: int = 20) -> str:
     messages = list_thread_messages(thread_id, limit=limit, actor_context=actor.to_dict())
     if messages:
-        upsert_thread_projection({"thread_id": thread_id, "messages": messages}, actor_context=actor.to_dict())
+        first = messages[0]
+        canonical_thread_id = _compact(first.get("thread_id") or thread_id)
+        upsert_thread_projection({"thread_id": canonical_thread_id, "messages": messages}, actor_context=actor.to_dict())
+        alias_thread_id = _compact(thread_id)
+        if alias_thread_id and alias_thread_id != canonical_thread_id:
+            with _connect() as conn:
+                conn.execute(
+                    """
+                    DELETE FROM communication_threads
+                    WHERE tenant_id = %s
+                      AND workspace_id = %s
+                      AND user_id = %s
+                      AND thread_id = %s
+                    """,
+                    (*_actor_params(actor), alias_thread_id),
+                )
+                conn.commit()
+        return canonical_thread_id
+    return ""
 
 
 def list_communication_threads(
@@ -308,8 +326,9 @@ def get_communication_thread(
     if not thread_key:
         return None
     actor = actor_from_mapping(actor_context or {})
+    lookup_key = thread_key
     if refresh:
-        _refresh_thread_projection(thread_key, actor=actor)
+        lookup_key = _refresh_thread_projection(thread_key, actor=actor) or thread_key
     with _connect() as conn:
         row = conn.execute(
             """
@@ -320,7 +339,7 @@ def get_communication_thread(
               AND user_id = %s
               AND thread_id = %s
             """,
-            (*_actor_params(actor), thread_key),
+            (*_actor_params(actor), lookup_key),
         ).fetchone()
     return _decode_thread(row)
 
