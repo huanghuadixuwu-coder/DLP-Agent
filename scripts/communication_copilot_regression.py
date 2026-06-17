@@ -255,6 +255,167 @@ def run_brief_assembly() -> dict[str, Any]:
     }
 
 
+def _seed_thread_store_message(
+    *,
+    actor_context: dict[str, Any],
+    message_id: str,
+    uid: str,
+    thread_id: str,
+    provider_thread_id: str,
+    sender: str,
+    recipients: str,
+    subject: str,
+    received_at: str,
+    summary: str,
+    risk_hint: str = "",
+) -> None:
+    from app.inbound_mail_store import upsert_inbound_message
+
+    upsert_inbound_message(
+        {
+            "message_id": message_id,
+            "mailbox": "INBOX",
+            "uid": uid,
+            "thread_id": thread_id,
+            "provider_thread_id": provider_thread_id,
+            "sender": sender,
+            "recipients": recipients,
+            "subject": subject,
+            "received_at": received_at,
+            "snippet": summary,
+            "summary": summary,
+            "body_text": f"RAW_BODY_SHOULD_NOT_BE_PROJECTED::{message_id}",
+            "body_preview": f"Preview for {message_id}",
+            "risk_hint": risk_hint,
+            "actor_context": actor_context,
+        }
+    )
+
+
+def run_thread_store() -> dict[str, Any]:
+    from app.communication.thread_store import (
+        get_active_communication_thread,
+        get_communication_thread,
+        list_communication_threads,
+        set_active_communication_thread,
+    )
+
+    suffix = uuid4().hex[:8]
+    actor_a = {
+        "tenant_id": f"tenant-thread-store-{suffix}",
+        "user_id": "employee-a",
+        "workspace_id": "workspace-a",
+    }
+    actor_b = {
+        "tenant_id": f"tenant-thread-store-{suffix}",
+        "user_id": "employee-b",
+        "workspace_id": "workspace-b",
+    }
+    actor_a_other_workspace = {
+        "tenant_id": actor_a["tenant_id"],
+        "user_id": actor_a["user_id"],
+        "workspace_id": "workspace-b",
+    }
+    thread_a = f"thread-store-a-{suffix}"
+    thread_b = f"thread-store-b-{suffix}"
+
+    _seed_thread_store_message(
+        actor_context=actor_a,
+        message_id=f"msg-thread-store-a-1-{suffix}",
+        uid=f"uid-a-1-{suffix}",
+        thread_id=thread_a,
+        provider_thread_id=f"provider-{thread_a}",
+        sender="customer-a@example.com",
+        recipients="employee-a@example.com",
+        subject="Actor A renewal",
+        received_at="2026-06-17T08:00:00+00:00",
+        summary="Actor A first renewal question.",
+        risk_hint="",
+    )
+    _seed_thread_store_message(
+        actor_context=actor_a,
+        message_id=f"msg-thread-store-a-2-{suffix}",
+        uid=f"uid-a-2-{suffix}",
+        thread_id=thread_a,
+        provider_thread_id=f"provider-{thread_a}",
+        sender="employee-a@example.com",
+        recipients="customer-a@example.com",
+        subject="Re: Actor A renewal",
+        received_at="2026-06-17T08:05:00+00:00",
+        summary="Actor A latest renewal summary.",
+        risk_hint="medium",
+    )
+    _seed_thread_store_message(
+        actor_context=actor_b,
+        message_id=f"msg-thread-store-b-1-{suffix}",
+        uid=f"uid-b-1-{suffix}",
+        thread_id=thread_b,
+        provider_thread_id=f"provider-{thread_b}",
+        sender="customer-b@example.com",
+        recipients="employee-b@example.com",
+        subject="Actor B onboarding",
+        received_at="2026-06-17T08:10:00+00:00",
+        summary="Actor B onboarding question.",
+        risk_hint="high",
+    )
+
+    actor_a_threads = list_communication_threads(actor_context=actor_a, limit=5)
+    actor_b_threads = list_communication_threads(actor_context=actor_b, limit=5)
+    actor_a_other_workspace_threads = list_communication_threads(actor_context=actor_a_other_workspace, limit=5)
+
+    actor_a_thread_ids = {item.get("thread_id") for item in actor_a_threads}
+    actor_b_thread_ids = {item.get("thread_id") for item in actor_b_threads}
+    _assert_true(thread_a in actor_a_thread_ids, "actor A thread listed")
+    _assert_true(thread_b not in actor_a_thread_ids, "actor A cannot list actor B thread")
+    _assert_true(thread_b in actor_b_thread_ids, "actor B thread listed")
+    _assert_true(thread_a not in actor_b_thread_ids, "actor B cannot list actor A thread")
+    _assert_equal(actor_a_other_workspace_threads, [], "workspace-isolated actor A listing")
+
+    actor_a_detail = get_communication_thread(thread_a, actor_context=actor_a)
+    _assert_true(actor_a_detail, "actor A thread detail")
+    _assert_equal(actor_a_detail["thread_id"], thread_a, "actor A detail thread_id")
+    _assert_equal(actor_a_detail["source_message_ids"][-1], f"msg-thread-store-a-2-{suffix}", "source message ids")
+    _assert_equal(actor_a_detail["latest_summary"], "Actor A latest renewal summary.", "latest summary")
+    _assert_equal(actor_a_detail["risk_hint"], "medium", "risk hint")
+    if "RAW_BODY_SHOULD_NOT_BE_PROJECTED" in json.dumps(actor_a_detail, ensure_ascii=False):
+        raise AssertionError("thread projection duplicated raw message body")
+
+    _assert_equal(get_communication_thread(thread_b, actor_context=actor_a), None, "actor A cannot read actor B thread")
+    _assert_equal(
+        set_active_communication_thread(thread_b, actor_context=actor_a),
+        None,
+        "actor A cannot activate actor B thread",
+    )
+
+    selected_a = set_active_communication_thread(thread_a, actor_context=actor_a)
+    _assert_true(selected_a, "actor A selected active thread")
+    _assert_equal(selected_a["thread_id"], thread_a, "selected actor A thread")
+    active_a = get_active_communication_thread(actor_context=actor_a)
+    _assert_true(active_a, "actor A active thread")
+    _assert_equal(active_a["thread_id"], thread_a, "actor A active thread id")
+    _assert_equal(get_active_communication_thread(actor_context=actor_b), None, "actor B has no active thread yet")
+    _assert_equal(
+        get_active_communication_thread(actor_context=actor_a_other_workspace),
+        None,
+        "active thread is workspace-isolated",
+    )
+
+    selected_b = set_active_communication_thread(thread_b, actor_context=actor_b)
+    _assert_true(selected_b, "actor B selected active thread")
+    _assert_equal(selected_b["thread_id"], thread_b, "selected actor B thread")
+    _assert_equal(get_active_communication_thread(actor_context=actor_a)["thread_id"], thread_a, "actor A active remains isolated")
+    _assert_equal(get_active_communication_thread(actor_context=actor_b)["thread_id"], thread_b, "actor B active thread id")
+
+    return {
+        "ok": True,
+        "case": "thread_store",
+        "actor_a_threads": sorted(actor_a_thread_ids),
+        "actor_b_threads": sorted(actor_b_thread_ids),
+        "actor_a_active": active_a["thread_id"],
+        "actor_b_active": thread_b,
+    }
+
+
 def run_mail_closeout() -> dict[str, Any]:
     import app.main as main_module
     from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND, MailDraft
@@ -1112,6 +1273,7 @@ def main() -> int:
         "workspace_flow": run_workspace_flow,
         "contracts_import": run_contracts_import,
         "brief_assembly": run_brief_assembly,
+        "thread_store": run_thread_store,
         "mail_closeout": run_mail_closeout,
         "subordinate_inputs": run_subordinate_inputs,
         "retirement": run_retirement,

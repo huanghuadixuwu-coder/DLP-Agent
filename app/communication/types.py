@@ -21,6 +21,11 @@ class CommunicationThreadRef:
     subject: str = ""
     participants: list[str] = field(default_factory=list)
     last_message_at: str = ""
+    status: str = "open"
+    source_message_ids: list[str] = field(default_factory=list)
+    latest_summary: str = ""
+    risk_hint: str = ""
+    updated_at: str = field(default_factory=utc_now)
     actor_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

@@ -23,6 +23,13 @@ from app.actor_context import ActorContext, build_actor_context, permission_obse
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.communication.brief_service import assemble_communication_brief_observation
+from app.communication.thread_store import (
+    get_active_communication_thread,
+    get_communication_thread,
+    init_communication_thread_store,
+    list_communication_threads,
+    set_active_communication_thread,
+)
 from app.config import get_settings
 from app.continuation_state import (
     PendingObject,
@@ -335,6 +342,7 @@ async def lifespan(_: FastAPI):
     init_pending_object_store()
     init_auth_store()
     init_inbound_mail_store()
+    init_communication_thread_store()
     init_workspace_memory_index()
     init_hermes_dynamic_memory_store()
     try:
@@ -6175,6 +6183,72 @@ def enterprise_rag_benchmark_api(
         return EnterpriseRagBenchmarkResponse(**result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/internal/communication/threads")
+def internal_communication_threads_api(
+    request: Request,
+    limit: int = 20,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "mail.read", "communication_threads")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "threads": list_communication_threads(
+            actor_context=actor.to_dict(),
+            limit=max(1, min(int(limit or 20), 100)),
+            refresh=refresh,
+        ),
+    }
+
+
+@app.get("/internal/communication/threads/active")
+def internal_active_communication_thread_api(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "mail.read", "active_communication_thread")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "active_thread": get_active_communication_thread(actor_context=actor.to_dict()),
+    }
+
+
+@app.post("/internal/communication/threads/{thread_id}/active")
+def internal_set_active_communication_thread_api(thread_id: str, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "mail.read", f"communication_thread:{thread_id}")
+    thread = set_active_communication_thread(thread_id, actor_context=actor.to_dict())
+    if not thread:
+        raise HTTPException(status_code=404, detail="Unknown communication thread")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "active_thread": thread,
+    }
+
+
+@app.get("/internal/communication/threads/{thread_id}")
+def internal_communication_thread_detail_api(
+    thread_id: str,
+    request: Request,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    permission_decision = _ensure_permission(actor, "mail.read", f"communication_thread:{thread_id}")
+    thread = get_communication_thread(thread_id, actor_context=actor.to_dict(), refresh=refresh)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Unknown communication thread")
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "permission_decision": permission_decision,
+        "thread": thread,
+    }
 
 
 @app.get("/mail/inbound/messages", response_model=list[InboundMailMessage])

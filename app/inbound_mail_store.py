@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from app.actor_context import actor_from_mapping
 from app.config import get_settings
 
 
@@ -71,6 +72,9 @@ def init_inbound_mail_store() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS inbound_mail_messages (
                     message_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'local-dev',
+                    user_id TEXT NOT NULL DEFAULT 'local-user',
+                    workspace_id TEXT NOT NULL DEFAULT 'default',
                     mailbox TEXT NOT NULL DEFAULT 'INBOX',
                     uid TEXT NOT NULL DEFAULT '',
                     thread_id TEXT NOT NULL DEFAULT '',
@@ -132,6 +136,9 @@ def init_inbound_mail_store() -> None:
                 ).fetchall()
             }
             for column_name, column_sql in [
+                ("tenant_id", "TEXT NOT NULL DEFAULT 'local-dev'"),
+                ("user_id", "TEXT NOT NULL DEFAULT 'local-user'"),
+                ("workspace_id", "TEXT NOT NULL DEFAULT 'default'"),
                 ("thread_id", "TEXT NOT NULL DEFAULT ''"),
                 ("provider_thread_id", "TEXT NOT NULL DEFAULT ''"),
                 ("body_text", "TEXT NOT NULL DEFAULT ''"),
@@ -143,6 +150,14 @@ def init_inbound_mail_store() -> None:
             ]:
                 if column_name not in existing_columns:
                     conn.execute(f"ALTER TABLE inbound_mail_messages ADD COLUMN {column_name} {column_sql}")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_inbound_mail_actor_received
+                    ON inbound_mail_messages(tenant_id, workspace_id, user_id, received_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_inbound_mail_actor_thread
+                    ON inbound_mail_messages(tenant_id, workspace_id, user_id, thread_id, provider_thread_id);
+                """
+            )
             conn.commit()
         _INITIALIZED = True
 
@@ -150,22 +165,28 @@ def init_inbound_mail_store() -> None:
 def upsert_inbound_message(message: dict[str, Any]) -> bool:
     init_inbound_mail_store()
     now = _now()
+    actor = actor_from_mapping(message.get("actor_context") or message)
     with _connect() as conn:
         row = conn.execute(
             """
             INSERT INTO inbound_mail_messages (
-                message_id, mailbox, uid, thread_id, provider_thread_id, sender, recipients,
-                subject, received_at, snippet, summary, body_text, body_html_sanitized,
-                body_preview, labels_json, attachments_json, headers_json, risk_hint,
+                message_id, tenant_id, user_id, workspace_id, mailbox, uid, thread_id,
+                provider_thread_id, sender, recipients, subject, received_at, snippet,
+                summary, body_text, body_html_sanitized, body_preview, labels_json,
+                attachments_json, headers_json, risk_hint,
                 raw_size, is_seen, created_at, updated_at
             ) VALUES (
-                %(message_id)s, %(mailbox)s, %(uid)s, %(thread_id)s, %(provider_thread_id)s,
-                %(sender)s, %(recipients)s, %(subject)s, %(received_at)s, %(snippet)s,
-                %(summary)s, %(body_text)s, %(body_html_sanitized)s, %(body_preview)s,
-                %(labels_json)s, %(attachments_json)s, %(headers_json)s, %(risk_hint)s,
+                %(message_id)s, %(tenant_id)s, %(user_id)s, %(workspace_id)s, %(mailbox)s,
+                %(uid)s, %(thread_id)s, %(provider_thread_id)s, %(sender)s, %(recipients)s,
+                %(subject)s, %(received_at)s, %(snippet)s, %(summary)s, %(body_text)s,
+                %(body_html_sanitized)s, %(body_preview)s, %(labels_json)s,
+                %(attachments_json)s, %(headers_json)s, %(risk_hint)s,
                 %(raw_size)s, %(is_seen)s, %(created_at)s, %(updated_at)s
             )
             ON CONFLICT (message_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                user_id = EXCLUDED.user_id,
+                workspace_id = EXCLUDED.workspace_id,
                 mailbox = EXCLUDED.mailbox,
                 uid = EXCLUDED.uid,
                 thread_id = EXCLUDED.thread_id,
@@ -190,6 +211,9 @@ def upsert_inbound_message(message: dict[str, Any]) -> bool:
             """,
             {
                 "message_id": message["message_id"],
+                "tenant_id": actor.tenant_id,
+                "user_id": actor.user_id,
+                "workspace_id": actor.workspace_id,
                 "mailbox": message.get("mailbox", "INBOX"),
                 "uid": message.get("uid", ""),
                 "thread_id": message.get("thread_id", ""),
@@ -223,10 +247,15 @@ def list_inbound_messages(
     until: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    actor_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     init_inbound_mail_store()
     clauses: list[str] = []
     params: list[Any] = []
+    if actor_context is not None:
+        actor = actor_from_mapping(actor_context or {})
+        clauses.extend(["tenant_id = %s", "workspace_id = %s", "user_id = %s"])
+        params.extend([actor.tenant_id, actor.workspace_id, actor.user_id])
     if since:
         clauses.append("received_at >= %s")
         params.append(since)
@@ -249,41 +278,72 @@ def list_inbound_messages(
     return [_decode_message(row) for row in rows if row]
 
 
-def get_inbound_message(message_id: str) -> dict[str, Any] | None:
+def get_inbound_message(message_id: str, *, actor_context: dict[str, Any] | None = None) -> dict[str, Any] | None:
     init_inbound_mail_store()
+    clauses = ["message_id = %s"]
+    params: list[Any] = [message_id]
+    if actor_context is not None:
+        actor = actor_from_mapping(actor_context or {})
+        clauses.extend(["tenant_id = %s", "workspace_id = %s", "user_id = %s"])
+        params.extend([actor.tenant_id, actor.workspace_id, actor.user_id])
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM inbound_mail_messages WHERE message_id = %s",
-            (message_id,),
+            f"SELECT * FROM inbound_mail_messages WHERE {' AND '.join(clauses)}",
+            params,
         ).fetchone()
     return _decode_message(row)
 
 
-def list_thread_messages(thread_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+def list_thread_messages(
+    thread_id: str,
+    *,
+    limit: int = 20,
+    actor_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     init_inbound_mail_store()
     bounded_limit = max(1, min(int(limit or 20), 50))
     thread_key = str(thread_id or "").strip()
     if not thread_key:
         return []
+    actor_clause = ""
+    params: list[Any] = [thread_key, thread_key]
+    if actor_context is not None:
+        actor = actor_from_mapping(actor_context or {})
+        actor_clause = """
+              AND tenant_id = %s
+              AND workspace_id = %s
+              AND user_id = %s
+        """
+        params.extend([actor.tenant_id, actor.workspace_id, actor.user_id])
+    params.append(bounded_limit)
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM inbound_mail_messages
-            WHERE thread_id = %s OR provider_thread_id = %s
+            WHERE (thread_id = %s OR provider_thread_id = %s)
+            {actor_clause}
             ORDER BY received_at ASC, created_at ASC
             LIMIT %s
             """,
-            (thread_key, thread_key, bounded_limit),
+            params,
         ).fetchall()
     return [_decode_message(row) for row in rows if row]
 
 
-def list_recent_inbound_threads(*, limit: int = 3, messages_per_thread: int = 5) -> list[dict[str, Any]]:
+def list_recent_inbound_threads(
+    *,
+    limit: int = 3,
+    messages_per_thread: int = 5,
+    actor_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     init_inbound_mail_store()
     bounded_limit = max(1, min(int(limit or 3), 10))
     bounded_messages = max(1, min(int(messages_per_thread or 5), 20))
-    recent_messages = list_inbound_messages(limit=max(20, bounded_limit * bounded_messages * 2))
+    recent_messages = list_inbound_messages(
+        limit=max(20, bounded_limit * bounded_messages * 2),
+        actor_context=actor_context,
+    )
     threads: list[dict[str, Any]] = []
     seen: set[str] = set()
     for message in recent_messages:
@@ -291,7 +351,7 @@ def list_recent_inbound_threads(*, limit: int = 3, messages_per_thread: int = 5)
         if not thread_key or thread_key in seen:
             continue
         seen.add(thread_key)
-        messages = list_thread_messages(thread_key, limit=bounded_messages)
+        messages = list_thread_messages(thread_key, limit=bounded_messages, actor_context=actor_context)
         if not messages:
             messages = [message]
         latest = messages[-1] if messages else message
