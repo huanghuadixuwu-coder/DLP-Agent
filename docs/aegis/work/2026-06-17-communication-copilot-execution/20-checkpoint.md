@@ -1,38 +1,34 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Re-run Task 0A spec compliance review with task-deliverable commit boundaries
-  clarified.
-- Then complete Task 0A code quality review and prepare Task 0B.
+- Start Task 0B safe-delete and quarantine classified legacy carriers.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
 - Task 0A worker produced inventory commit: `ba4ba05`.
 - Task 0A coverage fix commit: `1e1d028`.
 - Task 0A quality fix commit: `5031ecb`.
-- Task 0A spec compliance re-review passed.
-- Controller checkpoint commit `4c6125f` updated this work record during review;
-  it is coordination evidence, not part of the Task 0A worker deliverable.
+- Task 0A spec compliance review passed after corrected deliverable boundary.
+- Task 0A code/document quality review passed.
+- Controller checkpoint commits `4c6125f` and `e96bbb3` updated this work record during review; they are coordination evidence, not part of the Task 0A worker deliverable.
 
 Active slice:
-- Task 0A review boundary clarification.
+- Task 0B preparation.
 
 Evidence refs:
-- Spec compliance reviewer: no remaining spec-compliance findings after `1e1d028`.
-- Task 0A deliverable commits are `ba4ba05`, `1e1d028`, and `5031ecb`.
-- The Task 0A worker deliverable changed only `problem_todolist.md` and
-  `todolist.md`; the separate controller checkpoint changed this file.
-- Worktree was clean after Task 0A worker commits.
+- Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
+- Quality reviewer passed Task 0A and confirmed inventory is actionable for Task 0B.
+- `problem_todolist.md` Issue 26 now contains the classified legacy carrier inventory and regression map.
+- `todolist.md` section 19 records Task 0A completion and Task 0B pending.
 
 Blocked-on items:
-- Awaiting corrected spec re-review and then code quality re-review.
+- None.
 
 Next step:
-- Ask spec reviewer to re-check Task 0A using deliverable commit boundaries,
-  excluding controller checkpoint commits from the allowed file list.
+- Dispatch Task 0B worker with strict scope: delete only `dead_identity` and `safe_delete`; quarantine `compat_shim`; do not remove `active_runtime_dependency`.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
 - Compatibility: no runtime or UI style files changed in Task 0A.
-- Retirement: active dependency deletion remains deferred to Task 0B+ with regression protection.
+- Retirement: Task 0B must follow the inventory categories and regression gates.
 - Decision: continue.
