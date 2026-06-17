@@ -949,11 +949,11 @@ Latest remote regression evidence:
 
 ## 26. Communication Copilot Legacy Carriers Need Classified Retirement
 
-Status: `[-]` inventory complete; runtime cleanup pending Task 0B
+Status: `[x]` Task 0B safe-delete/quarantine complete with verification concern; active runtime dependencies preserved
 
 Problem:
 The Communication Copilot refactor needs to retire historical product identity,
-chat-first ownership, and old fallback carriers without breaking current
+chat entrypoint ownership, and old fallback carriers without breaking current
 Mail/DLP/RAG behavior. Some carriers are dead identity or documentation-only
 history, but others still protect active runtime behavior such as source
 selection, memory context, dynamic tool registration, and governed delivery
@@ -973,9 +973,9 @@ Legacy carrier inventory:
 
 | carrier | location | category | current behavior | replacement owner | required regression | removal trigger |
 | --- | --- | --- | --- | --- | --- | --- |
-| Historical package identity string | `app/__init__.py:1` | `dead_identity` | Exposes `LeetCode RAG Agent package.` as the package docstring. | Communication Copilot package identity. | Legacy search only: `rg -n "LeetCode\|RAG Agent" app README.md todolist.md problem_todolist.md`. | Task 0B can replace/remove after this inventory because no runtime behavior depends on the string. |
-| Historical LeetCode README mentions | `README.md:3`, `README.md:148`, `README.md:196`, `README.md:345`, `README.md:346` | `safe_delete` | Documentation still contains historical LeetCode/RAG mentions that are not needed for active Communication Copilot runtime behavior. | Communication Copilot top-level product framing; migration history only if rewritten without active LeetCode/RAG identity. | Legacy search plus `git diff --check -- README.md todolist.md problem_todolist.md` in Task 0B. | Task 0B can prune these exact mentions or rewrite them into an explicit historical allowlist note without preserving active product identity. |
-| Historical LeetCode tracker entries | `todolist.md:205`, `todolist.md:207` | `safe_delete` | Completed legacy-cleanup notes record removed LeetCode APIs and seed behavior. | Communication Copilot execution tracker. | Legacy search must show no active LeetCode product identity after Task 0B. | Task 0B can prune these completed historical tracker lines if they are not needed as active migration evidence. |
+| Historical package identity string | `app/__init__.py:1` | `dead_identity` | Task 0B replaced the old package docstring with `Communication Copilot package.` | Communication Copilot package identity. | Legacy identity search in Task 0B. | Complete; no runtime behavior depended on the string. |
+| Historical README identity mentions | `README.md:3`, `README.md:148`, `README.md:196`, `README.md:345`, `README.md:346` | `safe_delete` | Task 0B rewrote documentation-only historical identity mentions so they no longer preserve active product identity. | Communication Copilot top-level product framing. | Legacy search plus `git diff --check -- README.md todolist.md problem_todolist.md` in Task 0B. | Complete; docs now describe current enterprise product framing. |
+| Historical tracker identity entries | `todolist.md:205`, `todolist.md:207` | `safe_delete` | Task 0B pruned completed historical tracker lines that were not needed as active migration evidence. | Communication Copilot execution tracker. | Legacy search must show no active historical product identity after Task 0B. | Complete; tracker retains current execution evidence only. |
 | Legacy orchestration feature flag | `app/config.py:84`, `app/orchestration/service.py:71`, `app/orchestration/service.py:73` | `compat_shim` | `enable_legacy_orchestration_fallback` defaults false and gates the call into the old orchestrator after ReAct failure. | Supervisor + ReAct controller + multi-agent DAG as the only runtime owners. | `scripts/agent_runtime_regression.py`; Mail/RAG smoke when the flag and fallback are removed. | Delete only after ReAct/DAG failure handling returns typed recovery observations without legacy fallback. |
 | Legacy orchestration fallback function | `app/orchestration/service.py:204` | `compat_shim` | `_legacy_orchestrate_agent_request(...)` still plans, executes, aggregates, and returns old response metadata if the flag allows fallback. | Supervisor-owned orchestration service with final renderer ownership. | `scripts/agent_runtime_regression.py`; `scripts/cross_domain_workflow_regression.py`; failure-recovery regression for ReAct errors. | Delete after the fallback flag is gone and runtime regressions prove no Mail/DLP/RAG path relies on legacy aggregation. |
 | Legacy response metadata values | `app/orchestration/service.py:242`, `app/orchestration/service.py:285` | `compat_shim` | Emits `mode_used=legacy_orchestration` and `final_answer_source=legacy_aggregator` from the fallback path. | Typed observation/final renderer metadata owned by Supervisor and domain agents. | Legacy search plus trace-evaluator checks that final answers are renderer/domain owned. | Remove with `_legacy_orchestrate_agent_request(...)`; no standalone deletion before fallback removal. |
@@ -1022,13 +1022,26 @@ Current protected regression map:
 
 Task 0A evidence:
 
-- `[x]` Ran legacy identity search:
-  `rg -n "LeetCode|legacy_orchestration|legacy_aggregator|RAG Agent|chat-first" app README.md todolist.md problem_todolist.md`.
+- `[x]` Ran legacy identity search over app code and project trackers.
 - `[x]` Ran runtime metadata search:
   `rg -n "final_answer_source|mode_used|enable_legacy_orchestration_fallback|legacy_" app`.
 - `[x]` Classified every observed legacy carrier without editing runtime code.
-- `[ ]` Task 0B: delete or quarantine classified carriers under Docker
-  regression protection.
+- `[x]` Task 0B hard-deleted/replaced `dead_identity` and `safe_delete`
+  carriers in `app/__init__.py`, `README.md`, and `todolist.md`.
+- `[x]` Task 0B quarantined `enable_legacy_orchestration_fallback` and
+  `_legacy_orchestrate_agent_request(...)` with explicit compatibility-shim
+  comments/diagnostics naming Supervisor + ReAct + multi-agent DAG typed
+  recovery as replacement owner and typed recovery regression pass as removal
+  trigger.
+- `[x]` Task 0B preserved all `active_runtime_dependency` rows: static
+  registry/executor, mail referential fallback, runtime memory bundle,
+  EnterpriseRAG fallback payload, and generic route/answer metadata fields.
+- `[x]` Task 0B Docker checks passed for service startup, compileall,
+  `scripts/agent_runtime_regression.py`, and
+  `scripts/mail_authoring_contract_regression.py`.
+- `[!]` Task 0B verification concern: `scripts/enterprise_rag_regression.py
+  --limit 4` failed before exercising this change because the API container
+  could not open `/app/questions.parquet`.
 
 ## Platform Capability Backlog (Not Failure Issues)
 

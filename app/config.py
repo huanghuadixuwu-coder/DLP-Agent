@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     react_max_tool_failures: int = Field(default=2, alias="REACT_MAX_TOOL_FAILURES")
     react_max_same_tool_retries: int = Field(default=1, alias="REACT_MAX_SAME_TOOL_RETRIES")
     enable_fast_path_router: bool = Field(default=True, alias="ENABLE_FAST_PATH_ROUTER")
+    # Compatibility shim: owned by Supervisor + ReAct + multi-agent DAG.
+    # Remove after typed ReAct/DAG failure recovery replaces the old fallback.
     enable_legacy_orchestration_fallback: bool = Field(default=False, alias="ENABLE_LEGACY_ORCHESTRATION_FALLBACK")
     workspace_memory_root: str = Field(default=str(ROOT_DIR / "memory"), alias="WORKSPACE_MEMORY_ROOT")
     transcript_export_path: str = Field(default=str(DATA_DIR / "transcripts" / "session_transcript.jsonl"), alias="TRANSCRIPT_EXPORT_PATH")

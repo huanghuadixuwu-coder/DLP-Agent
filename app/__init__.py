@@ -1,2 +1,2 @@
-"""LeetCode RAG Agent package."""
+"""Communication Copilot package."""
 

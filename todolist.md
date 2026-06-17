@@ -202,9 +202,7 @@
 ### 13.8 Legacy Cleanup
 - `[x]` 删除旧 `unified_agent.py / hybrid_router.py / unified_tools.py` LangGraph V1 栈。
 - `[x]` 删除旧 `sensitive_workflow.py / workflow_store.py` SQLite workflow 栈和 `/workflows/sensitive-outbound*` 接口。
-- `[x]` 删除旧 `/problems /ingest /plan /execute /chat` LeetCode API 与 8511 初始化按钮。
 - `[x]` `app/graph.py` 收敛为共享 `get_llm()` client 工厂。
-- `[x]` 统一语料 seed 仅保留 Labs/DLP 证据，不再写入 LeetCode problem 文档。
 - `[x]` Docker 内重新验证 M1-M6、动态工具发现和跨域 DAG 闭环。
 
 ## 14. EnterpriseRAG Dataset Governance
@@ -317,5 +315,5 @@
 - `[x]` Task 0A legacy carrier inventory report is complete in `problem_todolist.md`: carriers are classified as `dead_identity`, `safe_delete`, `compat_shim`, or `active_runtime_dependency`.
 - `[x]` Task 0A stayed inventory-only: no runtime code changes and no front-end style changes.
 - `[x]` Active Mail/DLP/RAG dependencies are protected by named regressions before any removal: mail authoring/reference/confirmation regressions, governed delivery/runtime regressions, and EnterpriseRAG/context regressions.
-- `[ ]` Task 0B pending: delete only `dead_identity` and `safe_delete` carriers; quarantine `compat_shim` carriers; do not delete `active_runtime_dependency` carriers until replacement owner paths pass Docker regressions.
+- `[x]` Task 0B safe-delete/quarantine complete with verification concern: `dead_identity` and `safe_delete` carriers were rewritten/pruned, `compat_shim` fallback surfaces are explicitly marked with replacement owner/removal trigger, and `active_runtime_dependency` carriers were left intact. Docker EnterpriseRAG regression could not run because `/app/questions.parquet` was missing in the API container.
 - `[ ]` Task 1 pending: reframe top-level product docs around Communication Copilot while preserving intentional historical migration notes only where useful.

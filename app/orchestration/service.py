@@ -70,6 +70,12 @@ def orchestrate_agent_request(
         settings = get_settings()
         if is_memory_follow_up(safe_message or message) or not settings.enable_legacy_orchestration_fallback:
             raise
+        logger.warning(
+            "Compatibility shim active: legacy orchestration fallback is serving a ReAct failure. "
+            "Replacement owner: Supervisor + ReAct controller + multi-agent DAG typed recovery. "
+            "Removal trigger: delete after typed recovery observations replace this fallback and "
+            "agent/mail/rag Docker regressions pass."
+        )
         return _legacy_orchestrate_agent_request(
             session_id=session_id,
             conversation_id=conversation_id,
@@ -211,6 +217,10 @@ def _legacy_orchestrate_agent_request(
     upload_context: dict[str, Any] | None = None,
     actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Compatibility shim: replacement owner is Supervisor final rendering over
+    # ReAct/DAG typed observations. Remove with
+    # ENABLE_LEGACY_ORCHESTRATION_FALLBACK after failure recovery no longer
+    # needs legacy planning/execution/aggregation.
     started = perf_counter()
     plan = plan_message(message, upload_context or {})
     context = OrchestrationContext(

@@ -1,6 +1,6 @@
 # 安全外发与邮件协作 Agent
 
-这是一个 Docker-first 的企业邮件协作与知识问答 Agent。当前主线已经从早期的 LeetCode RAG / Labs 演示，收口为面向企业落地的多用户试用版：
+这是一个 Docker-first 的企业邮件协作与知识问答 Agent。当前主线已经收口为面向企业落地的多用户试用版：
 
 - 员工通过统一聊天入口处理企业知识问答、邮件草稿、DLP 外发审批、收件摘要和上传内容分析。
 - 系统通过 `ActorContext` 区分 `tenant_id / user_id / workspace_id / roles / session_id / conversation_id`，支持基础多用户、租户隔离和权限边界。
@@ -145,7 +145,7 @@ IMAP 链路是只读同步：
 
 ### 4. EnterpriseRAG 企业知识问答
 
-EnterpriseRAG 是企业事实问答的唯一主路径，不再使用 LeetCode/problem_id 语料作为企业知识基础。
+EnterpriseRAG 是企业事实问答的唯一主路径，企业知识基础只使用受治理的企业语料、索引和 citation。
 
 核心链路：
 
@@ -193,7 +193,7 @@ documents/questions
 - `workspace_memory`: 项目文档、规则、todolist、技术笔记
 - `user_model`: 用户偏好和长期记忆候选
 
-Conversation memory 使用独立的版本化 Chroma collection，不再与旧 LeetCode 语料共用索引。当前 collection 为 `conversation_memory_bge_m3_v1`，使用 `bge-m3` 的 1024 维 embedding。模型升级时先迁移到新 collection，验证后再切换配置；旧 collection 默认保留，便于回滚。迁移会比较 content hash、模型、维度与 schema version，未变化记录不会重复 embedding。
+Conversation memory 使用独立的版本化 Chroma collection，不与企业知识索引共用存储。当前 collection 为 `conversation_memory_bge_m3_v1`，使用 `bge-m3` 的 1024 维 embedding。模型升级时先迁移到新 collection，验证后再切换配置；旧 collection 默认保留，便于回滚。迁移会比较 content hash、模型、维度与 schema version，未变化记录不会重复 embedding。
 
 Docker 内迁移与回归：
 
@@ -342,8 +342,8 @@ Metrics：
 - 本轮不提供完整 SSO/OIDC；v1 使用企业邮箱绑定 + request headers / payload 身份注入。
 - Streamlit 是多人试用前端，不是完整生产前端。
 - PDF 与 GraphRAG 保留为后续计划；Calendar provider 边界和腾讯会议 Skill/MCP 已作为 Domain Agent 能力接入。
-- 历史 LeetCode V1 Agent、旧 sensitive workflow 和 `/problems /ingest /plan /execute /chat` 接口已经移除。
-- Labs 与 MCP 工具作为受控扩展接口保留；`app/graph.py` 只保留共享 LLM client 工厂，不再承载旧 LeetCode LangGraph QA 主链。
+- 旧 V1 演示 Agent、旧 sensitive workflow 和 `/problems /ingest /plan /execute /chat` 接口已经移除。
+- Labs 与 MCP 工具作为受控扩展接口保留；`app/graph.py` 只保留共享 LLM client 工厂，不再承载旧 QA 主链。
 ## Mail Provider Abstraction (M3)
 
 Mail Agent V2 now has a provider adapter boundary:
