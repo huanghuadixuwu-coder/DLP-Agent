@@ -304,6 +304,7 @@ Files:
 - Modify `app/orchestration/registry.py`
 - Modify `app/orchestration/service.py`
 - Modify `app/main.py`
+- Modify `app/__init__.py`
 - Modify `app/config.py`
 - Modify `README.md`
 - Modify `problem_todolist.md`
