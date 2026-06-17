@@ -917,7 +917,7 @@ with st.sidebar:
 
     merge_choices = st.multiselect("选择要合并的沟通线程", list(conversation_options.keys()))
     merge_name = st.text_input("合并后的名称", value="")
-    if st.button("合并所选对话", disabled=len(merge_choices) < 2):
+    if st.button("合并所选沟通线程", disabled=len(merge_choices) < 2):
         try:
             result = merge_conversations(
                 st.session_state.session_id,
