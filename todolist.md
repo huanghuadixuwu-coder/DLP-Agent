@@ -204,6 +204,7 @@
 - `[x]` 删除旧 `sensitive_workflow.py / workflow_store.py` SQLite workflow 栈和 `/workflows/sensitive-outbound*` 接口。
 - `[x]` `app/graph.py` 收敛为共享 `get_llm()` client 工厂。
 - `[x]` Docker 内重新验证 M1-M6、动态工具发现和跨域 DAG 闭环。
+- `[x]` Task 7 retired the quarantined legacy orchestration fallback: ReAct exceptions now return typed recovery observations with renderer-owned output; active legacy tool/source/memory dependencies remain intentionally preserved.
 
 ## 14. EnterpriseRAG Dataset Governance
 - `[x]` Replace historical mixed indexes with a reproducible canonical dataset -> deterministic slice -> shadow build -> gated publish workflow.

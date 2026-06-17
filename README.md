@@ -12,9 +12,10 @@ Framing contract:
   capabilities that help compose, ground, approve, and recover communication.
 - Local Docker Compose is the acceptance baseline; local host Python is not a
   valid completion signal.
-- This top-level docs update has no runtime impact and does not retire active
-  compatibility shims. Runtime migration happens only after replacement owner
-  paths are regression-proven.
+- Runtime migration happens only after replacement owner paths are
+  regression-proven. The retired internal orchestration fallback is now covered
+  by typed recovery observations; remaining active compatibility boundaries stay
+  documented in the trackers until their owners are proven.
 - Top-level docs must not present the product as a generic conversation surface
   or retrieval-centered system.
 

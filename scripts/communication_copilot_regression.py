@@ -742,6 +742,90 @@ def run_workspace_flow() -> dict[str, Any]:
     }
 
 
+def run_retirement() -> dict[str, Any]:
+    retired_tokens = [
+        "legacy_orchestration",
+        "legacy_aggregator",
+        "enable_legacy_orchestration_fallback",
+    ]
+    active_paths = [REPO_ROOT / "app", REPO_ROOT / "README.md"]
+    matches: list[str] = []
+    for root in active_paths:
+        paths = [root] if root.is_file() else [path for path in root.rglob("*.py") if path.is_file()]
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for token in retired_tokens:
+                if token in text:
+                    matches.append(f"{path.relative_to(REPO_ROOT)}:{token}")
+    if matches:
+        raise AssertionError(f"retired legacy orchestration carriers remain: {matches}")
+
+    import app.orchestration.service as service_module
+
+    original_run_react = service_module.run_react_agent_request
+    original_render_final = service_module.render_final_answer
+
+    def _failing_react(**_: Any) -> dict[str, Any]:
+        raise RuntimeError("forced react failure for retirement regression")
+
+    def _fake_renderer(**kwargs: Any) -> dict[str, Any]:
+        observations = list(kwargs.get("observations") or [])
+        _assert_true(observations, "recovery observations")
+        _assert_equal(observations[0].get("observation_type"), "dependency_failure", "recovery observation type")
+        _assert_equal(observations[0].get("source"), "react_controller", "recovery observation source")
+        _assert_equal(
+            dict(observations[0].get("payload") or {}).get("fallback_strategy"),
+            "typed_recovery_final_renderer",
+            "fallback strategy",
+        )
+        return {
+            "answer": "Structured recovery answer.",
+            "token_in": 1,
+            "token_out": 2,
+            "estimated_cost": 0.0,
+            "verifier_verdict": {"passed": True},
+            "verifier_rewrite_applied": False,
+        }
+
+    service_module.run_react_agent_request = _failing_react
+    service_module.render_final_answer = _fake_renderer
+    try:
+        result = service_module.orchestrate_agent_request(
+            session_id="session-retirement",
+            conversation_id="conversation-retirement",
+            message="Please summarize the customer thread.",
+            safe_message="Please summarize the customer thread.",
+            display_message="Please summarize the customer thread.",
+            router_intent="status_or_mail",
+            router_reason="retirement regression",
+            actor_context={"tenant_id": "tenant-1", "user_id": "user-1"},
+        )
+    finally:
+        service_module.run_react_agent_request = original_run_react
+        service_module.render_final_answer = original_render_final
+
+    _assert_equal(result.get("mode_used"), "react_recovery", "mode_used")
+    _assert_equal(result.get("final_answer_source"), "orchestration_recovery_renderer", "final_answer_source")
+    _assert_equal(result.get("termination_reason"), "controller_recovery", "termination_reason")
+    _assert_true(result.get("tool_observations"), "tool_observations")
+    _assert_true(result.get("partial_failures"), "partial_failures")
+    _assert_true(result.get("node_latencies_ms", {}).get("total") is not None, "node_latencies_ms.total")
+    _assert_true(result.get("answer"), "answer")
+    if result.get("mode_used") in {"legacy_orchestration"}:
+        raise AssertionError("recovery returned retired legacy mode")
+    if result.get("final_answer_source") in {"legacy_aggregator"}:
+        raise AssertionError("recovery returned retired legacy final answer source")
+
+    return {
+        "ok": True,
+        "case": "retirement",
+        "scanned_roots": [str(path.relative_to(REPO_ROOT)) for path in active_paths],
+        "mode_used": result.get("mode_used"),
+        "final_answer_source": result.get("final_answer_source"),
+        "observations": len(result.get("tool_observations") or []),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Communication Copilot regression checks")
     parser.add_argument("--case", required=True, dest="case_name")
@@ -753,6 +837,7 @@ def main() -> int:
         "brief_assembly": run_brief_assembly,
         "mail_closeout": run_mail_closeout,
         "subordinate_inputs": run_subordinate_inputs,
+        "retirement": run_retirement,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)
