@@ -625,12 +625,130 @@ def run_subordinate_inputs() -> dict[str, Any]:
     }
 
 
+def run_workspace_flow() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.observations import build_communication_brief_observation
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+
+    actor_context = {"tenant_id": "tenant-1", "user_id": "employee-1", "workspace_id": "workspace-1"}
+    thread_ref = CommunicationThreadRef(
+        thread_id="thread_workspace_123",
+        source="mail",
+        subject="Renewal workspace flow",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-17T08:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id="brief_workspace_123",
+        conversation_id="conversation_workspace_123",
+        thread_ref=thread_ref,
+        employee_goal="Prepare renewal reply",
+        customer_context_summary="Customer asked for renewal timing.",
+        grounding_refs=[{"kind": "enterprise_fact", "doc_id": "doc_pricing", "chunk_id": "chunk_pricing_1"}],
+        must_include=["pricing timeline"],
+        must_avoid=["unsupported discounts"],
+        open_questions=[],
+        recommended_next_action="draft_with_grounding",
+        source_observation_ids=["obs_thread_workspace_123"],
+        confidence=0.86,
+        created_at="2026-06-17T08:01:00+00:00",
+        actor_context=actor_context,
+    )
+    brief_observation = asdict(build_communication_brief_observation(brief))
+    result = {
+        "answer": "Workspace context assembled.",
+        "intent": "communication_workspace",
+        "routing_source": "representative_agent_chat",
+        "routing_confidence": 0.99,
+        "routing_reason": "Communication thread context is the primary work object.",
+        "candidate_intents": ["communication_workspace"],
+        "tool_calls": [
+            {
+                "tool_name": "communication_brief",
+                "success": True,
+                "status": "completed",
+                "result": {"brief_id": brief.brief_id},
+            }
+        ],
+        "tool_observations": [brief_observation],
+        "task_plan": {
+            "mail_plan": {
+                "target_object": "communication_brief",
+                "status": "draft_with_grounding",
+                "thread_ref": asdict(thread_ref),
+            }
+        },
+        "pending_confirmation": {},
+        "confirmation_payload": {},
+        "memory_hits": 0,
+        "merged_memory_hits": 0,
+        "workspace_memory_hits": 0,
+        "transcript_hits": 0,
+        "node_latencies_ms": {"total": 0.0},
+    }
+
+    workspace_state = main_module._derive_communication_workspace_state(result, brief.conversation_id)
+    result["task_plan"]["communication_workspace"] = workspace_state
+    debug_payload = main_module._build_debug_snapshot(result, brief.conversation_id)
+
+    _assert_equal(debug_payload.get("workspace_kind"), "communication_thread_context", "workspace_kind")
+    _assert_equal(debug_payload.get("primary_work_object", {}).get("kind"), "communication_brief", "primary kind")
+    _assert_equal(debug_payload.get("primary_work_object", {}).get("id"), brief.brief_id, "primary id")
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("thread_ref", {}).get("thread_id"),
+        thread_ref.thread_id,
+        "thread context",
+    )
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("backend_roles", {}).get("mail"),
+        "closeout_owner",
+        "mail backend role",
+    )
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("backend_roles", {}).get("enterprise_rag"),
+        "grounding_provider",
+        "rag backend role",
+    )
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("backend_roles", {}).get("meeting"),
+        "escalation_provider",
+        "meeting backend role",
+    )
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("governance_surface"),
+        "separate_governance_console",
+        "governance separation",
+    )
+    _assert_equal(
+        debug_payload.get("communication_context", {}).get("high_risk_approval_controls_exposed"),
+        False,
+        "workspace approval controls",
+    )
+    _assert_equal(
+        workspace_state.get("communication_context", {}).get("authority_owner"),
+        "backend_observations",
+        "authority owner",
+    )
+    if "approved_email_template" in json.dumps(debug_payload, ensure_ascii=False):
+        raise AssertionError("workspace state introduced a fixed business template")
+
+    return {
+        "ok": True,
+        "case": "workspace_flow",
+        "workspace_kind": debug_payload.get("workspace_kind"),
+        "primary_work_object": debug_payload.get("primary_work_object", {}).get("kind"),
+        "governance_surface": debug_payload.get("communication_context", {}).get("governance_surface"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Communication Copilot regression checks")
     parser.add_argument("--case", required=True, dest="case_name")
     args = parser.parse_args()
 
     cases = {
+        "workspace_flow": run_workspace_flow,
         "contracts_import": run_contracts_import,
         "brief_assembly": run_brief_assembly,
         "mail_closeout": run_mail_closeout,

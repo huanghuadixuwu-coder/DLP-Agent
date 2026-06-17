@@ -4954,8 +4954,12 @@ def _ensure_conversation(
 
 def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
     answer_text = str(result.get("answer", ""))
+    communication_workspace = _derive_communication_workspace_state(result, conversation_id)
     return {
         "conversation_id": conversation_id,
+        "workspace_kind": communication_workspace["workspace_kind"],
+        "primary_work_object": communication_workspace["primary_work_object"],
+        "communication_context": communication_workspace["communication_context"],
         "intent": str(result.get("intent", "unknown")),
         "routing_source": str(result.get("routing_source", "unknown")),
         "routing_confidence": float(result.get("routing_confidence", 0.0)),
@@ -5006,6 +5010,138 @@ def _build_debug_snapshot(result: dict, conversation_id: str) -> dict:
         "estimated_cost": float(result.get("estimated_cost", 0.0)),
         "answer_collapsed": len(answer_text) > 1200 or answer_text.count("\n") > 12,
     }
+
+
+def _derive_communication_workspace_state(result: dict, conversation_id: str) -> dict[str, Any]:
+    task_plan = dict(result.get("task_plan") or {})
+    observations = _collect_result_observations(result, task_plan)
+    observation_types = [
+        str(item.get("observation_type") or "")
+        for item in observations
+        if str(item.get("observation_type") or "").strip()
+    ]
+    mail_plan = dict(task_plan.get("mail_plan") or {})
+    primary_work_object = _primary_communication_work_object(
+        observations=observations,
+        mail_plan=mail_plan,
+        pending_confirmation=dict(result.get("pending_confirmation") or result.get("confirmation_payload") or {}),
+        conversation_id=conversation_id,
+    )
+    communication_context = {
+        "conversation_id": conversation_id,
+        "thread_ref": _communication_thread_ref(observations, mail_plan),
+        "observation_types": observation_types,
+        "backend_roles": {
+            "mail": "closeout_owner",
+            "dlp": "risk_boundary",
+            "enterprise_rag": "grounding_provider",
+            "meeting": "escalation_provider",
+        },
+        "surface_role": "user_workspace_context_view",
+        "authority_owner": "backend_observations",
+        "governance_surface": "separate_governance_console",
+        "high_risk_approval_controls_exposed": False,
+    }
+    return {
+        "workspace_kind": "communication_thread_context",
+        "primary_work_object": primary_work_object,
+        "communication_context": communication_context,
+    }
+
+
+def _collect_result_observations(result: dict, task_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for source in (
+        result.get("tool_observations"),
+        result.get("observations"),
+        task_plan.get("tool_observations"),
+    ):
+        for item in list(source or []):
+            if isinstance(item, dict):
+                observations.append(item)
+    return observations
+
+
+def _primary_communication_work_object(
+    *,
+    observations: list[dict[str, Any]],
+    mail_plan: dict[str, Any],
+    pending_confirmation: dict[str, Any],
+    conversation_id: str,
+) -> dict[str, Any]:
+    for observation_type in ("communication_brief", "communication_thread", "meeting_escalation_candidate"):
+        for observation in observations:
+            if str(observation.get("observation_type") or "") != observation_type:
+                continue
+            payload = dict(observation.get("payload") or {})
+            thread_ref = dict(payload.get("thread_ref") or payload)
+            return {
+                "kind": observation_type,
+                "id": str(
+                    payload.get("brief_id")
+                    or payload.get("thread_id")
+                    or payload.get("candidate_id")
+                    or ""
+                ),
+                "thread_id": str(thread_ref.get("thread_id") or ""),
+                "subject": str(thread_ref.get("subject") or payload.get("topic") or ""),
+                "status": str(observation.get("status") or ""),
+            }
+    if mail_plan:
+        return {
+            "kind": str(mail_plan.get("target_object") or mail_plan.get("mail_action_type") or "mail_action"),
+            "id": str(mail_plan.get("draft_id") or mail_plan.get("task_id") or ""),
+            "thread_id": str(dict(mail_plan.get("thread_ref") or {}).get("thread_id") or ""),
+            "subject": str(mail_plan.get("resolved_subject") or mail_plan.get("subject") or ""),
+            "status": str(mail_plan.get("status") or ""),
+        }
+    if pending_confirmation:
+        return {
+            "kind": str(pending_confirmation.get("tool_name") or pending_confirmation.get("action_name") or "pending_confirmation"),
+            "id": str(pending_confirmation.get("idempotency_key") or pending_confirmation.get("task_id") or ""),
+            "thread_id": "",
+            "subject": str(pending_confirmation.get("title") or ""),
+            "status": "pending_confirmation",
+        }
+    return {
+        "kind": "conversation_context",
+        "id": conversation_id,
+        "thread_id": "",
+        "subject": "",
+        "status": "active",
+    }
+
+
+def _communication_thread_ref(observations: list[dict[str, Any]], mail_plan: dict[str, Any]) -> dict[str, Any]:
+    for observation in observations:
+        payload = dict(observation.get("payload") or {})
+        thread_ref = dict(payload.get("thread_ref") or {})
+        if thread_ref:
+            return {
+                "thread_id": str(thread_ref.get("thread_id") or ""),
+                "source": str(thread_ref.get("source") or ""),
+                "subject": str(thread_ref.get("subject") or ""),
+                "participants": list(thread_ref.get("participants") or []),
+                "last_message_at": str(thread_ref.get("last_message_at") or ""),
+            }
+        if str(observation.get("observation_type") or "") == "communication_thread":
+            return {
+                "thread_id": str(payload.get("thread_id") or ""),
+                "source": str(payload.get("source") or ""),
+                "subject": str(payload.get("subject") or ""),
+                "participants": list(payload.get("participants") or []),
+                "last_message_at": str(payload.get("last_message_at") or ""),
+            }
+    thread_ref = dict(mail_plan.get("thread_ref") or {})
+    if thread_ref:
+        return {
+            "thread_id": str(thread_ref.get("thread_id") or ""),
+            "source": str(thread_ref.get("source") or ""),
+            "subject": str(thread_ref.get("subject") or ""),
+            "participants": list(thread_ref.get("participants") or []),
+            "last_message_at": str(thread_ref.get("last_message_at") or ""),
+        }
+    return {}
 
 
 def _write_unified_conversation_memory(
@@ -6070,6 +6206,18 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             confirmation_payload=dict(response.confirmation_payload or response.pending_confirmation or {}),
             actor_context=actor_context,
         )
+        response.task_plan = {
+            **dict(response.task_plan or {}),
+            "communication_workspace": _derive_communication_workspace_state(
+                {
+                    "task_plan": dict(response.task_plan or {}),
+                    "tool_observations": list(response.tool_observations or []),
+                    "pending_confirmation": dict(response.pending_confirmation or {}),
+                    "confirmation_payload": dict(response.confirmation_payload or {}),
+                },
+                conversation_id,
+            ),
+        }
         if continuation_state_snapshot:
             response.task_plan = {
                 **dict(response.task_plan or {}),
@@ -6603,6 +6751,10 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     result["permission_decision"] = permission_decision
     result["rate_limit_decision"] = rate_limit_decision
     result["queue_status"] = queue_status
+    result["task_plan"] = {
+        **dict(result.get("task_plan") or {}),
+        "communication_workspace": _derive_communication_workspace_state(result, conversation_id),
+    }
     _persist_confirmation_object(
         session_id=payload.session_id,
         conversation_id=conversation_id,

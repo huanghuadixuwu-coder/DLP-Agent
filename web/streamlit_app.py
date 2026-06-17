@@ -863,13 +863,13 @@ sync_url_state(st.session_state.session_id, st.session_state.current_conversatio
 
 
 with st.sidebar:
-    gradient_header("对话工作区", "conversation-gradient")
+    gradient_header("沟通线程工作区", "conversation-gradient")
     st.caption("当前 session")
     st.code(st.session_state.session_id, language=None)
 
     create_col, delete_col = st.columns(2)
     with create_col:
-        if st.button("新建对话"):
+        if st.button("新建沟通线程"):
             created = create_conversation(st.session_state.session_id)
             st.cache_data.clear()
             st.session_state.current_conversation_id = created["conversation_id"]
@@ -879,7 +879,7 @@ with st.sidebar:
             sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
             st.rerun()
     with delete_col:
-        if st.session_state.current_conversation_id and st.button("删除对话", type="secondary"):
+        if st.session_state.current_conversation_id and st.button("删除线程", type="secondary"):
             try:
                 delete_conversation(st.session_state.session_id, st.session_state.current_conversation_id)
                 st.cache_data.clear()
@@ -893,7 +893,7 @@ with st.sidebar:
                     st.session_state.current_conversation_id = created["conversation_id"]
                 st.session_state.visible_turn_limit = 30
                 sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
-                st.success("对话已删除")
+                st.success("沟通线程已删除")
                 st.rerun()
             except Exception as exc:
                 st.error(f"删除失败: {exc}")
@@ -902,7 +902,7 @@ with st.sidebar:
         current_label = reverse_conversation_options.get(st.session_state.current_conversation_id)
         labels = list(conversation_options.keys())
         selected_label = st.selectbox(
-            "当前对话",
+            "当前沟通线程",
             labels,
             index=labels.index(current_label) if current_label in labels else 0,
         )
@@ -915,7 +915,7 @@ with st.sidebar:
         st.caption("当前 conversation_id")
         st.code(st.session_state.current_conversation_id, language=None)
 
-    merge_choices = st.multiselect("选择要合并的对话", list(conversation_options.keys()))
+    merge_choices = st.multiselect("选择要合并的沟通线程", list(conversation_options.keys()))
     merge_name = st.text_input("合并后的名称", value="")
     if st.button("合并所选对话", disabled=len(merge_choices) < 2):
         try:
@@ -939,7 +939,7 @@ with st.sidebar:
     conversation_summary = (summary_payload.get("conversation") or {}).get("summary", "")
     merge_summary = summary_payload.get("merge") or {}
     if conversation_summary:
-        with st.expander("当前对话摘要", expanded=False):
+        with st.expander("当前沟通上下文摘要", expanded=False):
             st.write(conversation_summary)
     if merge_summary:
         with st.expander("合并来源", expanded=False):
@@ -993,7 +993,7 @@ with st.sidebar:
 left, right = st.columns([2, 1])
 
 with left:
-    st.subheader("对话")
+    st.subheader("沟通上下文")
     turns = load_turns(st.session_state.current_conversation_id)
     current_turn_debug = latest_debug_from_turns(turns)
     if current_turn_debug and (
@@ -1003,7 +1003,7 @@ with left:
         st.session_state.last_debug = current_turn_debug
         st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
     if not turns:
-        st.caption("这个对话还没有消息。")
+        st.caption("这个沟通线程还没有消息。")
     hidden_turn_count = max(0, len(turns) - st.session_state.visible_turn_limit)
     if hidden_turn_count:
         info_col, action_col = st.columns([3, 1])
@@ -1018,11 +1018,11 @@ with left:
         render_message(turn, st.session_state.auto_collapse_answers)
 
     st.markdown(
-        "<span class='small-muted'>可选：把日志、JSON、CSV 或 Markdown 上传给 Agent 一起处理。</span>",
+        "<span class='small-muted'>可选：把日志、JSON、CSV 或 Markdown 上传给 Copilot 作为本轮沟通上下文。</span>",
         unsafe_allow_html=True,
     )
     chat_uploaded = st.file_uploader(
-        "上传给本轮对话的文件",
+        "上传给本轮沟通上下文的文件",
         key=f"chat_upload_{st.session_state.current_conversation_id}_{st.session_state.chat_upload_nonce}",
     )
     chat_uploaded_text, chat_source_parse_status, chat_upload_error, chat_uploaded_base64 = decode_uploaded_file(chat_uploaded)
@@ -1032,14 +1032,14 @@ with left:
     elif chat_uploaded:
         st.caption(f"已准备文件: {chat_uploaded.name}，发送下一条消息时会一起提交。")
 
-    prompt = st.chat_input("输入问题，例如：帮我把如下文段发送到 1136732521@qq.com")
+    prompt = st.chat_input("输入沟通任务，例如：基于这条线程帮我准备给客户的回复")
     if prompt:
         with st.chat_message("user"):
             st.markdown(prompt)
             if chat_uploaded:
                 st.caption(f"附件: {chat_uploaded.name}")
         with st.chat_message("assistant"):
-            with st.spinner("Agent 正在处理请求；如涉及外发，会进入 DLP 检测与审批链路..."):
+            with st.spinner("Copilot 正在处理沟通上下文；如涉及外发，会进入 DLP 检测与治理链路..."):
                 try:
                     result = run_unified_agent(
                         st.session_state.session_id,
@@ -1069,7 +1069,7 @@ with left:
                     st.error(f"请求失败: {exc}")
 
 with right:
-    st.subheader("用户工作台")
+    st.subheader("用户沟通工作台")
     with st.expander("邮件早报 / 收件状态", expanded=False):
         st.caption("只读企业邮箱 IMAP 收件能力。同步和早报生成属于用户工作台动作，不包含治理审批。")
         mail_cols = st.columns(2)
@@ -1124,8 +1124,28 @@ with right:
     st.subheader("本轮状态")
     debug = st.session_state.last_debug or {}
     if not debug:
-        st.caption("发起一次对话后，这里会显示用户侧状态摘要。完整治理、DLQ、Provider、Queue 与诊断请打开独立治理台。")
+        st.caption("发起一次沟通任务后，这里会显示用户侧状态摘要。完整治理、DLQ、Provider、Queue 与诊断请打开独立治理台。")
     else:
+        workspace_state = (
+            debug.get("communication_workspace")
+            or (debug.get("task_plan") or {}).get("communication_workspace")
+            or {}
+        )
+        st.metric("Workspace", debug.get("workspace_kind") or workspace_state.get("workspace_kind", "communication_thread_context"))
+        primary_work_object = debug.get("primary_work_object") or workspace_state.get("primary_work_object") or {}
+        if primary_work_object:
+            st.caption(
+                "当前工作对象: "
+                f"{primary_work_object.get('kind', '-')}"
+                f" / {primary_work_object.get('status', '-')}"
+            )
+        communication_context = debug.get("communication_context") or workspace_state.get("communication_context") or {}
+        if communication_context:
+            st.caption(
+                "上下文边界: "
+                f"{communication_context.get('surface_role', 'user_workspace_context_view')}；"
+                "高风险审批仍在独立治理台。"
+            )
         st.metric("Route", debug.get("routing_source", debug.get("intent", "unknown")))
         if debug.get("task_id"):
             st.metric("Task", debug["task_id"])
