@@ -4369,7 +4369,7 @@ def _execute_fast_path(
                 "termination_reason": "direct_answer",
             }
         else:
-            summary = get_inbound_mail_summary()
+            summary = get_inbound_mail_summary(actor_context=actor_context)
             observation = make_typed_observation(
                 observation_type="mail_status_result",
                 source="inbound_mail_summary",
@@ -4822,7 +4822,7 @@ def _handle_compound_agent_request(
                 }
             )
         elif subtask.capability == "inbound_mail_summary":
-            result = get_inbound_mail_summary()
+            result = get_inbound_mail_summary(actor_context=actor_context)
             observations.append(
                 {
                     "observation_type": "mail_status_result",
@@ -4897,7 +4897,7 @@ def _handle_compound_agent_request(
                 )
             )
         elif subtask.capability == "inbound_mail_summary":
-            summary = get_inbound_mail_summary()
+            summary = get_inbound_mail_summary(actor_context=actor_context)
             sync_state = latest_sync_state()
             result = {"summary": summary, "sync_state": sync_state}
             observations.append(
@@ -6004,18 +6004,24 @@ def enqueue_inbound_mail_sync_api() -> dict[str, str]:
 
 
 @app.post("/mail/inbound/digest")
-def generate_daily_mail_digest_api() -> dict[str, Any]:
-    return generate_daily_mail_digest()
+def generate_daily_mail_digest_api(request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "mail.read", "inbound_mail_digest")
+    return generate_daily_mail_digest(actor_context=actor.to_dict())
 
 
 @app.post("/mail/inbound/digest/async")
-def enqueue_daily_mail_digest_api() -> dict[str, str]:
-    return {"task_id": enqueue_daily_mail_digest(), "queue": MAIL_QUEUE}
+def enqueue_daily_mail_digest_api(request: Request) -> dict[str, str]:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "mail.read", "inbound_mail_digest")
+    return {"task_id": enqueue_daily_mail_digest(actor.to_dict()), "queue": MAIL_QUEUE}
 
 
 @app.get("/mail/inbound/summary", response_model=InboundMailSummaryResponse)
-def inbound_mail_summary_api(since: str | None = None, until: str | None = None) -> InboundMailSummaryResponse:
-    return InboundMailSummaryResponse(**get_inbound_mail_summary(since, until))
+def inbound_mail_summary_api(request: Request, since: str | None = None, until: str | None = None) -> InboundMailSummaryResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "mail.read", "inbound_mail_summary")
+    return InboundMailSummaryResponse(**get_inbound_mail_summary(since, until, actor_context=actor.to_dict()))
 
 
 @app.get("/mail/outbound/summary", response_model=OutboundMailSummaryResponse)
@@ -6277,22 +6283,33 @@ def internal_communication_thread_detail_api(
 
 @app.get("/mail/inbound/messages", response_model=list[InboundMailMessage])
 def inbound_mail_messages_api(
+    request: Request,
     since: str | None = None,
     until: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[InboundMailMessage]:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "mail.read", "inbound_mail_messages")
     bounded_limit = max(1, min(limit, 200))
     return [
         InboundMailMessage(**item)
-        for item in list_inbound_mail_messages(since=since, until=until, limit=bounded_limit, offset=max(0, offset))
+        for item in list_inbound_mail_messages(
+            since=since,
+            until=until,
+            limit=bounded_limit,
+            offset=max(0, offset),
+            actor_context=actor.to_dict(),
+        )
     ]
 
 
 @app.post("/mail/inbound/{message_id}/draft-reply", response_model=InboundDraftReplyResponse)
-def draft_inbound_mail_reply_api(message_id: str) -> InboundDraftReplyResponse:
+def draft_inbound_mail_reply_api(message_id: str, request: Request) -> InboundDraftReplyResponse:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "mail.read", f"inbound_mail_message:{message_id}")
     try:
-        return InboundDraftReplyResponse(**draft_reply_for_message(message_id))
+        return InboundDraftReplyResponse(**draft_reply_for_message(message_id, actor_context=actor.to_dict()))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Unknown message_id") from exc
 

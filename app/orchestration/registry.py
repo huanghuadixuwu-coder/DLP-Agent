@@ -83,16 +83,20 @@ def _outbound_mail_summary(payload: dict[str, Any], context: OrchestrationContex
     )
 
 
-def _inbound_mail_summary(payload: dict[str, Any], _: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
-    result = get_inbound_mail_summary(since=payload.get("since"), until=payload.get("until"))
+def _inbound_mail_summary(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
+    result = get_inbound_mail_summary(
+        since=payload.get("since"),
+        until=payload.get("until"),
+        actor_context=context.actor_context,
+    )
     result["sync_state"] = latest_sync_state()
     return result
 
 
-def _inbound_message_search(payload: dict[str, Any], _: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
+def _inbound_message_search(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query") or "").strip().lower()
     limit = int(payload.get("limit") or 8)
-    messages = list_inbound_mail_messages(limit=max(limit, 20))
+    messages = list_inbound_mail_messages(limit=max(limit, 20), actor_context=context.actor_context)
     if query:
         terms = [token for token in query.split() if token]
         filtered = []
@@ -111,7 +115,7 @@ def _inbound_message_search(payload: dict[str, Any], _: OrchestrationContext, __
     return {"messages": messages[:limit]}
 
 
-def _inbound_message_read(payload: dict[str, Any], _: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
+def _inbound_message_read(payload: dict[str, Any], context: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
     message_id = str(payload.get("message_id") or "").strip()
     if not message_id:
         for item in dependency_payloads.values():
@@ -121,13 +125,13 @@ def _inbound_message_read(payload: dict[str, Any], _: OrchestrationContext, depe
                 break
     if not message_id:
         return {"error": "No message_id available for inbound_message_read."}
-    message = get_inbound_message(message_id)
+    message = get_inbound_message(message_id, actor_context=context.actor_context)
     if not message:
         return {"error": f"Unknown message_id: {message_id}"}
     return {"message": message}
 
 
-def _inbound_reply_draft(payload: dict[str, Any], _: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
+def _inbound_reply_draft(payload: dict[str, Any], context: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
     message_id = str(payload.get("message_id") or "").strip()
     if not message_id:
         for item in dependency_payloads.values():
@@ -141,7 +145,10 @@ def _inbound_reply_draft(payload: dict[str, Any], _: OrchestrationContext, depen
                 break
     if not message_id:
         return {"error": "No synchronized inbound mail message was found for drafting a reply."}
-    return draft_reply_for_message(message_id)
+    try:
+        return draft_reply_for_message(message_id, actor_context=context.actor_context)
+    except KeyError:
+        return {"error": f"Unknown message_id: {message_id}"}
 
 
 def _enterprise_search(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:

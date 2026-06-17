@@ -1010,8 +1010,8 @@ def sync_inbound_mail_task() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.task_worker.generate_daily_mail_digest_task")
-def generate_daily_mail_digest_task() -> dict[str, Any]:
-    return generate_daily_mail_digest()
+def generate_daily_mail_digest_task(actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    return generate_daily_mail_digest(actor_context=actor_context)
 
 
 @celery_app.task(name="app.task_worker.enterprise_rag_ingest_task")

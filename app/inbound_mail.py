@@ -494,11 +494,16 @@ def sync_inbound_mail(
     return {"enabled": True, "ok": True, "synced": synced, "new": new_count, "mailbox": mailbox, "state": state}
 
 
-def generate_daily_mail_digest(since: str | None = None, until: str | None = None) -> dict[str, Any]:
+def generate_daily_mail_digest(
+    since: str | None = None,
+    until: str | None = None,
+    *,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     start, end = default_digest_window()
     since_value = since or start.isoformat()
     until_value = until or end.isoformat()
-    summary = inbound_summary(since_value, until_value)
+    summary = inbound_summary(since_value, until_value, actor_context=actor_context)
     title = f"Mail digest: {summary['total']} received, {summary['unread']} unread"
     important_lines = [
         f"- {item.get('subject') or '(no subject)'} from {item.get('sender')}: {item.get('summary') or item.get('snippet')}"
@@ -531,15 +536,24 @@ def list_inbound_mail_messages(
     )
 
 
-def get_inbound_mail_summary(since: str | None = None, until: str | None = None) -> dict[str, Any]:
+def get_inbound_mail_summary(
+    since: str | None = None,
+    until: str | None = None,
+    *,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     start, end = default_digest_window()
-    summary = inbound_summary(since or start.isoformat(), until or end.isoformat())
+    summary = inbound_summary(
+        since or start.isoformat(),
+        until or end.isoformat(),
+        actor_context=actor_context,
+    )
     summary["sync_state"] = latest_sync_state()
     return summary
 
 
-def draft_reply_for_message(message_id: str) -> dict[str, Any]:
-    message = get_inbound_message(message_id)
+def draft_reply_for_message(message_id: str, *, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    message = get_inbound_message(message_id, actor_context=actor_context)
     if not message:
         raise KeyError(message_id)
     source = "\n".join(

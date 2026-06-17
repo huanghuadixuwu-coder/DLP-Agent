@@ -409,8 +409,8 @@ def list_recent_inbound_threads(
     return threads
 
 
-def inbound_summary(since: str, until: str) -> dict[str, Any]:
-    messages = list_inbound_messages(since=since, until=until, limit=200)
+def inbound_summary(since: str, until: str, *, actor_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    messages = list_inbound_messages(since=since, until=until, limit=200, actor_context=actor_context)
     important = [
         item
         for item in messages

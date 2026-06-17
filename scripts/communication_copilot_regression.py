@@ -295,7 +295,9 @@ def _seed_thread_store_message(
 def run_thread_store() -> dict[str, Any]:
     from types import SimpleNamespace
 
+    import app.inbound_mail as inbound_mail_module
     import app.main as main_module
+    import app.orchestration.registry as registry_module
     from app.actor_context import ActorContext, actor_from_mapping
     from app.communication.thread_store import (
         get_active_communication_thread,
@@ -306,6 +308,7 @@ def run_thread_store() -> dict[str, Any]:
     from app.inbound_mail_store import get_inbound_message
     from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import UnifiedAgentRequest
+    from app.orchestration.types import OrchestrationContext
 
     suffix = uuid4().hex[:8]
     actor_a = {
@@ -378,6 +381,27 @@ def run_thread_store() -> dict[str, Any]:
     if actor_a_shared["message_id"] == actor_b_shared["message_id"]:
         raise AssertionError("actor-scoped inbound storage keys collided")
 
+    actor_a_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_a, limit=10)
+    actor_b_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_b, limit=10)
+    actor_a_list_ids = {str(item.get("message_id") or "") for item in actor_a_list}
+    actor_b_list_ids = {str(item.get("message_id") or "") for item in actor_b_list}
+    _assert_true(actor_a_shared["message_id"] in actor_a_list_ids, "helper actor A list includes own message")
+    _assert_true(actor_b_shared["message_id"] not in actor_a_list_ids, "helper actor A list excludes actor B message")
+    _assert_true(actor_b_shared["message_id"] in actor_b_list_ids, "helper actor B list includes own message")
+    _assert_true(actor_a_shared["message_id"] not in actor_b_list_ids, "helper actor B list excludes actor A message")
+    actor_a_summary = inbound_mail_module.get_inbound_mail_summary(
+        "2026-06-17T00:00:00+00:00",
+        "2026-06-18T00:00:00+00:00",
+        actor_context=actor_a,
+    )
+    actor_b_summary = inbound_mail_module.get_inbound_mail_summary(
+        "2026-06-17T00:00:00+00:00",
+        "2026-06-18T00:00:00+00:00",
+        actor_context=actor_b,
+    )
+    _assert_equal(actor_a_summary["total"], 2, "helper actor A summary total")
+    _assert_equal(actor_b_summary["total"], 1, "helper actor B summary total")
+
     provider = CurrentImapSmtpMailProvider()
     provider_search_a = provider.search_messages(limit=10, actor_context=actor_a)
     provider_search_b = provider.search_messages(limit=10, actor_context=actor_b)
@@ -415,6 +439,87 @@ def run_thread_store() -> dict[str, Any]:
     blocked_cross_read = provider.read_message(str(actor_b_shared["message_id"] or ""), actor_context=actor_a)
     _assert_equal(blocked_cross_read.ok, False, "provider actor A cannot read actor B storage id")
     _assert_equal(blocked_cross_read.status, "not_found", "provider cross actor read status")
+
+    context_a = OrchestrationContext(
+        session_id=f"session-thread-store-{suffix}",
+        conversation_id=f"conversation-thread-store-{suffix}",
+        message="Read inbound mail",
+        safe_message="Read inbound mail",
+        actor_context=actor_a,
+    )
+    registry_search_a = registry_module._inbound_message_search({"limit": 10}, context_a, {})
+    registry_search_a_ids = {
+        str(item.get("message_id") or "") for item in list(registry_search_a.get("messages") or [])
+    }
+    _assert_true(actor_a_shared["message_id"] in registry_search_a_ids, "registry search actor A includes own message")
+    _assert_true(actor_b_shared["message_id"] not in registry_search_a_ids, "registry search actor A excludes actor B message")
+    registry_summary_a = registry_module._inbound_mail_summary(
+        {
+            "since": "2026-06-17T00:00:00+00:00",
+            "until": "2026-06-18T00:00:00+00:00",
+        },
+        context_a,
+        {},
+    )
+    _assert_equal(registry_summary_a["total"], 2, "registry actor A summary total")
+    registry_read_a = registry_module._inbound_message_read({"message_id": shared_provider_message_id}, context_a, {})
+    _assert_equal(dict(registry_read_a.get("message") or {}).get("thread_id"), thread_a, "registry actor A read own provider id")
+    registry_cross_read = registry_module._inbound_message_read(
+        {"message_id": str(actor_b_shared["message_id"] or "")},
+        context_a,
+        {},
+    )
+    _assert_true("error" in registry_cross_read, "registry actor A cannot read actor B storage id")
+
+    original_inbound_get_llm = inbound_mail_module.get_llm
+    inbound_mail_module.get_llm = lambda **_: (_ for _ in ()).throw(RuntimeError("forced draft fallback"))
+    try:
+        helper_draft_a = inbound_mail_module.draft_reply_for_message(shared_provider_message_id, actor_context=actor_a)
+        _assert_equal(helper_draft_a["message"]["thread_id"], thread_a, "helper draft actor A thread")
+        try:
+            inbound_mail_module.draft_reply_for_message(str(actor_b_shared["message_id"] or ""), actor_context=actor_a)
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("helper draft actor A read actor B storage id")
+        registry_draft_cross = registry_module._inbound_reply_draft(
+            {"message_id": str(actor_b_shared["message_id"] or "")},
+            context_a,
+            {},
+        )
+        _assert_true("error" in registry_draft_cross, "registry draft actor A cannot read actor B storage id")
+    finally:
+        inbound_mail_module.get_llm = original_inbound_get_llm
+
+    actor_a_request = SimpleNamespace(
+        headers={
+            "x-tenant-id": actor_a["tenant_id"],
+            "x-user-id": actor_a["user_id"],
+            "x-workspace-id": actor_a["workspace_id"],
+        }
+    )
+    api_summary_a = main_module.inbound_mail_summary_api(
+        actor_a_request,
+        since="2026-06-17T00:00:00+00:00",
+        until="2026-06-18T00:00:00+00:00",
+    )
+    _assert_equal(api_summary_a.total, 2, "public API actor A summary total")
+    api_messages_a = main_module.inbound_mail_messages_api(actor_a_request, limit=10)
+    api_message_ids_a = {item.message_id for item in api_messages_a}
+    _assert_true(actor_a_shared["message_id"] in api_message_ids_a, "public API actor A messages include own message")
+    _assert_true(actor_b_shared["message_id"] not in api_message_ids_a, "public API actor A messages exclude actor B message")
+    inbound_mail_module.get_llm = lambda **_: (_ for _ in ()).throw(RuntimeError("forced draft fallback"))
+    try:
+        api_draft_a = main_module.draft_inbound_mail_reply_api(shared_provider_message_id, actor_a_request)
+        _assert_equal(api_draft_a.message.thread_id, thread_a, "public API actor A draft thread")
+        try:
+            main_module.draft_inbound_mail_reply_api(str(actor_b_shared["message_id"] or ""), actor_a_request)
+        except Exception as exc:
+            _assert_equal(getattr(exc, "status_code", None), 404, "public API actor A cross draft status")
+        else:
+            raise AssertionError("public API actor A drafted actor B storage id")
+    finally:
+        inbound_mail_module.get_llm = original_inbound_get_llm
 
     actor_a_threads = list_communication_threads(actor_context=actor_a, limit=5)
     actor_b_threads = list_communication_threads(actor_context=actor_b, limit=5)
