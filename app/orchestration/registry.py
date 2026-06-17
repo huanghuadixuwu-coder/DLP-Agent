@@ -17,6 +17,7 @@ from app.graph import get_llm
 from app.hermes_memory import build_runtime_context_bundle, search_workspace_memory_with_plan
 from app.inbound_mail import draft_reply_for_message, get_inbound_mail_summary, latest_sync_state, list_inbound_mail_messages
 from app.inbound_mail_store import get_inbound_message
+from app.mail.access import is_mail_read_authorized
 from app.orchestration.tool_discovery import get_dynamic_tool_executor_map, get_dynamic_tool_registry
 from app.orchestration.types import OrchestrationContext, ToolDefinition
 from app.task_store import get_latest_recoverable_task, get_sent_mail_stats
@@ -83,7 +84,20 @@ def _outbound_mail_summary(payload: dict[str, Any], context: OrchestrationContex
     )
 
 
+def _inbound_mail_access_error(context: OrchestrationContext) -> dict[str, Any] | None:
+    if is_mail_read_authorized(context.actor_context):
+        return None
+    return {
+        "error": "authenticated session with mail.read is required for inbound mail access",
+        "status": "permission_denied",
+        "missing_evidence": True,
+    }
+
+
 def _inbound_mail_summary(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
+    access_error = _inbound_mail_access_error(context)
+    if access_error:
+        return access_error
     result = get_inbound_mail_summary(
         since=payload.get("since"),
         until=payload.get("until"),
@@ -94,6 +108,9 @@ def _inbound_mail_summary(payload: dict[str, Any], context: OrchestrationContext
 
 
 def _inbound_message_search(payload: dict[str, Any], context: OrchestrationContext, __: dict[str, Any]) -> dict[str, Any]:
+    access_error = _inbound_mail_access_error(context)
+    if access_error:
+        return access_error
     query = str(payload.get("query") or "").strip().lower()
     limit = int(payload.get("limit") or 8)
     messages = list_inbound_mail_messages(limit=max(limit, 20), actor_context=context.actor_context)
@@ -116,6 +133,9 @@ def _inbound_message_search(payload: dict[str, Any], context: OrchestrationConte
 
 
 def _inbound_message_read(payload: dict[str, Any], context: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
+    access_error = _inbound_mail_access_error(context)
+    if access_error:
+        return access_error
     message_id = str(payload.get("message_id") or "").strip()
     if not message_id:
         for item in dependency_payloads.values():
@@ -132,6 +152,9 @@ def _inbound_message_read(payload: dict[str, Any], context: OrchestrationContext
 
 
 def _inbound_reply_draft(payload: dict[str, Any], context: OrchestrationContext, dependency_payloads: dict[str, Any]) -> dict[str, Any]:
+    access_error = _inbound_mail_access_error(context)
+    if access_error:
+        return access_error
     message_id = str(payload.get("message_id") or "").strip()
     if not message_id:
         for item in dependency_payloads.values():

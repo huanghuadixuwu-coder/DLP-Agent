@@ -82,6 +82,7 @@ from app.inbound_mail import (
 )
 from app.inbound_mail_store import init_inbound_mail_store, list_notifications, list_recent_inbound_threads
 from app.mail.current_provider import CurrentImapSmtpMailProvider
+from app.mail.access import is_inbound_mail_tool, mark_mail_read_authorized
 from app.mail.draft_store import (
     bind_mail_draft_task,
     build_persisted_confirmation_payload,
@@ -281,6 +282,24 @@ def _ensure_authenticated_actor_access(
     }
 
 
+def _try_authenticated_actor_access(
+    request: Request,
+    actor: ActorContext,
+    *,
+    resource: str,
+    local_mode: str = "local_dev",
+) -> dict[str, Any] | None:
+    try:
+        return _ensure_authenticated_actor_access(
+            request,
+            actor,
+            resource=resource,
+            local_mode=local_mode,
+        )
+    except HTTPException:
+        return None
+
+
 def _ensure_internal_communication_thread_access(request: Request, actor: ActorContext) -> dict[str, Any]:
     return _ensure_authenticated_actor_access(
         request,
@@ -297,6 +316,38 @@ def _ensure_inbound_mail_access(request: Request, actor: ActorContext, resource:
         resource=resource,
         local_mode="local_dev_mail",
     )
+
+
+def _agent_chat_can_mark_mail_read(request: Request, actor: ActorContext) -> bool:
+    if not _try_authenticated_actor_access(
+        request,
+        actor,
+        resource="agent chat inbound mail",
+        local_mode="local_dev_mail",
+    ):
+        return False
+    return require_permission(actor, "mail.read", "agent_chat_inbound_mail").allowed
+
+
+def _agent_chat_mark_mail_read_if_authorized(
+    request: Request,
+    actor: ActorContext,
+    actor_context: dict[str, Any],
+) -> dict[str, Any]:
+    if _agent_chat_can_mark_mail_read(request, actor):
+        return mark_mail_read_authorized(actor_context)
+    return dict(actor_context or {})
+
+
+def _ensure_agent_chat_inbound_mail_access(
+    request: Request,
+    actor: ActorContext,
+    actor_context: dict[str, Any],
+    resource: str = "agent_chat_inbound_mail",
+) -> dict[str, Any]:
+    _ensure_inbound_mail_access(request, actor, "agent chat inbound mail")
+    _ensure_permission(actor, "mail.read", resource)
+    return mark_mail_read_authorized(actor_context)
 
 
 def _attach_landing_context(
@@ -4635,6 +4686,34 @@ def _looks_like_outbound_mail_summary_query(message: str) -> bool:
     )
 
 
+def _agent_chat_requests_inbound_mail_access(
+    message: str,
+    *,
+    route_decision: dict[str, Any] | None = None,
+    multi_agent_plan: Any | None = None,
+) -> bool:
+    text = (message or "").lower()
+    if _looks_like_inbound_mail_query(message):
+        return True
+    if any(token in text for token in ("inbox", "mailbox")):
+        return True
+    route = dict(route_decision or {})
+    recommended_tool = str(route.get("recommended_tool") or "")
+    intent = str(route.get("intent") or "")
+    if is_inbound_mail_tool(recommended_tool):
+        return True
+    if intent == "mail_status" and recommended_tool not in {
+        "outbound_mail_summary",
+        "governance_task_context_fetch",
+    }:
+        return True
+    for subtask in list(getattr(multi_agent_plan, "subtasks", []) or []):
+        action = str(getattr(subtask, "action", "") or getattr(subtask, "capability", ""))
+        if is_inbound_mail_tool(action):
+            return True
+    return False
+
+
 def _build_inbound_mail_agent_response(
     *,
     session_id: str,
@@ -6533,6 +6612,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     conversation_id = str(conversation["conversation_id"])
     actor = replace(actor, conversation_id=conversation_id)
     actor_context = actor.to_dict()
+    actor_context = _agent_chat_mark_mail_read_if_authorized(request, actor, actor_context)
     continuation_state_snapshot: dict[str, Any] = {}
 
     def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
@@ -6898,6 +6978,8 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     actor_context=actor_context,
                 ))
     multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
+    if _agent_chat_requests_inbound_mail_access(payload.message, multi_agent_plan=multi_agent_dag_plan):
+        actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
     if multi_agent_dag_plan is None and _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
         supplemented = _supplement_dlp_task(
@@ -6932,6 +7014,8 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             safe_message=payload.message,
             upload_context=upload_context,
         )
+        if _agent_chat_requests_inbound_mail_access(payload.message, route_decision=route_decision):
+            actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
     semantic_mail_action_match = str((route_decision or {}).get("intent") or "") == "mail_action"
     if multi_agent_dag_plan is None and (rule_mail_action_match or semantic_mail_action_match) and not is_mail_status_query:
         mail_action_plan = _build_mail_action_plan(payload, conversation_id, dict(upload_context or {}), actor_context=actor_context)
@@ -7013,6 +7097,8 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             safe_message=payload.message,
             upload_context=upload_context,
         )
+        if _agent_chat_requests_inbound_mail_access(payload.message, route_decision=route_decision):
+            actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
     if multi_agent_dag_plan is not None:
         route_decision = {
             **route_decision,

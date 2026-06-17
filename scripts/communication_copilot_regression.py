@@ -309,6 +309,7 @@ def run_thread_store() -> dict[str, Any]:
         upsert_thread_projection,
     )
     from app.inbound_mail_store import create_notification, get_inbound_message, list_notifications
+    from app.mail.access import mark_mail_read_authorized
     from app.mail.current_provider import CurrentImapSmtpMailProvider
     from app.models import InboundMailSyncRequest, UnifiedAgentRequest
     from app.orchestration.types import OrchestrationContext
@@ -664,12 +665,25 @@ def run_thread_store() -> dict[str, Any]:
     _assert_equal(blocked_cross_read.ok, False, "provider actor A cannot read actor B storage id")
     _assert_equal(blocked_cross_read.status, "not_found", "provider cross actor read status")
 
-    context_a = OrchestrationContext(
+    unauthorized_context_a = OrchestrationContext(
         session_id=f"session-thread-store-{suffix}",
         conversation_id=f"conversation-thread-store-{suffix}",
         message="Read inbound mail",
         safe_message="Read inbound mail",
         actor_context=actor_a,
+    )
+    unauthorized_registry_summary = registry_module._inbound_mail_summary({}, unauthorized_context_a, {})
+    _assert_equal(
+        unauthorized_registry_summary.get("status"),
+        "permission_denied",
+        "unauthorized orchestration inbound summary denied",
+    )
+    context_a = OrchestrationContext(
+        session_id=f"session-thread-store-{suffix}",
+        conversation_id=f"conversation-thread-store-{suffix}",
+        message="Read inbound mail",
+        safe_message="Read inbound mail",
+        actor_context=mark_mail_read_authorized(actor_a),
     )
     registry_search_a = registry_module._inbound_message_search({"limit": 10}, context_a, {})
     registry_search_a_ids = {
@@ -788,6 +802,89 @@ def run_thread_store() -> dict[str, Any]:
             raise AssertionError("public API actor A drafted actor B storage id")
     finally:
         inbound_mail_module.get_llm = original_inbound_get_llm
+
+    spoof_chat_payload = UnifiedAgentRequest(
+        session_id=f"session-chat-spoof-{suffix}",
+        message="mail digest",
+        tenant_id=actor_a["tenant_id"],
+        user_id=actor_a["user_id"],
+        workspace_id=actor_a["workspace_id"],
+    )
+    original_main_render_final_answer = main_module.render_final_answer
+    original_main_route_agent_request = main_module.route_agent_request
+    main_module.render_final_answer = lambda **_kwargs: {
+        "answer": "stubbed mail answer",
+        "token_in": 0,
+        "token_out": 0,
+        "estimated_cost": 0.0,
+    }
+    def inbound_fast_route(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "intent": "mail_status",
+            "route_mode": "fast",
+            "recommended_tool": "inbound_mail_summary",
+            "required_grounding": "tool",
+            "routing_source": "stubbed_regression_router",
+            "router_reason": "stubbed inbound mail regression route",
+            "confidence": 0.99,
+        }
+
+    def implicit_inbound_fast_route(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "intent": "mail_status",
+            "route_mode": "fast",
+            "recommended_tool": "",
+            "required_grounding": "tool",
+            "routing_source": "stubbed_regression_router",
+            "router_reason": "stubbed implicit inbound mail regression route",
+            "confidence": 0.99,
+        }
+
+    main_module.route_agent_request = inbound_fast_route
+    try:
+        assert_http_status(
+            lambda: main_module.agent_chat(spoof_chat_payload, SimpleNamespace(headers={})),
+            401,
+            "spoofed non-local agent chat inbound fast path requires auth session",
+        )
+        main_module.route_agent_request = implicit_inbound_fast_route
+        assert_http_status(
+            lambda: main_module.agent_chat(
+                UnifiedAgentRequest(
+                    session_id=f"session-chat-spoof-implicit-{suffix}",
+                    message="status check",
+                    tenant_id=actor_a["tenant_id"],
+                    user_id=actor_a["user_id"],
+                    workspace_id=actor_a["workspace_id"],
+                ),
+                SimpleNamespace(headers={}),
+            ),
+            401,
+            "spoofed non-local agent chat implicit inbound fast path requires auth session",
+        )
+        main_module.route_agent_request = inbound_fast_route
+        authenticated_chat = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=f"session-chat-auth-{suffix}",
+                message="mail digest",
+            ),
+            actor_a_request,
+        )
+        _assert_true(
+            any(str(call.get("tool_name") or "") == "inbound_mail_summary" for call in authenticated_chat.tool_calls),
+            "authenticated non-local agent chat reads inbound summary",
+        )
+        local_chat = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=f"session-chat-local-{suffix}",
+                message="mail digest",
+            ),
+            local_request,
+        )
+        _assert_true(local_chat.tool_calls, "local-dev agent chat inbound mail remains allowed")
+    finally:
+        main_module.render_final_answer = original_main_render_final_answer
+        main_module.route_agent_request = original_main_route_agent_request
 
     from datetime import datetime, timezone
 
