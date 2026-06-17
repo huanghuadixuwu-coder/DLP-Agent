@@ -747,6 +747,7 @@ def run_retirement() -> dict[str, Any]:
         "legacy_orchestration",
         "legacy_aggregator",
         "enable_legacy_orchestration_fallback",
+        "ENABLE_LEGACY_ORCHESTRATION_FALLBACK",
     ]
     active_paths = [REPO_ROOT / "app", REPO_ROOT / "README.md"]
     matches: list[str] = []
