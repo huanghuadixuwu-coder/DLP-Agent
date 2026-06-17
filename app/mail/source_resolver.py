@@ -118,6 +118,17 @@ def resolve_mail_source_request(
             reason="Multiple communication briefs are available; the intended closeout source is ambiguous.",
             classifier_source="deterministic_communication_brief_ambiguous",
         )
+    assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
+    if (legacy_referential_request or explicit_summary) and len(assistant_candidates) == 1:
+        return _resolution(
+            selected_candidate_ids=[assistant_candidates[0]["candidate_id"]],
+            source_mode="prior_assistant_answer",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=0.82,
+            reason="Selected the single prior assistant answer for an explicit referential mail request.",
+            classifier_source="deterministic_prior_assistant_reference",
+        )
 
     try:
         settings = get_settings()

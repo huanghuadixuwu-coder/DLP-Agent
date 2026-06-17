@@ -312,6 +312,34 @@ def run_mail_closeout() -> dict[str, Any]:
         ["communication-brief:brief_closeout_123"],
         "selected candidate",
     )
+    prior_answer_resolution = resolve_mail_source_request(
+        message="Please forward that information to customer@example.com.",
+        candidates=[
+            {
+                "candidate_id": "assistant-turn:single-prior",
+                "kind": "assistant_last_answer",
+                "label": "single prior answer",
+                "content": "Prior assistant answer that should be rewritten for the recipient.",
+                "content_type": "text/plain",
+            },
+            {
+                "candidate_id": "mail-thread:unrelated",
+                "kind": "mail_thread",
+                "label": "mail thread: unrelated renewal thread",
+                "content": json.dumps({"thread_id": "unrelated", "subject": "Unrelated"}, ensure_ascii=False),
+                "content_type": "application/json",
+            },
+        ],
+        legacy_referential_request=True,
+        explicit_summary=True,
+    )
+    _assert_equal(prior_answer_resolution["source_mode"], "prior_assistant_answer", "prior answer source mode")
+    _assert_equal(
+        prior_answer_resolution["selected_candidate_ids"],
+        ["assistant-turn:single-prior"],
+        "prior answer selected candidate",
+    )
+    _assert_equal(prior_answer_resolution["needs_clarification"], False, "prior answer clarification")
 
     plan_result = build_mail_action_plan(
         message="Please email the customer at customer@example.com with the closeout.",
