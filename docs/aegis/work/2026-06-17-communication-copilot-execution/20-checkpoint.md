@@ -1,27 +1,31 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Commit finalized plan edits.
-- Execute Task 0A legacy carrier inventory.
+- Complete Task 0A code quality review.
+- If quality review passes, mark Task 0A complete and prepare Task 0B.
 
 Completed todos:
-- Communication Copilot plan reviewed and revised with confirmed decisions.
+- Committed finalized plan edits: `e756302`.
+- Task 0A worker produced inventory commit: `ba4ba05`.
+- Task 0A coverage fix commit: `1e1d028`.
+- Task 0A spec compliance re-review passed.
 
 Active slice:
-- Task 0A preparation.
+- Task 0A code quality review.
 
 Evidence refs:
-- `git diff --check -- docs/aegis/plans/2026-06-17-communication-copilot-implementation.md`
-- `git status --short --branch`
+- Spec compliance reviewer: no remaining spec-compliance findings after `1e1d028`.
+- `git diff --name-only ba4ba05^..HEAD` shows only `problem_todolist.md` and `todolist.md` for Task 0A span.
+- Worktree was clean after Task 0A commits.
 
 Blocked-on items:
-- None.
+- Awaiting code quality review result.
 
 Next step:
-- Commit plan baseline, then dispatch Task 0A worker.
+- Address any quality review issues or close Task 0A and start Task 0B.
 
 DriftCheckDraft:
-- Scope: matches approved Communication Copilot plan.
-- Compatibility: Docker-first and no front-end style changes preserved.
-- Retirement: Task 0A/0B legacy retirement track is explicit.
+- Scope: still executing approved Communication Copilot plan.
+- Compatibility: no runtime or UI style files changed in Task 0A.
+- Retirement: active dependency deletion remains deferred to Task 0B+ with regression protection.
 - Decision: continue.
