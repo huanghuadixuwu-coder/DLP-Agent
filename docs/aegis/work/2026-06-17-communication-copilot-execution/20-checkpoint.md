@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Run final review and branch completion after Task 7.
+- Branch completion options after final review.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -34,9 +34,12 @@ Completed todos:
 - Task 7 retirement scan hardening landed in `f64d84f`.
 - Task 7 spec compliance review passed.
 - Task 7 code quality review passed, including a narrow re-review after the scan hardening.
+- Final reviewer initially found runtime `communication_brief` wiring, source precedence, and recovery-summary gaps.
+- Final review fixes landed in `7b7805f` and `65732ad`.
+- Final reviewer re-review passed.
 
 Active slice:
-- Final review preparation.
+- Branch completion preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -70,12 +73,16 @@ Evidence refs:
 - Task 7 Docker verification passed for `communication_copilot_regression.py --case retirement`, with `mode_used=react_recovery` and `final_answer_source=orchestration_recovery_renderer`.
 - Task 7 removed the retired `legacy_orchestration`, `legacy_aggregator`, and `ENABLE_LEGACY_ORCHESTRATION_FALLBACK` carrier path while preserving active dependency surfaces such as the static tool registry wrappers, `legacy_referential_request`, and runtime memory payload compatibility.
 - Task 7 search verification found no retired carrier tokens in active `app`/`README.md` runtime surfaces.
+- Final review fix verification passed for `communication_copilot_regression.py --case runtime_brief_closeout`, including persisted debug and response-level `primary_work_object=communication_brief`.
+- Final review fix verification passed for `communication_copilot_regression.py --case mail_closeout`, confirming `source_mode=communication_brief`.
+- Final review fix verification passed for `communication_copilot_regression.py --case retirement`, confirming recovery remains `react_recovery` without retired fallback metadata.
+- Final reviewer re-review confirmed all original findings resolved and no new blocking findings.
 
 Blocked-on items:
 - EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks full RAG-specific regression evidence but not Task 6 UI/workspace framing.
 
 Next step:
-- Run final Docker verification and final code review before branch completion.
+- Present branch completion options.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -88,4 +95,5 @@ DriftCheckDraft:
 - Subordinate boundary: Task 5 marked RAG as grounding provider and Meeting as escalation provider; Mail remains closeout owner.
 - Workspace boundary: Task 6 made communication-thread context the dominant user workspace state while leaving business authority in backend observations and governance surfaces.
 - Retirement boundary: Task 7 retired only the proven legacy orchestration fallback; active legacy-named compatibility dependencies remain tracked for future replacement.
-- Decision: continue to final review.
+- Final review boundary: Runtime now emits and persists `communication_brief`, response workspace state is refreshed after brief closeout, mail source resolution gives structured brief precedence over incidental thread candidates, and ReAct recovery summaries do not leak internal controller names.
+- Decision: ready for branch completion choice.

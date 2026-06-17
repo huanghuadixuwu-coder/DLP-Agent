@@ -87,3 +87,12 @@ Task 7 evidence:
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case retirement`: passed with `mode_used=react_recovery` and `final_answer_source=orchestration_recovery_renderer`.
 - `rg -n "LeetCode|legacy_orchestration|legacy_aggregator|RAG Agent" app README.md`: no active matches.
 - `git diff --check`: passed with Windows LF/CRLF warnings only.
+
+Final review evidence:
+- Final reviewer initially failed the branch because runtime did not emit `communication_brief`, brief precedence could be lost to incidental mail-thread candidates, and recovery fallback summaries could expose internal controller names.
+- Fix commits: `7b7805f`, `65732ad`.
+- `docker compose exec -T api python -m compileall -q app scripts web`: passed after fixes.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case runtime_brief_closeout`: passed with persisted and response-level `communication_brief`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case mail_closeout`: passed with `source_mode=communication_brief`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case retirement`: passed with `mode_used=react_recovery`.
+- Final reviewer re-review passed with no findings.
