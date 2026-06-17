@@ -110,6 +110,18 @@ def resolve_mail_source_request(
             reason="Selected the explicit uploaded content source before prior communication briefs.",
             classifier_source="deterministic_uploaded_content",
         )
+    assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
+    anchored_assistant = _deterministic_anchor_match(message, assistant_candidates)
+    if anchored_assistant:
+        return _resolution(
+            selected_candidate_ids=[anchored_assistant["candidate_id"]],
+            source_mode="prior_assistant_answer",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=float(anchored_assistant.get("confidence") or 0.0),
+            reason="Selected the prior assistant answer matched by explicit request anchors before prior communication briefs.",
+            classifier_source="deterministic_prior_assistant_anchor_match",
+        )
     brief_candidates = [item for item in normalized_candidates if item["kind"] == COMMUNICATION_BRIEF_SOURCE_KIND]
     competing_reference_candidates = [
         item
@@ -135,7 +147,6 @@ def resolve_mail_source_request(
             reason="Multiple communication briefs are available; the intended closeout source is ambiguous.",
             classifier_source="deterministic_communication_brief_ambiguous",
         )
-    assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
     if (legacy_referential_request or explicit_summary) and len(assistant_candidates) == 1:
         return _resolution(
             selected_candidate_ids=[assistant_candidates[0]["candidate_id"]],

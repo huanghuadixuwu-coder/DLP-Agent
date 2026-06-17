@@ -364,6 +364,34 @@ def run_mail_closeout() -> dict[str, Any]:
         "prior answer selected candidate",
     )
     _assert_equal(prior_answer_resolution["needs_clarification"], False, "prior answer clarification")
+    anchored_prior_answer_resolution = resolve_mail_source_request(
+        message="Please forward the MedThink EU failover answer to customer@example.com.",
+        candidates=[
+            {
+                "candidate_id": "assistant-turn:medthink-failover",
+                "kind": "assistant_last_answer",
+                "label": "assistant answer: MedThink EU failover",
+                "content": "MedThink EU failover uses EU hot standby, with US as a short-term fallback.",
+                "content_type": "text/plain",
+            },
+            {
+                "candidate_id": "communication-brief:brief_closeout_123",
+                "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+                "label": "communication brief: Renewal planning",
+                "content": brief_content,
+                "content_type": "application/json",
+            },
+        ],
+        legacy_referential_request=True,
+        explicit_summary=True,
+    )
+    _assert_equal(anchored_prior_answer_resolution["source_mode"], "prior_assistant_answer", "anchored prior answer source mode")
+    _assert_equal(
+        anchored_prior_answer_resolution["selected_candidate_ids"],
+        ["assistant-turn:medthink-failover"],
+        "anchored prior answer selected candidate",
+    )
+    _assert_equal(anchored_prior_answer_resolution["needs_clarification"], False, "anchored prior answer clarification")
 
     plan_result = build_mail_action_plan(
         message="Please email the customer at customer@example.com with the closeout.",
