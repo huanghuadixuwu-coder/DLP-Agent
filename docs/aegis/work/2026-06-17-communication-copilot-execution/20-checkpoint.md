@@ -1,7 +1,7 @@
 ﻿# Todo Checkpoint Draft
 
 Current todo:
-- Start Task 5 make EnterpriseRAG and Meeting Agent produce communication inputs.
+- Start Task 6 reframe `/agent/chat` and workspace around communication work.
 
 Completed todos:
 - Committed finalized plan edits: `e756302`.
@@ -24,9 +24,11 @@ Completed todos:
 - Task 3 spec compliance and code quality reviews passed.
 - Task 4 made Mail Agent consume `communication_brief` as the closeout source across `f39ba37`, `0e35004`, `2cde2ea`, and `f2180aa`.
 - Task 4 spec compliance and code quality reviews passed after source-precedence regressions were fixed.
+- Task 5 normalized EnterpriseRAG and Meeting as subordinate communication providers in `dc23773`.
+- Task 5 spec compliance and code quality reviews passed.
 
 Active slice:
-- Task 5 preparation.
+- Task 6 preparation.
 
 Evidence refs:
 - Spec compliance reviewer confirmed Task 0A deliverable files only: `problem_todolist.md`, `todolist.md`.
@@ -47,12 +49,15 @@ Evidence refs:
 - Task 4 Docker verification passed for `mail_reference_authoring_regression.py` and `communication_copilot_regression.py --case mail_closeout` after final fixes.
 - Task 4 preserved explicit upload/current-source precedence and anchored prior-assistant-answer precedence before `communication_brief`.
 - Task 4 did not commit frontend/style/docs/data transcript changes.
+- Task 5 Docker verification passed for communication subordinate input regression, meeting worker regression, and cross-domain workflow regression.
+- Task 5 added structural subordinate role metadata for RAG grounding and Meeting escalation without making either final closeout owner.
+- Task 5 EnterpriseRAG full regression remains blocked only by missing `/app/questions.parquet`.
 
 Blocked-on items:
-- EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks RAG-specific regression evidence but not Task 1 docs framing.
+- EnterpriseRAG benchmark/regression data is missing from Docker (`/app/questions.parquet` and matching documents); this blocks full RAG-specific regression evidence but not Task 6 UI/workspace framing.
 
 Next step:
-- Dispatch Task 5 worker to expose EnterpriseRAG grounding bundles and Meeting escalation candidates as communication inputs without taking over Mail closeout.
+- Dispatch Task 6 worker to reframe `/agent/chat` and the workspace around communication work without changing front-end visual style.
 
 DriftCheckDraft:
 - Scope: still executing approved Communication Copilot plan.
@@ -62,4 +67,5 @@ DriftCheckDraft:
 - Contract boundary: Task 2 introduced additive internal types only; no active behavior moved yet.
 - Assembly boundary: Task 3 introduced internal brief assembly only; no public closeout ownership moved yet.
 - Closeout boundary: Task 4 moved Mail closeout toward `communication_brief` while preserving existing Mail/DLP confirmation lifecycle.
+- Subordinate boundary: Task 5 marked RAG as grounding provider and Meeting as escalation provider; Mail remains closeout owner.
 - Decision: continue.

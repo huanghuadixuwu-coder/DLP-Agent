@@ -56,3 +56,12 @@ Task 4 evidence:
 - `docker compose exec -T api python scripts/mail_reference_authoring_regression.py`: passed with `ok: true`.
 - `docker compose exec -T api python scripts/communication_copilot_regression.py --case mail_closeout`: passed with `ok: true`.
 - Worker verification also passed `mail_authoring_contract_regression.py`, `contracts_import`, `brief_assembly`, compileall, and diff-check for allowed files.
+
+Task 5 evidence:
+- Worker subordinate-provider commit: `dc23773`.
+- Spec compliance reviewer passed and confirmed RAG grounding metadata, Meeting escalation metadata, domain-agent metadata, and Mail closeout ownership.
+- Code quality reviewer passed; residual drift risk is repeated role/kind literals across integration boundaries.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case subordinate_inputs`: passed in worker verification.
+- `docker compose exec -T api python scripts/meeting_worker_regression.py`: passed in worker verification.
+- `docker compose exec -T api python scripts/cross_domain_workflow_regression.py`: passed in worker verification.
+- `docker compose exec -T api python scripts/enterprise_rag_regression.py --limit 4`: blocked only by missing `/app/questions.parquet`.
