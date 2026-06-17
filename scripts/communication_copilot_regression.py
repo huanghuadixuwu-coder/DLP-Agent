@@ -298,7 +298,7 @@ def run_thread_store() -> dict[str, Any]:
     import app.inbound_mail as inbound_mail_module
     import app.main as main_module
     import app.orchestration.registry as registry_module
-    from app.actor_context import ActorContext, actor_from_mapping
+    from app.actor_context import DEFAULT_TENANT_ID, DEFAULT_USER_ID, ActorContext, actor_from_mapping
     from app.communication.thread_store import (
         get_active_communication_thread,
         get_communication_thread,
@@ -326,9 +326,22 @@ def run_thread_store() -> dict[str, Any]:
         "user_id": actor_a["user_id"],
         "workspace_id": "workspace-b",
     }
+    local_workspace_a = {
+        "tenant_id": DEFAULT_TENANT_ID,
+        "user_id": DEFAULT_USER_ID,
+        "workspace_id": f"local-workspace-a-{suffix}",
+    }
+    local_workspace_b = {
+        "tenant_id": DEFAULT_TENANT_ID,
+        "user_id": DEFAULT_USER_ID,
+        "workspace_id": f"local-workspace-b-{suffix}",
+    }
     thread_a = f"thread-store-a-{suffix}"
     thread_b = f"thread-store-b-{suffix}"
+    local_thread_a = f"thread-store-local-a-{suffix}"
+    local_thread_b = f"thread-store-local-b-{suffix}"
     shared_provider_message_id = f"shared-provider-msg-{suffix}"
+    local_shared_provider_message_id = f"shared-local-provider-msg-{suffix}"
 
     _seed_thread_store_message(
         actor_context=actor_a,
@@ -380,6 +393,78 @@ def run_thread_store() -> dict[str, Any]:
     _assert_equal(actor_b_shared.get("provider_message_id"), shared_provider_message_id, "actor B provider message id")
     if actor_a_shared["message_id"] == actor_b_shared["message_id"]:
         raise AssertionError("actor-scoped inbound storage keys collided")
+
+    _seed_thread_store_message(
+        actor_context=local_workspace_a,
+        message_id=local_shared_provider_message_id,
+        uid=f"uid-local-a-1-{suffix}",
+        thread_id=local_thread_a,
+        provider_thread_id=f"provider-{local_thread_a}",
+        sender="local-customer-a@example.com",
+        recipients="local-user@example.com",
+        subject="Local workspace A renewal",
+        received_at="2026-06-17T08:20:00+00:00",
+        summary="Local workspace A renewal question.",
+        risk_hint="",
+    )
+    _seed_thread_store_message(
+        actor_context=local_workspace_b,
+        message_id=local_shared_provider_message_id,
+        uid=f"uid-local-b-1-{suffix}",
+        thread_id=local_thread_b,
+        provider_thread_id=f"provider-{local_thread_b}",
+        sender="local-customer-b@example.com",
+        recipients="local-user@example.com",
+        subject="Local workspace B onboarding",
+        received_at="2026-06-17T08:25:00+00:00",
+        summary="Local workspace B onboarding question.",
+        risk_hint="high",
+    )
+    local_a_shared = get_inbound_message(local_shared_provider_message_id, actor_context=local_workspace_a)
+    local_b_shared = get_inbound_message(local_shared_provider_message_id, actor_context=local_workspace_b)
+    _assert_true(local_a_shared, "local workspace A shared provider message retained")
+    _assert_true(local_b_shared, "local workspace B shared provider message retained")
+    _assert_equal(local_a_shared["thread_id"], local_thread_a, "local workspace A shared message thread")
+    _assert_equal(local_b_shared["thread_id"], local_thread_b, "local workspace B shared message thread")
+    _assert_equal(
+        local_a_shared.get("provider_message_id"),
+        local_shared_provider_message_id,
+        "local workspace A provider message id",
+    )
+    _assert_equal(
+        local_b_shared.get("provider_message_id"),
+        local_shared_provider_message_id,
+        "local workspace B provider message id",
+    )
+    if local_a_shared["message_id"] == local_b_shared["message_id"]:
+        raise AssertionError("local-dev workspace storage keys collided")
+    _assert_equal(
+        get_inbound_message(local_shared_provider_message_id, actor_context=ActorContext().to_dict()),
+        None,
+        "default local-dev workspace does not read non-default workspace rows",
+    )
+    local_a_list_ids = {
+        str(item.get("message_id") or "")
+        for item in inbound_mail_module.list_inbound_mail_messages(actor_context=local_workspace_a, limit=10)
+    }
+    local_b_list_ids = {
+        str(item.get("message_id") or "")
+        for item in inbound_mail_module.list_inbound_mail_messages(actor_context=local_workspace_b, limit=10)
+    }
+    _assert_true(local_a_shared["message_id"] in local_a_list_ids, "local workspace A list includes own message")
+    _assert_true(local_b_shared["message_id"] not in local_a_list_ids, "local workspace A list excludes workspace B")
+    _assert_true(local_b_shared["message_id"] in local_b_list_ids, "local workspace B list includes own message")
+    _assert_true(local_a_shared["message_id"] not in local_b_list_ids, "local workspace B list excludes workspace A")
+    local_a_thread_ids = {
+        item.get("thread_id") for item in list_communication_threads(actor_context=local_workspace_a, limit=5)
+    }
+    local_b_thread_ids = {
+        item.get("thread_id") for item in list_communication_threads(actor_context=local_workspace_b, limit=5)
+    }
+    _assert_true(local_thread_a in local_a_thread_ids, "local workspace A thread listed")
+    _assert_true(local_thread_b not in local_a_thread_ids, "local workspace A cannot list workspace B thread")
+    _assert_true(local_thread_b in local_b_thread_ids, "local workspace B thread listed")
+    _assert_true(local_thread_a not in local_b_thread_ids, "local workspace B cannot list workspace A thread")
 
     actor_a_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_a, limit=10)
     actor_b_list = inbound_mail_module.list_inbound_mail_messages(actor_context=actor_b, limit=10)

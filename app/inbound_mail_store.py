@@ -10,7 +10,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from app.actor_context import actor_from_mapping
+from app.actor_context import DEFAULT_WORKSPACE_ID, actor_from_mapping
 from app.config import get_settings
 
 
@@ -50,7 +50,7 @@ def _storage_message_id(provider_message_id: str, actor_context: dict[str, Any] 
     original = _clean(provider_message_id)
     if not original:
         return ""
-    if actor.is_local_dev:
+    if actor.is_local_dev and actor.workspace_id == DEFAULT_WORKSPACE_ID:
         return original
     digest = hashlib.sha256(
         "|".join([actor.tenant_id, actor.workspace_id, actor.user_id, original]).encode("utf-8")
