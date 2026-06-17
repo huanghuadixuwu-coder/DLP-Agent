@@ -311,3 +311,11 @@
 - `[x]` Reuse existing Supervisor, DAG executor, registry, Prometheus/Admin, PostgreSQL task state, and Celery workers.
 - `[x]` Avoid a second scheduler, a second tracing stack, or a parallel tool registry in the first implementation.
 - `[x]` Keep new platform contracts small and provider-neutral; add adapters only for verified scenarios.
+
+## 19. Communication Copilot Refactor Execution
+- `[-]` Execute the approved Communication Copilot implementation plan from `docs/aegis/plans/2026-06-17-communication-copilot-implementation.md`.
+- `[x]` Task 0A legacy carrier inventory report is complete in `problem_todolist.md`: carriers are classified as `dead_identity`, `safe_delete`, `compat_shim`, or `active_runtime_dependency`.
+- `[x]` Task 0A stayed inventory-only: no runtime code changes and no front-end style changes.
+- `[x]` Active Mail/DLP/RAG dependencies are protected by named regressions before any removal: mail authoring/reference/confirmation regressions, governed delivery/runtime regressions, and EnterpriseRAG/context regressions.
+- `[ ]` Task 0B pending: delete only `dead_identity` and `safe_delete` carriers; quarantine `compat_shim` carriers; do not delete `active_runtime_dependency` carriers until replacement owner paths pass Docker regressions.
+- `[ ]` Task 1 pending: reframe top-level product docs around Communication Copilot while preserving intentional historical migration notes only where useful.

@@ -947,6 +947,70 @@ Latest remote regression evidence:
   short-circuits removed avoidable classifier calls without adding
   domain-specific answer templates.
 
+## 26. Communication Copilot Legacy Carriers Need Classified Retirement
+
+Status: `[-]` inventory complete; runtime cleanup pending Task 0B
+
+Problem:
+The Communication Copilot refactor needs to retire historical product identity,
+chat-first ownership, and old fallback carriers without breaking current
+Mail/DLP/RAG behavior. Some carriers are dead identity or documentation-only
+history, but others still protect active runtime behavior such as source
+selection, memory context, dynamic tool registration, and governed delivery
+progress. Deleting them before replacement owners are regression-proven would
+risk regressions in mail authoring, DLP task creation, and EnterpriseRAG
+grounding.
+
+Task 0A inventory rule:
+
+- Categories are fixed as `dead_identity`, `safe_delete`, `compat_shim`, or
+  `active_runtime_dependency`.
+- Task 0B may delete only `dead_identity` and `safe_delete` items.
+- `compat_shim` and `active_runtime_dependency` items need explicit replacement
+  owners and removal triggers before runtime deletion.
+
+Legacy carrier inventory:
+
+| carrier | location | category | current behavior | replacement owner | required regression | removal trigger |
+| --- | --- | --- | --- | --- | --- | --- |
+| Historical package identity string | `app/__init__.py:1` | `dead_identity` | Exposes `LeetCode RAG Agent package.` as the package docstring. | Communication Copilot package identity. | Legacy search only: `rg -n "LeetCode\|RAG Agent" app README.md todolist.md problem_todolist.md`. | Task 0B can replace/remove after this inventory because no runtime behavior depends on the string. |
+| Historical LeetCode README framing | `README.md:3`, `README.md:148`, `README.md:196`, `README.md:345`, `README.md:346` | `safe_delete` | Documentation labels old LeetCode/RAG heritage as historical context and removed V1 behavior. | Communication Copilot top-level product framing; historical notes only when explicitly labeled. | Legacy search plus `git diff --check -- README.md todolist.md problem_todolist.md` in the doc-framing task. | Task 1 should delete or demote active-product framing; allow only historical migration notes. |
+| Historical LeetCode tracker entries | `todolist.md:205`, `todolist.md:207` | `safe_delete` | Completed legacy-cleanup notes record removed LeetCode APIs and seed behavior. | Communication Copilot roadmap history section, if still needed. | Legacy search must show only intentional historical tracker notes. | Task 1 or Task 7 can prune once top-level docs no longer need old migration evidence. |
+| Legacy orchestration feature flag | `app/config.py:84` | `compat_shim` | `enable_legacy_orchestration_fallback` defaults false and can re-enable the old orchestrator after ReAct failure. | Supervisor + ReAct controller + multi-agent DAG as the only runtime owners. | `scripts/agent_runtime_regression.py`; Mail/RAG smoke when the flag and fallback are removed. | Delete only after ReAct/DAG failure handling returns typed recovery observations without legacy fallback. |
+| Legacy orchestration fallback function | `app/orchestration/service.py:204` | `compat_shim` | `_legacy_orchestrate_agent_request(...)` still plans, executes, aggregates, and returns old response metadata if the flag allows fallback. | Supervisor-owned orchestration service with final renderer ownership. | `scripts/agent_runtime_regression.py`; `scripts/cross_domain_workflow_regression.py`; failure-recovery regression for ReAct errors. | Delete after the fallback flag is gone and runtime regressions prove no Mail/DLP/RAG path relies on legacy aggregation. |
+| Legacy response metadata values | `app/orchestration/service.py:242`, `app/orchestration/service.py:285` | `compat_shim` | Emits `mode_used=legacy_orchestration` and `final_answer_source=legacy_aggregator` from the fallback path. | Typed observation/final renderer metadata owned by Supervisor and domain agents. | Legacy search plus trace-evaluator checks that final answers are renderer/domain owned. | Remove with `_legacy_orchestrate_agent_request(...)`; no standalone deletion before fallback removal. |
+| Legacy static tool registry merge | `app/orchestration/registry.py:391`, `app/orchestration/registry.py:566` | `active_runtime_dependency` | `_legacy_tool_registry()` is merged behind dynamic tools and still provides default read-only tools for catalog, context, mailbox status, inbound mail, uploaded content, persona, and EnterpriseRAG. | Decorator-driven dynamic registry plus Communication Copilot domain owners. | `scripts/agent_runtime_regression.py`; `scripts/mail_authoring_contract_regression.py`; inbound/mail status regressions; `scripts/enterprise_rag_regression.py --limit 4`. | Migrate each tool to a dynamic owner, prove the same tool names/observations in Docker, then delete the legacy registry helper. |
+| Legacy static tool executor merge | `app/orchestration/registry.py:542`, `app/orchestration/registry.py:574` | `active_runtime_dependency` | `_legacy_tool_executor_map()` supplies handlers for the static tools when no dynamic handler overrides them. | Dynamic executor map registered by each domain package. | Same as static registry, plus DLP/governance task context checks. | Delete only after every listed legacy handler has a dynamic replacement and no missing tool appears in agent runtime regression. |
+| Mail referential source fallback flag | `app/mail/source_resolver.py:76`, `app/mail/source_resolver.py:203`, `app/main.py:1459`, `app/main.py:2108` | `active_runtime_dependency` | `legacy_referential_request` keeps safe deterministic prior-answer selection when LLM source resolution fails. | `communication_brief` source refs and semantic `mail_resolve_body_sources(...)` observations. | `scripts/mail_authoring_contract_regression.py`; `scripts/mail_reference_authoring_regression.py`; `scripts/mail_confirmation_task_renderer_regression.py`; continuation/source clarification regressions. | Remove after brief-driven source resolution covers prior answer, inline body, upload, meeting result, and mail thread references under LLM timeout. |
+| Runtime legacy memory bundle | `app/hermes_memory.py:321`, `app/hermes_memory.py:361`, `app/hermes_memory.py:378` | `active_runtime_dependency` | `legacy_memory` folds existing conversation memory into the runtime context bundle and records `legacy_summary_memory` as a source. | Communication memory/context owner feeding `communication_thread` and `communication_brief`. | `scripts/enterprise_rag_regression.py --limit 4`; fast memory and context-bundle runtime regression; no loss of transcript/workspace memory counts. | Rename or remove only after the new context owner preserves summary memory behavior and diagnostics. |
+| EnterpriseRAG context fallback payload | `app/enterprise_rag/core/service.py:192`, `app/enterprise_rag/core/service.py:215` | `active_runtime_dependency` | On context-bundle absence or failure, EnterpriseRAG still returns a stable payload containing empty `legacy_memory`. | Grounding bundle diagnostics owned by EnterpriseRAG and communication context service. | EnterpriseRAG regression including timeout/dependency-failure path and compact diagnostics. | Remove legacy payload key only after callers no longer read it and diagnostics expose the replacement field. |
+| Generic `mode_used` response field | `app/models.py:118`, `app/main.py`, `app/orchestration/react_controller.py` | `active_runtime_dependency` | Runtime responses and UI/debug surfaces use `mode_used` for routing/progress metadata; the field is not legacy by itself. | Keep as response metadata unless replaced by a typed route/progress contract. | `scripts/agent_runtime_regression.py`; governance/workspace progress regressions. | Do not remove in Task 0B; only delete legacy values such as `legacy_orchestration` when their carrier is gone. |
+| Generic `final_answer_source` response/debug field | `app/models.py:153`, `app/main.py`, `app/enterprise_rag/core/service.py`, `app/orchestration/trace_evaluator.py` | `active_runtime_dependency` | Renderer, RAG, mail confirmation, and trace evaluator use this field to assert answer ownership. | Keep or replace with a typed answer ownership contract. | `scripts/mail_confirmation_task_renderer_regression.py`; `scripts/enterprise_rag_regression.py --limit 4`; trace evaluator checks. | Do not remove in Task 0B; only retire legacy values after replacement owner paths pass. |
+
+Current protected regression map:
+
+- Mail source and closeout dependencies are protected by
+  `mail_authoring_contract_regression.py`,
+  `mail_reference_authoring_regression.py`,
+  `mail_confirmation_task_renderer_regression.py`, and continuation/source
+  clarification regressions.
+- DLP/governed delivery dependencies are protected by
+  `agent_runtime_regression.py`, `cross_domain_workflow_regression.py`, and
+  mail confirmation/task renderer checks that preserve governed task creation.
+- EnterpriseRAG and memory dependencies are protected by
+  `enterprise_rag_regression.py --limit 4`, active-index diagnostics, and
+  context-bundle failure recovery checks.
+
+Task 0A evidence:
+
+- `[x]` Ran legacy identity search:
+  `rg -n "LeetCode|legacy_orchestration|legacy_aggregator|RAG Agent|chat-first" app README.md todolist.md problem_todolist.md`.
+- `[x]` Ran runtime metadata search:
+  `rg -n "final_answer_source|mode_used|enable_legacy_orchestration_fallback|legacy_" app`.
+- `[x]` Classified every observed legacy carrier without editing runtime code.
+- `[ ]` Task 0B: delete or quarantine classified carriers under Docker
+  regression protection.
+
 ## Platform Capability Backlog (Not Failure Issues)
 
 Status: `[ ]` planned after Phase 3 stabilization
