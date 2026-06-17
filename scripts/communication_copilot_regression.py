@@ -6,6 +6,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -297,6 +298,13 @@ def run_mail_closeout() -> dict[str, Any]:
             "content": brief_content,
             "content_type": "application/json",
         },
+        {
+            "candidate_id": "mail-thread:incidental",
+            "kind": "mail_thread",
+            "label": "mail thread: unrelated invoice",
+            "content": json.dumps({"thread_id": "incidental", "subject": "Unrelated invoice"}, ensure_ascii=False),
+            "content_type": "application/json",
+        },
     ]
 
     source_resolution = resolve_mail_source_request(
@@ -311,6 +319,36 @@ def run_mail_closeout() -> dict[str, Any]:
         source_resolution["selected_candidate_ids"],
         ["communication-brief:brief_closeout_123"],
         "selected candidate",
+    )
+    explicit_thread_resolution = resolve_mail_source_request(
+        message="Please use the Procurement Renewal thread for the email to customer@example.com.",
+        candidates=[
+            {
+                "candidate_id": "mail-thread:procurement-renewal",
+                "kind": "mail_thread",
+                "label": "mail thread: Procurement Renewal",
+                "content": json.dumps(
+                    {"thread_id": "procurement-renewal", "subject": "Procurement Renewal"},
+                    ensure_ascii=False,
+                ),
+                "content_type": "application/json",
+            },
+            {
+                "candidate_id": "communication-brief:brief_closeout_123",
+                "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+                "label": "communication brief: Renewal planning",
+                "content": brief_content,
+                "content_type": "application/json",
+            },
+        ],
+        legacy_referential_request=True,
+        explicit_summary=True,
+    )
+    _assert_equal(explicit_thread_resolution["source_mode"], "mail_thread", "explicit thread source mode")
+    _assert_equal(
+        explicit_thread_resolution["selected_candidate_ids"],
+        ["mail-thread:procurement-renewal"],
+        "explicit thread selected candidate",
     )
     upload_resolution = resolve_mail_source_request(
         message="Please email the uploaded file content to customer@example.com.",
@@ -742,6 +780,208 @@ def run_workspace_flow() -> dict[str, Any]:
     }
 
 
+def run_runtime_brief_closeout() -> dict[str, Any]:
+    import app.communication.thread_context as thread_context_module
+    import app.main as main_module
+    from app.conversation_store import create_conversation, get_turns
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.mail.source_resolver import resolve_mail_source_request
+    from app.models import UnifiedAgentRequest
+    from app.orchestration.observations import make_typed_observation
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-runtime-brief-{suffix}"
+    conversation_id = f"conversation-runtime-brief-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-runtime-{suffix}",
+        "user_id": f"user-runtime-{suffix}",
+        "workspace_id": "workspace-runtime",
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+
+    original_persist_answer_artifact = main_module._persist_answer_artifact_object
+    original_write_dynamic_turn_memory = main_module.write_dynamic_turn_memory
+    original_enqueue_summary = main_module.enqueue_conversation_memory_summary
+    original_list_thread_messages = thread_context_module.list_thread_messages
+    original_list_recent_inbound_threads = thread_context_module.list_recent_inbound_threads
+    main_module._persist_answer_artifact_object = lambda **_: {}
+    main_module.write_dynamic_turn_memory = lambda **_: {"memory_scope": "session", "identifiers": {}}
+    main_module.enqueue_conversation_memory_summary = lambda *_args, **_kwargs: None
+    thread_context_module.list_thread_messages = lambda *_, **__: []
+    thread_context_module.list_recent_inbound_threads = lambda **_: []
+    try:
+        answer = "MedThink EU failover should use EU hot standby first, with US fallback only during declared regional outage."
+        citation = {
+            "doc_id": "doc-runtime-dr",
+            "chunk_id": "chunk-runtime-dr-1",
+            "source_type": "policy",
+            "title": "MedThink disaster recovery policy",
+            "snippet": "EU hot standby is primary for EU failover.",
+            "score": 0.94,
+        }
+        enterprise_observation = make_typed_observation(
+            observation_type="enterprise_answer_observation",
+            source="enterprise_rag_query",
+            grounding_kind="retrieval",
+            summary="MedThink EU failover uses EU hot standby first.",
+            payload={
+                "communication_role": "grounding_provider",
+                "communication_input_kind": "grounding_bundle",
+                "answer_state": {"answerable": True, "missing_evidence": False, "confidence": 0.91},
+                "canonical_facts": [
+                    {
+                        "fact_id": "fact-runtime-dr",
+                        "fact_type": "policy",
+                        "normalized_fact": answer,
+                        "priority": "high",
+                        "score": 0.94,
+                        "source_fact_ids": ["source-runtime-dr"],
+                    }
+                ],
+                "evidence_manifest": [
+                    {
+                        "doc_id": citation["doc_id"],
+                        "chunk_id": citation["chunk_id"],
+                        "source_type": citation["source_type"],
+                        "title": citation["title"],
+                        "score": citation["score"],
+                    }
+                ],
+                "selected_evidence": [citation],
+            },
+            citations=[citation],
+            confidence=0.91,
+            actor_context=actor_context,
+        )
+        result = {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "request_id": f"request-runtime-brief-{suffix}",
+            "message": "How should MedThink handle EU failover?",
+            "safe_message": "How should MedThink handle EU failover?",
+            "display_message": "How should MedThink handle EU failover?",
+            "answer": answer,
+            "intent": "enterprise_rag_query",
+            "routing_source": "fast_router",
+            "routing_confidence": 0.91,
+            "routing_reason": "Enterprise knowledge question answered with citations.",
+            "candidate_intents": ["enterprise_fact"],
+            "mode_used": "fast_path",
+            "tool_calls": [{"tool_name": "enterprise_rag_query", "success": True, "status": "completed", "result": {}}],
+            "retrieved_evidence": [citation],
+            "needs_clarification": False,
+            "clarification_question": None,
+            "privacy": {},
+            "context_budget": {},
+            "citations": [citation],
+            "memory_context": {},
+            "memory_hits": 0,
+            "merged_memory_hits": 0,
+            "context_sources": ["enterprise_rag"],
+            "workspace_memory_hits": 0,
+            "transcript_hits": 0,
+            "user_model_used": False,
+            "reflection_notes": None,
+            "upload_context": {},
+            "route_mode": "fast",
+            "router_intent": "enterprise_fact",
+            "router_reason": "Enterprise knowledge question answered with citations.",
+            "required_grounding": "tool",
+            "fast_path_used": True,
+            "degraded_from": "none",
+            "planner_type": "fast_router",
+            "task_plan": {},
+            "subtask_results": [],
+            "aggregation_strategy": "fast_path",
+            "partial_failures": [],
+            "react_trace": [],
+            "loop_step_count": 0,
+            "termination_reason": "direct_answer",
+            "pending_confirmation": {},
+            "confirmation_payload": {},
+            "final_answer_source": "fast_enterprise_rag_renderer",
+            "memory_reads": [],
+            "tool_observations": [enterprise_observation],
+            "actor_context": actor_context,
+            "node_latencies_ms": {"total": 1.0},
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+        }
+        turn_id, memory_written = main_module._write_unified_conversation_memory(
+            result,
+            conversation_id,
+            actor_context=actor_context,
+        )
+    finally:
+        main_module._persist_answer_artifact_object = original_persist_answer_artifact
+        main_module.write_dynamic_turn_memory = original_write_dynamic_turn_memory
+        main_module.enqueue_conversation_memory_summary = original_enqueue_summary
+        thread_context_module.list_thread_messages = original_list_thread_messages
+        thread_context_module.list_recent_inbound_threads = original_list_recent_inbound_threads
+
+    brief_observations = [
+        item
+        for item in list(result.get("tool_observations") or [])
+        if str(item.get("observation_type") or "") == COMMUNICATION_BRIEF_SOURCE_KIND
+    ]
+    _assert_true(turn_id, "runtime turn_id")
+    _assert_true(memory_written, "runtime memory_written")
+    _assert_equal(len(brief_observations), 1, "runtime brief observation count")
+    _assert_true(answer in json.dumps(brief_observations[0].get("payload") or {}, ensure_ascii=False), "runtime brief facts")
+
+    assistant_turn = next(
+        turn for turn in reversed(get_turns(conversation_id)) if str(turn.get("role") or "") == "assistant"
+    )
+    debug_payload = dict(assistant_turn.get("debug_payload") or {})
+    _assert_equal(debug_payload.get("primary_work_object", {}).get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "persisted primary kind")
+    _assert_true(
+        any(
+            str(item.get("observation_type") or "") == COMMUNICATION_BRIEF_SOURCE_KIND
+            for item in list(debug_payload.get("tool_observations") or [])
+        ),
+        "persisted debug communication brief",
+    )
+
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email the customer at customer@example.com with the closeout.",
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=None)
+    brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
+    _assert_equal(len(brief_candidates), 1, "collected runtime brief candidate")
+
+    source_resolution = resolve_mail_source_request(
+        message="Please email the customer at customer@example.com with the closeout.",
+        candidates=[
+            {
+                "candidate_id": "mail-thread:incidental",
+                "kind": "mail_thread",
+                "label": "mail thread: unrelated invoice",
+                "content": json.dumps({"thread_id": "incidental", "subject": "Unrelated invoice"}, ensure_ascii=False),
+                "content_type": "application/json",
+            },
+            brief_candidates[0],
+        ],
+        legacy_referential_request=True,
+        explicit_summary=True,
+    )
+    _assert_equal(source_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "brief beats incidental thread")
+    _assert_equal(source_resolution["selected_candidate_ids"], [brief_candidates[0]["candidate_id"]], "runtime brief selected")
+
+    return {
+        "ok": True,
+        "case": "runtime_brief_closeout",
+        "turn_id": turn_id,
+        "primary_work_object": debug_payload.get("primary_work_object", {}).get("kind"),
+        "candidate_count": len(candidates),
+        "source_mode": source_resolution["source_mode"],
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -762,6 +1002,7 @@ def run_retirement() -> dict[str, Any]:
         raise AssertionError(f"retired legacy orchestration carriers remain: {matches}")
 
     import app.orchestration.service as service_module
+    from app.orchestration.final_renderer import fallback_final_answer
 
     original_run_react = service_module.run_react_agent_request
     original_render_final = service_module.render_final_answer
@@ -779,8 +1020,20 @@ def run_retirement() -> dict[str, Any]:
             "typed_recovery_final_renderer",
             "fallback strategy",
         )
+        summary = str(observations[0].get("summary") or "")
+        if "react_controller" in summary or "orchestrate_agent_request" in summary:
+            raise AssertionError("recovery observation summary leaked internal controller names")
+        answer = fallback_final_answer(
+            question=str(kwargs.get("question") or ""),
+            current_goal=str(kwargs.get("current_goal") or ""),
+            observations=observations,
+            working_memory=list(kwargs.get("working_memory") or []),
+            conservative=bool(kwargs.get("conservative")),
+        )
+        if "react_controller" in answer or "orchestrate_agent_request" in answer:
+            raise AssertionError("renderer fallback answer leaked internal controller names")
         return {
-            "answer": "Structured recovery answer.",
+            "answer": answer,
             "token_in": 1,
             "token_out": 2,
             "estimated_cost": 0.0,
@@ -812,6 +1065,11 @@ def run_retirement() -> dict[str, Any]:
     _assert_true(result.get("partial_failures"), "partial_failures")
     _assert_true(result.get("node_latencies_ms", {}).get("total") is not None, "node_latencies_ms.total")
     _assert_true(result.get("answer"), "answer")
+    first_summary = str(list(result.get("tool_observations") or [])[0].get("summary") or "")
+    if "react_controller" in first_summary or "orchestrate_agent_request" in first_summary:
+        raise AssertionError("returned recovery observation summary leaked internal controller names")
+    if "react_controller" in str(result.get("answer") or "") or "orchestrate_agent_request" in str(result.get("answer") or ""):
+        raise AssertionError("returned recovery answer leaked internal controller names")
     if result.get("mode_used") in {"legacy_orchestration"}:
         raise AssertionError("recovery returned retired legacy mode")
     if result.get("final_answer_source") in {"legacy_aggregator"}:
@@ -839,6 +1097,7 @@ def main() -> int:
         "mail_closeout": run_mail_closeout,
         "subordinate_inputs": run_subordinate_inputs,
         "retirement": run_retirement,
+        "runtime_brief_closeout": run_runtime_brief_closeout,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

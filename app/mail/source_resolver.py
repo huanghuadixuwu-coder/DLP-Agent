@@ -129,7 +129,18 @@ def resolve_mail_source_request(
         if item["kind"] in REFERENCE_SOURCE_KINDS
         and item["kind"] not in {COMMUNICATION_BRIEF_SOURCE_KIND, "assistant_last_answer"}
     ]
-    if len(brief_candidates) == 1 and not competing_reference_candidates:
+    anchored_reference = _deterministic_anchor_match(message, competing_reference_candidates)
+    if anchored_reference:
+        return _resolution(
+            selected_candidate_ids=[anchored_reference["candidate_id"]],
+            source_mode=_source_mode_for_kind(str(anchored_reference.get("kind") or "")),
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=float(anchored_reference.get("confidence") or 0.0),
+            reason="Selected the explicit reference candidate matched by request anchors before prior communication briefs.",
+            classifier_source="deterministic_reference_anchor_match",
+        )
+    if len(brief_candidates) == 1:
         return _resolution(
             selected_candidate_ids=[brief_candidates[0]["candidate_id"]],
             source_mode="communication_brief",

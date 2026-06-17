@@ -22,6 +22,7 @@ from redis import Redis
 from app.actor_context import ActorContext, build_actor_context, permission_observation, require_permission
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
+from app.communication.brief_service import assemble_communication_brief_observation
 from app.config import get_settings
 from app.continuation_state import (
     PendingObject,
@@ -2716,6 +2717,169 @@ def _enterprise_renderer_observation_summary(payload: dict[str, Any]) -> str:
     return "已检索企业知识证据并生成结构化事实。"
 
 
+def _observation_kind(observation: dict[str, Any]) -> str:
+    return str(observation.get("observation_type") or observation.get("kind") or "").strip()
+
+
+def _runtime_brief_skip_reason(result: dict[str, Any]) -> str:
+    if bool(result.get("needs_clarification")):
+        return "clarification"
+    if dict(result.get("pending_confirmation") or result.get("confirmation_payload") or {}):
+        return "pending_confirmation"
+    intent = str(result.get("intent") or result.get("router_intent") or "")
+    mode = str(result.get("mode_used") or "")
+    termination = str(result.get("termination_reason") or "")
+    final_source = str(result.get("final_answer_source") or "")
+    structured_values = {intent, mode, termination, final_source}
+    if structured_values & {
+        "action_or_draft",
+        "mail_action",
+        "mail_inbound",
+        "outbound_resolution",
+        "task_queue",
+        "meeting_result",
+        "pending_object_cancelled",
+        "continuation_resolution_required",
+    }:
+        return "action_or_mail_flow"
+    if any(value.startswith("mail_") or value.startswith("inbound_mail") or value.startswith("outbound_mail") for value in structured_values):
+        return "mail_flow"
+    if any(value.startswith("task_") or value.startswith("domain_") or value.startswith("dlp_") for value in structured_values):
+        return "task_flow"
+    task_plan = dict(result.get("task_plan") or {})
+    if task_plan.get("mail_plan") or task_plan.get("pending_mail_draft"):
+        return "mail_plan"
+    for observation in _collect_result_observations(result, task_plan):
+        kind = _observation_kind(observation)
+        if kind in {
+            "mail_status_result",
+            "mail_read_result",
+            "mail_action_plan",
+            "mail_confirmation",
+            "mail_draft",
+            "meeting_result",
+            "continuation_resolution_required",
+            "confirmation_required",
+        }:
+            return "action_or_mail_observation"
+    return ""
+
+
+def _runtime_grounding_observation(result: dict[str, Any]) -> dict[str, Any]:
+    task_plan = dict(result.get("task_plan") or {})
+    for observation in _collect_result_observations(result, task_plan):
+        kind = _observation_kind(observation)
+        if kind == "enterprise_answer_observation":
+            return dict(observation)
+        payload = dict(observation.get("payload") or {})
+        if (
+            str(payload.get("communication_role") or "") == "grounding_provider"
+            or str(payload.get("communication_input_kind") or "") == "grounding_bundle"
+        ):
+            return dict(observation)
+
+    enterprise_payload = dict(result.get("enterprise_answer_observation") or {})
+    if enterprise_payload:
+        return {
+            "observation_type": "enterprise_answer_observation",
+            "source": "enterprise_rag_query",
+            "grounding_kind": "retrieval",
+            "summary": _enterprise_renderer_observation_summary(enterprise_payload),
+            "payload": enterprise_payload,
+            "citations": list(enterprise_payload.get("selected_evidence") or enterprise_payload.get("citations_brief") or []),
+            "confidence": float(dict(enterprise_payload.get("answer_state") or {}).get("confidence") or 0.0),
+        }
+
+    citations = [dict(item) for item in list(result.get("citations") or []) if isinstance(item, dict)]
+    retrieved_evidence = [dict(item) for item in list(result.get("retrieved_evidence") or []) if isinstance(item, dict)]
+    if not citations and not retrieved_evidence:
+        return {}
+    evidence_refs = citations or retrieved_evidence
+    answer_summary = compact_text(str(result.get("answer") or ""), 320).strip()
+    return {
+        "observation_type": "enterprise_answer_observation",
+        "source": "runtime_grounded_answer",
+        "grounding_kind": "retrieval",
+        "summary": answer_summary,
+        "payload": {
+            "communication_role": "grounding_provider",
+            "communication_input_kind": "grounding_bundle",
+            "answer_state": {
+                "answerable": True,
+                "missing_evidence": False,
+                "confidence": float(result.get("routing_confidence") or 0.72),
+                "final_answer_source": str(result.get("final_answer_source") or ""),
+            },
+            "canonical_facts": [
+                {
+                    "fact_id": "answer_summary",
+                    "fact_type": "runtime_answer",
+                    "normalized_fact": answer_summary,
+                    "priority": "high",
+                    "score": float(result.get("routing_confidence") or 0.72),
+                    "source_fact_ids": [],
+                }
+            ]
+            if answer_summary
+            else [],
+            "evidence_manifest": [
+                {
+                    "doc_id": str(item.get("doc_id") or item.get("id") or ""),
+                    "chunk_id": str(item.get("chunk_id") or ""),
+                    "source_type": str(item.get("source_type") or item.get("kind") or ""),
+                    "title": str(item.get("title") or item.get("source_title") or ""),
+                    "score": float(item.get("score") or 0.0),
+                }
+                for item in evidence_refs[:8]
+            ],
+            "selected_evidence": evidence_refs[:8],
+        },
+        "citations": citations[:8],
+        "confidence": float(result.get("routing_confidence") or 0.72),
+    }
+
+
+def _append_runtime_communication_brief(
+    result: dict[str, Any],
+    conversation_id: str,
+    actor_context: dict[str, Any] | None = None,
+) -> None:
+    task_plan = dict(result.get("task_plan") or {})
+    observations = _collect_result_observations(result, task_plan)
+    if any(_observation_kind(item) == COMMUNICATION_BRIEF_SOURCE_KIND for item in observations):
+        return
+    if _runtime_brief_skip_reason(result):
+        return
+    grounding_observation = _runtime_grounding_observation(result)
+    if not grounding_observation:
+        return
+    source_observation_ids = []
+    for item in [grounding_observation, *observations]:
+        payload = dict(item.get("payload") or {})
+        provenance = dict(item.get("provenance") or {})
+        source_id = (
+            str(provenance.get("correlation_id") or "")
+            or str(payload.get("correlation_id") or "")
+            or str(payload.get("brief_id") or "")
+            or str(item.get("source") or "")
+        )
+        if source_id and source_id not in source_observation_ids:
+            source_observation_ids.append(source_id)
+    try:
+        _, observation = assemble_communication_brief_observation(
+            employee_goal=str(result.get("display_message") or result.get("message") or ""),
+            conversation_id=conversation_id,
+            grounding_observation=grounding_observation,
+            memory_context=dict(result.get("memory_context") or {}),
+            actor_context=dict(actor_context or result.get("actor_context") or {}),
+            source_observation_ids=source_observation_ids[:8],
+        )
+    except Exception as exc:  # pragma: no cover - closeout should not block answer persistence
+        logger.warning("Communication brief closeout skipped: %s", exc)
+        return
+    result.setdefault("tool_observations", []).append(asdict(observation))
+
+
 def _build_meeting_result_response(
     *,
     session_id: str,
@@ -5153,6 +5317,7 @@ def _write_unified_conversation_memory(
     if not answer:
         return None, False
 
+    _append_runtime_communication_brief(result, conversation_id, actor_context=actor_context)
     question = str(result.get("display_message") or result.get("message", ""))
     safe_question = str(result.get("display_message") or result.get("safe_message") or question)
     answer_summary = compact_text(answer, 1200)

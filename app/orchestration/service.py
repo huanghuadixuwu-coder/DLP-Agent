@@ -226,6 +226,7 @@ def _recover_react_controller_failure(
         severity="high",
         retryable=True,
     )
+    failure_observation["summary"] = "The agent orchestration path failed; a recovery response was returned."
     failure_observation["success"] = False
     observations = [failure_observation]
     rendered = render_final_answer(
