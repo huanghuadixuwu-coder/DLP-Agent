@@ -44,6 +44,16 @@ def _decode_json(value: Any, default: Any) -> Any:
     return default if value is None else value
 
 
+def _decode_json_dict(value: Any) -> dict[str, Any]:
+    decoded = _decode_json(value, {})
+    return dict(decoded) if isinstance(decoded, dict) else {}
+
+
+def _decode_json_list(value: Any) -> list[Any]:
+    decoded = _decode_json(value, [])
+    return list(decoded) if isinstance(decoded, list) else []
+
+
 def _brief_payload(brief: CommunicationBrief | dict[str, Any]) -> dict[str, Any]:
     if isinstance(brief, CommunicationBrief):
         return asdict(brief)
@@ -66,10 +76,10 @@ def _decode_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     item = dict(row)
     item["version"] = int(item.get("version") or 1)
-    item["brief"] = dict(_decode_json(item.pop("brief_json", "{}"), {}))
-    item["actor_context"] = dict(_decode_json(item.pop("actor_context_json", "{}"), {}))
-    item["grounding_refs"] = list(_decode_json(item.pop("grounding_refs_json", "[]"), []))
-    item["source_observation_ids"] = list(_decode_json(item.pop("source_observation_ids_json", "[]"), []))
+    item["brief"] = _decode_json_dict(item.pop("brief_json", "{}"))
+    item["actor_context"] = _decode_json_dict(item.pop("actor_context_json", "{}"))
+    item["grounding_refs"] = _decode_json_list(item.pop("grounding_refs_json", "[]"))
+    item["source_observation_ids"] = _decode_json_list(item.pop("source_observation_ids_json", "[]"))
     return item
 
 
@@ -244,14 +254,24 @@ def refresh_brief_for_thread(
     actor = actor_from_mapping(actor_context or {}, conversation_id=conversation_id)
     latest = get_latest_brief_for_thread(thread_id, actor_context=actor.to_dict())
     latest_brief = dict((latest or {}).get("brief") or {})
+    resolved_grounding_refs = (
+        list(latest_brief.get("grounding_refs") or [])
+        if grounding_refs is None
+        else list(grounding_refs)
+    )
+    resolved_source_observation_ids = (
+        list(latest_brief.get("source_observation_ids") or [])
+        if source_observation_ids is None
+        else list(source_observation_ids)
+    )
     brief = assemble_communication_brief(
         brief_id=str(latest_brief.get("brief_id") or ""),
         employee_goal=employee_goal,
         conversation_id=conversation_id or str(latest_brief.get("conversation_id") or ""),
         thread_id=thread_id,
-        grounding_refs=list(grounding_refs or latest_brief.get("grounding_refs") or []),
+        grounding_refs=resolved_grounding_refs,
         actor_context=actor.to_dict(),
-        source_observation_ids=list(source_observation_ids or latest_brief.get("source_observation_ids") or []),
+        source_observation_ids=resolved_source_observation_ids,
     )
     return upsert_communication_brief(
         brief,

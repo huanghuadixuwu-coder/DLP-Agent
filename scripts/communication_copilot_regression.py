@@ -365,13 +365,28 @@ def run_brief_store() -> dict[str, Any]:
     _assert_equal(actor_b_latest, None, "different actor cannot read latest brief")
     _assert_equal(actor_b_direct, None, "different actor cannot read direct brief")
 
+    cleared = refresh_brief_for_thread(
+        thread_id,
+        actor_context=actor_a,
+        employee_goal="Prepare renewal reply without current grounding",
+        grounding_refs=[],
+        source_observation_ids=[],
+        refresh_reason="clear_grounding",
+    )
+    _assert_equal(cleared["brief"]["brief_id"], brief.brief_id, "cleared stable brief id")
+    _assert_equal(cleared["brief"]["grounding_refs"], [], "explicit empty grounding refs clear stale refs")
+    _assert_equal(cleared["brief"]["source_observation_ids"], [], "explicit empty source ids clear stale ids")
+    _assert_equal(cleared["grounding_refs"], [], "stored empty grounding refs")
+    _assert_equal(cleared["source_observation_ids"], [], "stored empty source ids")
+    _assert_true("grounding_required" in cleared["brief"]["open_questions"], "cleared grounding requires fresh grounding")
+
     return {
         "ok": True,
         "case": "brief_store",
-        "brief_id": latest["brief"]["brief_id"],
+        "brief_id": cleared["brief"]["brief_id"],
         "thread_id": thread_id,
-        "version": latest["version"],
-        "refresh_reason": latest["refresh_reason"],
+        "version": cleared["version"],
+        "refresh_reason": cleared["refresh_reason"],
     }
 
 
@@ -1885,8 +1900,9 @@ def run_workspace_flow() -> dict[str, Any]:
 
 
 def run_runtime_brief_closeout() -> dict[str, Any]:
-    import app.communication.thread_context as thread_context_module
     import app.main as main_module
+    from app.communication.brief_store import get_latest_brief_for_thread
+    from app.communication.thread_store import set_active_communication_thread
     from app.conversation_store import create_conversation, get_turns
     from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
     from app.mail.source_resolver import resolve_mail_source_request
@@ -1903,18 +1919,33 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         "session_id": session_id,
         "conversation_id": conversation_id,
     }
+    other_actor_context = {
+        "tenant_id": actor_context["tenant_id"],
+        "user_id": f"other-user-runtime-{suffix}",
+        "workspace_id": actor_context["workspace_id"],
+    }
+    thread_id = f"thread-runtime-brief-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-runtime-brief-1-{suffix}",
+        uid=f"uid-runtime-brief-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Runtime brief closeout",
+        received_at="2026-06-17T09:00:00+00:00",
+        summary="Customer asked how MedThink should handle EU failover.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "runtime active thread")
     create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
 
     original_persist_answer_artifact = main_module._persist_answer_artifact_object
     original_write_dynamic_turn_memory = main_module.write_dynamic_turn_memory
     original_enqueue_summary = main_module.enqueue_conversation_memory_summary
-    original_list_thread_messages = thread_context_module.list_thread_messages
-    original_list_recent_inbound_threads = thread_context_module.list_recent_inbound_threads
     main_module._persist_answer_artifact_object = lambda **_: {}
     main_module.write_dynamic_turn_memory = lambda **_: {"memory_scope": "session", "identifiers": {}}
     main_module.enqueue_conversation_memory_summary = lambda *_args, **_kwargs: None
-    thread_context_module.list_thread_messages = lambda *_, **__: []
-    thread_context_module.list_recent_inbound_threads = lambda **_: []
     try:
         answer = "MedThink EU failover should use EU hot standby first, with US fallback only during declared regional outage."
         citation = {
@@ -2030,8 +2061,6 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         main_module._persist_answer_artifact_object = original_persist_answer_artifact
         main_module.write_dynamic_turn_memory = original_write_dynamic_turn_memory
         main_module.enqueue_conversation_memory_summary = original_enqueue_summary
-        thread_context_module.list_thread_messages = original_list_thread_messages
-        thread_context_module.list_recent_inbound_threads = original_list_recent_inbound_threads
 
     brief_observations = [
         item
@@ -2042,6 +2071,11 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
     _assert_true(memory_written, "runtime memory_written")
     _assert_equal(len(brief_observations), 1, "runtime brief observation count")
     _assert_true(answer in json.dumps(brief_observations[0].get("payload") or {}, ensure_ascii=False), "runtime brief facts")
+    _assert_equal(
+        dict(brief_observations[0].get("payload") or {}).get("thread_ref", {}).get("thread_id"),
+        thread_id,
+        "runtime brief thread id",
+    )
     _assert_equal(
         response_workspace.get("primary_work_object", {}).get("kind"),
         COMMUNICATION_BRIEF_SOURCE_KIND,
@@ -2066,14 +2100,31 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         "persisted debug communication brief",
     )
 
+    latest_persisted_brief = get_latest_brief_for_thread(thread_id, actor_context=actor_context)
+    other_actor_brief = get_latest_brief_for_thread(thread_id, actor_context=other_actor_context)
+    _assert_true(latest_persisted_brief, "runtime persisted latest brief")
+    _assert_equal(latest_persisted_brief["thread_id"], thread_id, "runtime persisted thread id")
+    _assert_equal(latest_persisted_brief["refresh_reason"], "runtime_closeout", "runtime persisted refresh reason")
+    _assert_equal(latest_persisted_brief["brief"]["brief_id"], brief_observations[0]["payload"]["brief_id"], "runtime persisted brief id")
+    _assert_equal(other_actor_brief, None, "runtime persisted brief actor isolation")
+
     payload = UnifiedAgentRequest(
         session_id=session_id,
         conversation_id=conversation_id,
         message="Please email the customer at customer@example.com with the closeout.",
     )
-    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=None)
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
     brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
     _assert_equal(len(brief_candidates), 1, "collected runtime brief candidate")
+    _assert_equal(brief_candidates[0].get("source_turn_id"), "", "runtime brief candidate came from store")
+    _assert_equal(
+        brief_candidates[0].get("candidate_id"),
+        f"communication-brief:{latest_persisted_brief['brief']['brief_id']}",
+        "store candidate id",
+    )
+    candidate_content = str(brief_candidates[0].get("content") or "")
+    _assert_true(latest_persisted_brief["brief"]["brief_id"] in candidate_content, "store candidate brief id")
+    _assert_true("communication_briefs" in candidate_content, "store candidate persistence source")
 
     source_resolution = resolve_mail_source_request(
         message="Please email the customer at customer@example.com with the closeout.",
@@ -2100,6 +2151,7 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         "primary_work_object": debug_payload.get("primary_work_object", {}).get("kind"),
         "response_primary_work_object": response_workspace.get("primary_work_object", {}).get("kind"),
         "candidate_count": len(candidates),
+        "persisted_brief_id": latest_persisted_brief["brief"]["brief_id"],
         "source_mode": source_resolution["source_mode"],
     }
 
