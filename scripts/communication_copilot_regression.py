@@ -93,7 +93,14 @@ def run_contracts_import() -> dict[str, Any]:
     _assert_equal(thread_observation.actor_context, actor_context, "thread actor_context")
 
     _assert_equal(brief_observation.observation_type, "communication_brief", "brief observation_type")
-    _assert_equal(brief_observation.payload, asdict(brief), "brief payload")
+    expected_brief_payload = {
+        **asdict(brief),
+        "brief_persistence_source": "assembled",
+        "brief_version": 1,
+        "thread_id": thread_ref.thread_id,
+        "refresh_reason": "",
+    }
+    _assert_equal(brief_observation.payload, expected_brief_payload, "brief payload")
     _assert_equal(brief_observation.payload["thread_ref"]["thread_id"], thread_ref.thread_id, "brief thread_ref")
     _assert_equal(brief_observation.confidence, brief.confidence, "brief confidence")
     _assert_equal(brief_observation.actor_context, actor_context, "brief actor_context")
@@ -219,6 +226,10 @@ def run_brief_assembly() -> dict[str, Any]:
     _assert_equal(brief.recommended_next_action, "draft_with_grounding", "recommended_next_action")
     _assert_equal(observation.observation_type, "communication_brief", "observation_type")
     _assert_equal(payload["thread_ref"]["thread_id"], brief.thread_ref.thread_id, "payload thread_ref")
+    _assert_equal(payload["brief_persistence_source"], "assembled", "payload brief_persistence_source")
+    _assert_equal(payload["brief_version"], 1, "payload brief_version")
+    _assert_equal(payload["thread_id"], brief.thread_ref.thread_id, "payload thread_id")
+    _assert_equal(payload["refresh_reason"], "", "payload refresh_reason")
     _assert_equal(payload["grounding_refs"][0]["doc_id"], "doc_pricing", "payload grounding_refs")
     _assert_equal(observation.actor_context, actor_context, "observation actor_context")
     _assert_equal(observation.missing_fields, [], "observation missing_fields")
@@ -252,6 +263,115 @@ def run_brief_assembly() -> dict[str, Any]:
         "thread_id": brief.thread_ref.thread_id,
         "grounding_refs": len(brief.grounding_refs),
         "empty_open_questions": empty_brief.open_questions,
+    }
+
+
+def run_brief_store() -> dict[str, Any]:
+    from app.communication.brief_store import (
+        get_communication_brief,
+        get_latest_brief_for_thread,
+        refresh_brief_for_thread,
+        upsert_communication_brief,
+    )
+    from app.communication.brief_service import assemble_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+
+    suffix = uuid4().hex[:8]
+    actor_a = {
+        "tenant_id": f"tenant-brief-store-{suffix}",
+        "user_id": "employee-a",
+        "workspace_id": "workspace-a",
+    }
+    actor_b = {
+        "tenant_id": f"tenant-brief-store-{suffix}",
+        "user_id": "employee-b",
+        "workspace_id": "workspace-a",
+    }
+    thread_id = f"thread-brief-store-{suffix}"
+
+    _seed_thread_store_message(
+        actor_context=actor_a,
+        message_id=f"msg-brief-store-1-{suffix}",
+        uid=f"uid-brief-store-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Brief store renewal",
+        received_at="2026-06-17T08:00:00+00:00",
+        summary="Customer asked whether renewal pricing can be confirmed this week.",
+    )
+    active_thread = set_active_communication_thread(thread_id, actor_context=actor_a)
+    _assert_true(active_thread, "active thread for actor A")
+
+    grounding_refs = [
+        {
+            "doc_id": "doc-renewal-policy",
+            "chunk_id": "chunk-renewal-policy-1",
+            "source_type": "policy",
+            "title": "Renewal pricing policy",
+            "score": 0.93,
+        }
+    ]
+    brief = assemble_communication_brief(
+        employee_goal="Prepare renewal reply",
+        conversation_id=f"conversation-brief-store-{suffix}",
+        thread_id=thread_id,
+        grounding_refs=grounding_refs,
+        actor_context=actor_a,
+        source_observation_ids=["obs-grounding-renewal"],
+    )
+    stored = upsert_communication_brief(
+        brief,
+        actor_context=actor_a,
+        refresh_reason="initial_test_persist",
+    )
+    _assert_equal(stored["brief"]["brief_id"], brief.brief_id, "stored brief id")
+    _assert_equal(stored["thread_id"], thread_id, "stored thread id")
+    _assert_equal(stored["version"], 1, "initial version")
+    if "RAW_BODY_SHOULD_NOT_BE_PROJECTED" in json.dumps(stored, ensure_ascii=False):
+        raise AssertionError("brief store leaked raw message body")
+
+    _seed_thread_store_message(
+        actor_context=actor_a,
+        message_id=f"msg-brief-store-2-{suffix}",
+        uid=f"uid-brief-store-2-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Re: Brief store renewal",
+        received_at="2026-06-17T08:10:00+00:00",
+        summary="Customer added that procurement needs the answer before Friday.",
+    )
+    refreshed = refresh_brief_for_thread(
+        thread_id,
+        actor_context=actor_a,
+        employee_goal="Prepare renewal reply with procurement timing",
+        grounding_refs=grounding_refs,
+        source_observation_ids=["obs-grounding-renewal"],
+        refresh_reason="new_message",
+    )
+    latest = get_latest_brief_for_thread(thread_id, actor_context=actor_a)
+    actor_b_latest = get_latest_brief_for_thread(thread_id, actor_context=actor_b)
+    actor_b_direct = get_communication_brief(brief.brief_id, actor_context=actor_b)
+
+    _assert_equal(refreshed["brief_id"], brief.brief_id, "refreshed stable brief id")
+    _assert_equal(latest["brief"]["brief_id"], brief.brief_id, "latest stable brief id")
+    _assert_true(latest["version"] >= 2, "latest version incremented")
+    _assert_equal(latest["refresh_reason"], "new_message", "latest refresh reason")
+    _assert_equal(latest["brief"]["thread_ref"]["last_message_at"], "2026-06-17T08:10:00+00:00", "latest thread timestamp")
+    _assert_true("procurement" in latest["brief"]["thread_ref"]["latest_summary"].lower(), "latest summary refreshed")
+    _assert_equal(actor_b_latest, None, "different actor cannot read latest brief")
+    _assert_equal(actor_b_direct, None, "different actor cannot read direct brief")
+
+    return {
+        "ok": True,
+        "case": "brief_store",
+        "brief_id": latest["brief"]["brief_id"],
+        "thread_id": thread_id,
+        "version": latest["version"],
+        "refresh_reason": latest["refresh_reason"],
     }
 
 
@@ -2096,6 +2216,7 @@ def main() -> int:
         "workspace_flow": run_workspace_flow,
         "contracts_import": run_contracts_import,
         "brief_assembly": run_brief_assembly,
+        "brief_store": run_brief_store,
         "thread_store": run_thread_store,
         "mail_closeout": run_mail_closeout,
         "subordinate_inputs": run_subordinate_inputs,

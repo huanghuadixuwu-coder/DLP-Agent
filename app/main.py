@@ -23,6 +23,7 @@ from app.actor_context import ActorContext, build_actor_context, permission_obse
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.communication.brief_service import assemble_communication_brief_observation
+from app.communication.brief_store import get_latest_brief_for_thread, init_communication_brief_store
 from app.communication.thread_store import (
     get_active_communication_thread,
     get_communication_thread,
@@ -439,6 +440,7 @@ async def lifespan(_: FastAPI):
     init_auth_store()
     init_inbound_mail_store()
     init_communication_thread_store()
+    init_communication_brief_store()
     init_workspace_memory_index()
     init_hermes_dynamic_memory_store()
     try:
@@ -790,6 +792,9 @@ def _collect_outbound_candidates(
                 "recommended_next_action": str(brief_payload.get("recommended_next_action") or ""),
                 "source_observation_ids": list(brief_payload.get("source_observation_ids") or []),
                 "confidence": float(brief_payload.get("confidence") or 0.0),
+                "brief_persistence_source": str(brief_payload.get("brief_persistence_source") or ""),
+                "brief_version": int(brief_payload.get("brief_version") or 1),
+                "refresh_reason": str(brief_payload.get("refresh_reason") or ""),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -950,6 +955,31 @@ def _collect_outbound_candidates(
                     candidate_id=f"mail-thread:{thread_id}",
                     content=_mail_thread_candidate_content(thread),
                     label=f"mail thread: {subject}",
+                    content_type="application/json",
+                )
+
+    if actor_context:
+        with suppress(Exception):
+            active_thread = get_active_communication_thread(actor_context=actor_context)
+            active_thread_id = str(dict(active_thread or {}).get("thread_id") or "").strip()
+            latest_brief = get_latest_brief_for_thread(active_thread_id, actor_context=actor_context) if active_thread_id else None
+            brief_payload = dict(dict(latest_brief or {}).get("brief") or {})
+            brief_id = str(brief_payload.get("brief_id") or "").strip()
+            if brief_id:
+                thread_ref = dict(brief_payload.get("thread_ref") or {})
+                label_subject = str(thread_ref.get("subject") or brief_payload.get("employee_goal") or "communication brief")
+                _append_candidate(
+                    kind=COMMUNICATION_BRIEF_SOURCE_KIND,
+                    candidate_id=f"communication-brief:{brief_id}",
+                    content=_communication_brief_candidate_content(
+                        {
+                            **brief_payload,
+                            "brief_persistence_source": str(dict(latest_brief or {}).get("persistence_source") or "communication_briefs"),
+                            "brief_version": int(dict(latest_brief or {}).get("version") or 1),
+                            "refresh_reason": str(dict(latest_brief or {}).get("refresh_reason") or ""),
+                        }
+                    ),
+                    label=f"communication brief: {compact_text(label_subject, 72)}",
                     content_type="application/json",
                 )
 
@@ -2981,6 +3011,8 @@ def _append_runtime_communication_brief(
             memory_context=dict(result.get("memory_context") or {}),
             actor_context=dict(actor_context or result.get("actor_context") or {}),
             source_observation_ids=source_observation_ids[:8],
+            persist_snapshot=True,
+            refresh_reason="runtime_closeout",
         )
     except Exception as exc:  # pragma: no cover - closeout should not block answer persistence
         logger.warning("Communication brief closeout skipped: %s", exc)

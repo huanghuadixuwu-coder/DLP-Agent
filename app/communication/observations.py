@@ -42,8 +42,14 @@ def build_communication_brief_observation(
     status: str = "completed",
     source: str = DEFAULT_SOURCE,
     provenance: dict[str, Any] | None = None,
+    persistence_metadata: dict[str, Any] | None = None,
 ) -> TypedObservation:
     payload = asdict(brief)
+    metadata = dict(persistence_metadata or {})
+    payload["brief_persistence_source"] = str(metadata.get("brief_persistence_source") or "assembled")
+    payload["brief_version"] = int(metadata.get("brief_version") or 1)
+    payload["thread_id"] = str(metadata.get("thread_id") or brief.thread_ref.thread_id)
+    payload["refresh_reason"] = str(metadata.get("refresh_reason") or "")
     return TypedObservation(
         observation_type="communication_brief",
         status=status,

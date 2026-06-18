@@ -7,7 +7,7 @@ from app.communication.thread_context import (
     CommunicationThreadContext,
     resolve_communication_thread_context,
 )
-from app.communication.types import CommunicationBrief
+from app.communication.types import CommunicationBrief, new_communication_id
 from app.orchestration.types import TypedObservation
 
 
@@ -135,10 +135,12 @@ def _recommended_next_action(
 
 def assemble_communication_brief(
     *,
+    brief_id: str = "",
     employee_goal: str,
     conversation_id: str = "",
     thread_context: CommunicationThreadContext | None = None,
     thread_id: str = "",
+    grounding_refs: list[dict[str, Any]] | None = None,
     grounding_observation: Any = None,
     memory_context: dict[str, Any] | None = None,
     actor_context: dict[str, Any] | None = None,
@@ -146,7 +148,7 @@ def assemble_communication_brief(
 ) -> CommunicationBrief:
     actor = dict(actor_context or {})
     resolved_thread = thread_context or resolve_communication_thread_context(thread_id=thread_id, actor_context=actor)
-    grounding_refs = extract_grounding_refs(grounding_observation)
+    resolved_grounding_refs = list(grounding_refs or extract_grounding_refs(grounding_observation))
     must_include = _dedupe_strings(
         [
             *_must_include_from_grounding(grounding_observation),
@@ -158,12 +160,12 @@ def assemble_communication_brief(
     open_questions = _dedupe_strings(
         [
             *resolved_thread.open_questions,
-            *(["grounding_required"] if not grounding_refs else []),
+            *(["grounding_required"] if not resolved_grounding_refs else []),
         ],
         limit=8,
     )
     confidence_inputs = [resolved_thread.confidence]
-    if grounding_refs:
+    if resolved_grounding_refs:
         confidence_inputs.append(_grounding_confidence(grounding_observation) or 0.5)
     if memory_context and int(dict(memory_context).get("memory_hits") or 0) > 0:
         confidence_inputs.append(0.65)
@@ -172,17 +174,18 @@ def assemble_communication_brief(
         confidence = min(confidence, 0.72)
 
     return CommunicationBrief(
+        brief_id=brief_id or new_communication_id("comm_brief"),
         conversation_id=conversation_id,
         thread_ref=resolved_thread.thread_ref,
         employee_goal=_bounded_text(employee_goal, 500),
         customer_context_summary=_summarize_thread_context(resolved_thread),
-        grounding_refs=grounding_refs,
+        grounding_refs=resolved_grounding_refs,
         must_include=must_include,
         must_avoid=must_avoid,
         open_questions=open_questions,
         recommended_next_action=_recommended_next_action(
             thread_context=resolved_thread,
-            grounding_refs=grounding_refs,
+            grounding_refs=resolved_grounding_refs,
         ),
         source_observation_ids=list(source_observation_ids or []),
         confidence=confidence,
@@ -191,7 +194,29 @@ def assemble_communication_brief(
 
 
 def assemble_communication_brief_observation(
+    persist_snapshot: bool = False,
+    refresh_reason: str = "assembly",
     **kwargs: Any,
 ) -> tuple[CommunicationBrief, TypedObservation]:
     brief = assemble_communication_brief(**kwargs)
-    return brief, build_communication_brief_observation(brief)
+    persistence_metadata: dict[str, Any] = {
+        "brief_persistence_source": "assembled",
+        "brief_version": 1,
+        "thread_id": brief.thread_ref.thread_id,
+        "refresh_reason": "",
+    }
+    if persist_snapshot and brief.thread_ref.thread_id:
+        from app.communication.brief_store import upsert_communication_brief
+
+        stored = upsert_communication_brief(
+            brief,
+            actor_context=brief.actor_context,
+            refresh_reason=refresh_reason,
+        )
+        persistence_metadata = {
+            "brief_persistence_source": str(stored.get("persistence_source") or "communication_briefs"),
+            "brief_version": int(stored.get("version") or 1),
+            "thread_id": str(stored.get("thread_id") or brief.thread_ref.thread_id),
+            "refresh_reason": str(stored.get("refresh_reason") or refresh_reason),
+        }
+    return brief, build_communication_brief_observation(brief, persistence_metadata=persistence_metadata)
