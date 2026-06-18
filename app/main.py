@@ -1060,6 +1060,183 @@ def _contains_inbound_mail_candidates(candidates: list[dict[str, Any]] | None) -
     return any(str(item.get("kind") or "") == "mail_thread" for item in list(candidates or []))
 
 
+def _looks_like_contextual_communication_request(message: str) -> bool:
+    text = str(message or "").strip()
+    lowered = text.lower()
+    if _looks_like_contextual_outbound_request(text) or looks_like_mail_action_request(text):
+        return True
+    markers = (
+        "active thread",
+        "customer thread",
+        "communication thread",
+        "latest brief",
+        "brief",
+        "reply draft",
+        "draft a reply",
+        "customer",
+        "thread",
+        "reply",
+        "email",
+        "mail",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _communication_thread_payload(thread: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "thread_id": str(thread.get("thread_id") or ""),
+        "source": str(thread.get("source") or ""),
+        "subject": str(thread.get("subject") or ""),
+        "participants": list(thread.get("participants") or []),
+        "last_message_at": str(thread.get("last_message_at") or ""),
+        "status": str(thread.get("status") or ""),
+        "source_message_ids": list(thread.get("source_message_ids") or []),
+        "latest_summary": str(thread.get("latest_summary") or ""),
+        "risk_hint": str(thread.get("risk_hint") or ""),
+        "updated_at": str(thread.get("updated_at") or ""),
+    }
+
+
+def _resolve_agent_chat_context(
+    payload: UnifiedAgentRequest,
+    *,
+    conversation_id: str,
+    actor_context: dict[str, Any],
+) -> dict[str, Any]:
+    requested_thread_id = str(getattr(payload, "thread_id", "") or "").strip()
+    global_mode = bool(getattr(payload, "global_mode", False))
+    provenance_base = {
+        "route": "/agent/chat",
+        "conversation_id": conversation_id,
+        "requested_thread_id": requested_thread_id,
+    }
+    if global_mode:
+        observation = make_typed_observation(
+            observation_type="global_entry",
+            source="agent_chat_context_resolver",
+            grounding_kind="state",
+            summary="The request explicitly entered global ask mode.",
+            payload={"global_mode": True, "thread_id": "", "brief_id": ""},
+            provenance={**provenance_base, "source": "request_payload"},
+            confidence=1.0,
+            actor_context=actor_context,
+        )
+        return {
+            "global_mode": True,
+            "thread": {},
+            "brief": {},
+            "observations": [observation],
+            "context": {"global_mode": True, "thread_id": "", "brief_id": ""},
+        }
+
+    thread: dict[str, Any] | None = None
+    resolution_source = "active_thread_store"
+    if requested_thread_id:
+        thread = set_active_communication_thread(requested_thread_id, actor_context=actor_context)
+        resolution_source = "request_thread_id"
+        if thread is None:
+            thread = get_communication_thread(requested_thread_id, actor_context=actor_context, refresh=False)
+    else:
+        thread = get_active_communication_thread(actor_context=actor_context)
+
+    observations: list[dict[str, Any]] = []
+    context: dict[str, Any] = {"global_mode": False}
+    if thread:
+        thread_payload = _communication_thread_payload(dict(thread))
+        context["thread_id"] = thread_payload["thread_id"]
+        context["active_thread"] = thread_payload
+        observations.append(
+            make_typed_observation(
+                observation_type="active_communication_thread",
+                source="communication_copilot",
+                grounding_kind="state",
+                summary="Resolved the active communication thread for this chat turn.",
+                payload=thread_payload,
+                provenance={**provenance_base, "source": resolution_source},
+                confidence=1.0,
+                actor_context=actor_context,
+            )
+        )
+        latest_brief = get_latest_brief_for_thread(thread_payload["thread_id"], actor_context=actor_context)
+        brief_payload = dict(dict(latest_brief or {}).get("brief") or {})
+        brief_id = str(brief_payload.get("brief_id") or "").strip()
+        if brief_id:
+            context["brief_id"] = brief_id
+            context["latest_brief"] = brief_payload
+            observations.append(
+                make_typed_observation(
+                    observation_type=COMMUNICATION_BRIEF_SOURCE_KIND,
+                    source="communication_copilot",
+                    grounding_kind="state",
+                    summary="Resolved the latest communication brief for the active thread.",
+                    payload={
+                        **brief_payload,
+                        "brief_persistence_source": str(dict(latest_brief or {}).get("persistence_source") or "communication_briefs"),
+                        "brief_version": int(dict(latest_brief or {}).get("version") or 1),
+                        "refresh_reason": str(dict(latest_brief or {}).get("refresh_reason") or ""),
+                    },
+                    provenance={**provenance_base, "source": "communication_brief_store"},
+                    confidence=float(brief_payload.get("confidence") or 0.86),
+                    actor_context=actor_context,
+                )
+            )
+    elif requested_thread_id or _looks_like_contextual_communication_request(payload.message):
+        observations.append(
+            make_typed_observation(
+                observation_type="active_object_resolution_failed",
+                source="agent_chat_context_resolver",
+                status="failed",
+                grounding_kind="state",
+                summary="No active communication thread could be resolved for this contextual chat turn.",
+                payload={
+                    "requested_thread_id": requested_thread_id,
+                    "active_thread_found": False,
+                    "reason": "requested_thread_not_found" if requested_thread_id else "no_active_thread",
+                },
+                provenance={**provenance_base, "source": resolution_source},
+                confidence=1.0,
+                actor_context=actor_context,
+                success=False,
+            )
+        )
+        context["resolution_failed"] = True
+
+    return {
+        "global_mode": False,
+        "thread": dict(thread or {}),
+        "brief": dict(context.get("latest_brief") or {}),
+        "observations": observations,
+        "context": context,
+    }
+
+
+def _prepend_observations_once(
+    existing: list[dict[str, Any]] | None,
+    additions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    result = [dict(item) for item in list(existing or []) if isinstance(item, dict)]
+    seen = {
+        (
+            str(item.get("observation_type") or ""),
+            str(dict(item.get("payload") or {}).get("thread_id") or ""),
+            str(dict(item.get("payload") or {}).get("brief_id") or ""),
+        )
+        for item in result
+    }
+    prefix: list[dict[str, Any]] = []
+    for item in [dict(value) for value in list(additions or []) if isinstance(value, dict)]:
+        key = (
+            str(item.get("observation_type") or ""),
+            str(dict(item.get("payload") or {}).get("thread_id") or ""),
+            str(dict(item.get("payload") or {}).get("brief_id") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        prefix.append(item)
+    return [*prefix, *result]
+
+
 
 def _task_answer_text(task: dict[str, Any]) -> str:
     status = str(task.get("status", ""))
@@ -6650,8 +6827,20 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     actor_context = actor.to_dict()
     actor_context = _agent_chat_mark_mail_read_if_authorized(request, actor, actor_context)
     continuation_state_snapshot: dict[str, Any] = {}
+    agent_chat_context_snapshot: dict[str, Any] = {}
+    agent_chat_context_observations: list[dict[str, Any]] = []
 
     def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
+        if agent_chat_context_observations:
+            response.tool_observations = _prepend_observations_once(
+                list(response.tool_observations or []),
+                agent_chat_context_observations,
+            )
+            response.task_plan = {
+                **dict(response.task_plan or {}),
+                "tool_observations": response.tool_observations,
+                "agent_chat_context": dict(agent_chat_context_snapshot),
+            }
         _persist_confirmation_object(
             session_id=payload.session_id,
             conversation_id=conversation_id,
@@ -6687,6 +6876,22 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     outbound_message = _build_outbound_message(payload.message, payload.uploaded_text, payload.uploaded_filename)
     display_message = _build_display_message(payload.message, payload.uploaded_filename, payload.source_parse_status)
     upload_context, recalled_upload = _resolve_upload_context(payload, conversation_id, actor_context)
+    resolved_agent_chat_context = _resolve_agent_chat_context(
+        payload,
+        conversation_id=conversation_id,
+        actor_context=actor_context,
+    )
+    agent_chat_context_snapshot = dict(resolved_agent_chat_context.get("context") or {})
+    agent_chat_context_observations = [
+        dict(item)
+        for item in list(resolved_agent_chat_context.get("observations") or [])
+        if isinstance(item, dict)
+    ]
+    if agent_chat_context_snapshot:
+        upload_context = {
+            **dict(upload_context or {}),
+            "agent_chat_context": dict(agent_chat_context_snapshot),
+        }
     if recalled_upload and upload_context.get("filename"):
         display_message = _build_display_message(
             payload.message,
@@ -7176,6 +7381,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             router_reason=str(route_decision.get("router_reason") or ""),
             degraded_from=str(route_decision.get("degraded_from") or "none"),
             actor_context=actor_context,
+            initial_observations=agent_chat_context_observations,
         )
     except Exception:
         logger.exception("Orchestration request failed; falling back to unified agent")
@@ -7208,6 +7414,15 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
         ))
 
     result["actor_context"] = actor_context
+    if agent_chat_context_observations:
+        result["tool_observations"] = _prepend_observations_once(
+            list(result.get("tool_observations") or []),
+            agent_chat_context_observations,
+        )
+        task_plan = dict(result.get("task_plan") or {})
+        task_plan["tool_observations"] = list(result["tool_observations"])
+        task_plan["agent_chat_context"] = dict(agent_chat_context_snapshot)
+        result["task_plan"] = task_plan
     result["permission_decision"] = permission_decision
     result["rate_limit_decision"] = rate_limit_decision
     result["queue_status"] = queue_status

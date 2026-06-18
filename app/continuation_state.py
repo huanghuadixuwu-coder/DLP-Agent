@@ -470,6 +470,26 @@ def _is_semantic_patch_applicable(text: str, target: PendingObject) -> bool:
         )
     ):
         return False
+    communication_context_markers = (
+        "active thread",
+        "customer thread",
+        "communication thread",
+        "latest brief",
+        "brief",
+        "customer",
+        "thread",
+    )
+    draft_anchor_markers = (
+        "draft",
+        "current draft",
+        "existing draft",
+        "active draft",
+        "this draft",
+    )
+    if any(token in lowered for token in communication_context_markers) and not any(
+        token in lowered for token in draft_anchor_markers
+    ):
+        return False
     object_anchors = (
         "draft",
         "current draft",

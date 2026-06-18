@@ -92,6 +92,8 @@ class UnifiedAgentRequest(BaseModel):
     mode: Mode = "auto"
     problem_id: str | None = None
     conversation_id: str | None = None
+    thread_id: str = ""
+    global_mode: bool = False
     show_steps: bool = True
     uploaded_filename: str = ""
     uploaded_content_type: str = ""

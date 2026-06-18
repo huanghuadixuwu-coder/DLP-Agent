@@ -2156,6 +2156,263 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
     }
 
 
+def run_contextual_chat() -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-contextual-chat-{suffix}"
+    conversation_id = f"conversation-contextual-chat-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-contextual-{suffix}",
+        "user_id": f"user-contextual-{suffix}",
+        "workspace_id": "workspace-contextual",
+        "roles": ["admin"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-contextual-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-contextual-1-{suffix}",
+        uid=f"uid-contextual-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Enterprise renewal follow-up",
+        received_at="2026-06-17T10:00:00+00:00",
+        summary="Customer asks whether Enterprise renewal includes EU failover and wants a concise reply.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "contextual active thread")
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Enterprise renewal follow-up",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-17T10:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-contextual-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Answer the customer's EU failover question and draft a concise reply.",
+        customer_context_summary="Customer needs Enterprise renewal EU failover details.",
+        grounding_refs=[{"doc_id": "policy-eu-failover", "title": "EU failover policy"}],
+        must_include=["EU hot standby"],
+        must_avoid=["unsupported commitments"],
+        recommended_next_action="draft_reply",
+        source_observation_ids=["obs-contextual-grounding"],
+        confidence=0.88,
+        actor_context=actor_context,
+    )
+    stored_brief = upsert_communication_brief(
+        brief,
+        actor_context=actor_context,
+        refresh_reason="contextual_chat_regression",
+    )
+    _assert_true(stored_brief, "contextual stored brief")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+
+    request = SimpleNamespace(headers={})
+    planner_calls: list[dict[str, Any]] = []
+    original_orchestrate = main_module.orchestrate_agent_request
+    original_route = main_module.route_agent_request
+    original_plan_multi = main_module.plan_multi_agent_dag_request
+    original_write_memory = main_module._write_unified_conversation_memory
+    original_persist_confirmation = main_module._persist_confirmation_object
+    original_persist_answer_artifact = main_module._persist_answer_artifact_object
+    original_write_dynamic_turn_memory = main_module.write_dynamic_turn_memory
+    original_enqueue_summary = main_module.enqueue_conversation_memory_summary
+
+    def _slow_route(**_: Any) -> dict[str, Any]:
+        return {
+            "route_mode": "slow",
+            "intent": "enterprise_fact",
+            "required_grounding": "tool",
+            "recommended_tool": "enterprise_rag_query",
+            "router_reason": "contextual chat regression",
+            "degraded_from": "none",
+        }
+
+    def _fake_orchestrate(**kwargs: Any) -> dict[str, Any]:
+        planner_calls.append(kwargs)
+        observations = list(kwargs.get("initial_observations") or [])
+        return {
+            "session_id": kwargs["session_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "request_id": f"request-contextual-{len(planner_calls)}-{suffix}",
+            "message": kwargs["message"],
+            "safe_message": kwargs["safe_message"],
+            "display_message": kwargs["display_message"],
+            "answer": "Stubbed contextual answer.",
+            "intent": kwargs.get("router_intent") or "enterprise_fact",
+            "routing_source": "contextual_chat_regression",
+            "routing_confidence": 0.91,
+            "routing_reason": kwargs.get("router_reason") or "contextual chat regression",
+            "candidate_intents": ["enterprise_fact"],
+            "mode_used": "react_controller",
+            "tool_calls": [{"tool_name": "enterprise_rag_query", "success": True, "status": "completed", "result": {}}],
+            "retrieved_evidence": [],
+            "needs_clarification": False,
+            "clarification_question": None,
+            "privacy": {},
+            "context_budget": {},
+            "citations": [],
+            "memory_context": {},
+            "memory_hits": 0,
+            "merged_memory_hits": 0,
+            "context_sources": [],
+            "workspace_memory_hits": 0,
+            "transcript_hits": 0,
+            "user_model_used": False,
+            "reflection_notes": None,
+            "upload_context": dict(kwargs.get("upload_context") or {}),
+            "route_mode": "slow",
+            "router_intent": kwargs.get("router_intent") or "enterprise_fact",
+            "router_reason": kwargs.get("router_reason") or "",
+            "required_grounding": kwargs.get("required_grounding") or "tool",
+            "fast_path_used": False,
+            "degraded_from": "none",
+            "recommended_tool": kwargs.get("recommended_tool") or "",
+            "planner_type": "contextual_chat_regression",
+            "task_plan": {"tool_observations": observations},
+            "subtask_results": [],
+            "aggregation_strategy": "stub",
+            "partial_failures": [],
+            "react_trace": [],
+            "loop_step_count": 0,
+            "termination_reason": "direct_answer",
+            "pending_confirmation": {},
+            "confirmation_payload": {},
+            "final_answer_source": "contextual_chat_regression",
+            "memory_reads": [],
+            "tool_observations": observations,
+            "actor_context": kwargs.get("actor_context") or {},
+            "node_latencies_ms": {"total": 1.0},
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+        }
+
+    main_module.orchestrate_agent_request = _fake_orchestrate
+    main_module.route_agent_request = _slow_route
+    main_module.plan_multi_agent_dag_request = lambda **_: None
+    main_module._write_unified_conversation_memory = lambda *_args, **_kwargs: (f"turn-contextual-{len(planner_calls)}", True)
+    main_module._persist_confirmation_object = lambda **_: None
+    main_module._persist_answer_artifact_object = lambda **_: {}
+    main_module.write_dynamic_turn_memory = lambda **_: {"memory_scope": "session", "identifiers": {}}
+    main_module.enqueue_conversation_memory_summary = lambda *_args, **_kwargs: None
+    try:
+        contextual_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message="Using the active customer thread and latest brief, answer the EU failover question.",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin"],
+            ),
+            request,
+        )
+        draft_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message="Using the active customer thread and latest brief, draft a concise reply.",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin"],
+            ),
+            request,
+        )
+        global_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message="Globally, what is our general Enterprise positioning?",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin"],
+                global_mode=True,
+            ),
+            request,
+        )
+    finally:
+        main_module.orchestrate_agent_request = original_orchestrate
+        main_module.route_agent_request = original_route
+        main_module.plan_multi_agent_dag_request = original_plan_multi
+        main_module._write_unified_conversation_memory = original_write_memory
+        main_module._persist_confirmation_object = original_persist_confirmation
+        main_module._persist_answer_artifact_object = original_persist_answer_artifact
+        main_module.write_dynamic_turn_memory = original_write_dynamic_turn_memory
+        main_module.enqueue_conversation_memory_summary = original_enqueue_summary
+
+    contextual_observations = list(contextual_response.tool_observations or [])
+    contextual_types = [str(item.get("observation_type") or "") for item in contextual_observations]
+    _assert_true("active_communication_thread" in contextual_types, "contextual active thread observation")
+    _assert_true("communication_brief" in contextual_types, "contextual brief observation")
+    active_thread_observation = next(item for item in contextual_observations if item.get("observation_type") == "active_communication_thread")
+    brief_observation = next(item for item in contextual_observations if item.get("observation_type") == "communication_brief")
+    _assert_equal(dict(active_thread_observation.get("payload") or {}).get("thread_id"), thread_id, "contextual thread id")
+    _assert_equal(dict(brief_observation.get("payload") or {}).get("brief_id"), brief.brief_id, "contextual latest brief id")
+    _assert_equal(dict(brief_observation.get("payload") or {}).get("thread_ref", {}).get("thread_id"), thread_id, "contextual brief thread ref")
+    _assert_equal(active_thread_observation.get("actor_context", {}).get("tenant_id"), actor_context["tenant_id"], "thread actor context")
+    _assert_equal(brief_observation.get("actor_context", {}).get("tenant_id"), actor_context["tenant_id"], "brief actor context")
+    _assert_equal(
+        dict(planner_calls[0].get("upload_context") or {}).get("agent_chat_context", {}).get("thread_id"),
+        thread_id,
+        "planner active thread context",
+    )
+    _assert_equal(
+        dict(planner_calls[0].get("upload_context") or {}).get("agent_chat_context", {}).get("brief_id"),
+        brief.brief_id,
+        "planner latest brief context",
+    )
+    draft_observations = list(draft_response.tool_observations or [])
+    draft_types = [str(item.get("observation_type") or "") for item in draft_observations]
+    _assert_true("active_communication_thread" in draft_types, "draft active thread observation")
+    _assert_true("communication_brief" in draft_types, "draft latest brief observation")
+
+    global_observations = list(global_response.tool_observations or [])
+    global_types = [str(item.get("observation_type") or "") for item in global_observations]
+    _assert_true("global_entry" in global_types, "global entry observation")
+    _assert_true("active_communication_thread" not in global_types, "global mode does not bind active thread")
+    global_planner_call = next(
+        item for item in planner_calls if str(item.get("message") or "").startswith("Globally,")
+    )
+    _assert_equal(
+        dict(global_planner_call.get("upload_context") or {}).get("agent_chat_context", {}).get("global_mode"),
+        True,
+        "planner global mode context",
+    )
+    _assert_equal(
+        dict(global_planner_call.get("upload_context") or {}).get("agent_chat_context", {}).get("thread_id"),
+        "",
+        "planner global mode thread id",
+    )
+
+    return {
+        "ok": True,
+        "case": "contextual_chat",
+        "thread_id": thread_id,
+        "brief_id": brief.brief_id,
+        "contextual_observation_types": contextual_types,
+        "draft_observation_types": draft_types,
+        "global_observation_types": global_types,
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -2274,6 +2531,7 @@ def main() -> int:
         "subordinate_inputs": run_subordinate_inputs,
         "retirement": run_retirement,
         "runtime_brief_closeout": run_runtime_brief_closeout,
+        "contextual_chat": run_contextual_chat,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

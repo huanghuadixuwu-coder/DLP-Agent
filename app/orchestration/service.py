@@ -13,6 +13,26 @@ from app.resilience import make_failure_observation
 logger = logging.getLogger(__name__)
 
 
+def _prepend_initial_observations(
+    result: dict[str, Any],
+    initial_observations: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    observations = [dict(item) for item in list(initial_observations or []) if isinstance(item, dict)]
+    if not observations:
+        return result
+    payload = dict(result or {})
+    existing = list(payload.get("tool_observations") or payload.get("observations") or [])
+    payload["tool_observations"] = [*observations, *existing]
+    task_plan = dict(payload.get("task_plan") or {})
+    task_plan_observations = list(task_plan.get("tool_observations") or [])
+    task_plan["tool_observations"] = [*observations, *task_plan_observations]
+    task_plan["agent_chat_context"] = {
+        "observation_types": [str(item.get("observation_type") or "") for item in observations],
+    }
+    payload["task_plan"] = task_plan
+    return payload
+
+
 def orchestrate_agent_request(
     *,
     session_id: str,
@@ -27,7 +47,9 @@ def orchestrate_agent_request(
     router_reason: str = "",
     degraded_from: str = "none",
     actor_context: dict[str, Any] | None = None,
+    initial_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    context_observations = [dict(item) for item in list(initial_observations or []) if isinstance(item, dict)]
     dag_result = _try_multi_agent_dag_request(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -41,12 +63,13 @@ def orchestrate_agent_request(
         router_reason=router_reason,
         degraded_from=degraded_from,
         actor_context=actor_context,
+        initial_observations=context_observations,
     )
     if dag_result is not None:
         return dag_result
 
     try:
-        return run_react_agent_request(
+        result = run_react_agent_request(
             session_id=session_id,
             conversation_id=conversation_id,
             message=message,
@@ -60,6 +83,7 @@ def orchestrate_agent_request(
             degraded_from=degraded_from,
             actor_context=actor_context,
         )
+        return _prepend_initial_observations(result, context_observations)
     except Exception as exc:
         logger.exception("ReAct controller failed; returning typed orchestration recovery")
         return _recover_react_controller_failure(
@@ -75,6 +99,7 @@ def orchestrate_agent_request(
             router_reason=router_reason,
             degraded_from=degraded_from,
             actor_context=actor_context,
+            initial_observations=context_observations,
             error=exc,
         )
 
@@ -93,6 +118,7 @@ def _try_multi_agent_dag_request(
     router_reason: str = "",
     degraded_from: str = "none",
     actor_context: dict[str, Any] | None = None,
+    initial_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     from app.orchestration.dag_executor import execute_dag_plan
     from app.orchestration.final_renderer import render_final_answer
@@ -113,7 +139,10 @@ def _try_multi_agent_dag_request(
         actor_context=dict(actor_context or {}),
     )
     dag_result = execute_dag_plan(plan, context, allow_side_effects=False)
-    observations = list(dag_result.get("observations") or [])
+    observations = [
+        *[dict(item) for item in list(initial_observations or []) if isinstance(item, dict)],
+        *list(dag_result.get("observations") or []),
+    ]
     pending_confirmation = _pending_confirmation_from_observations(observations, plan)
     rendered = render_final_answer(
         question=display_message or message,
@@ -213,6 +242,7 @@ def _recover_react_controller_failure(
     router_reason: str = "",
     degraded_from: str = "none",
     actor_context: dict[str, Any] | None = None,
+    initial_observations: list[dict[str, Any]] | None = None,
     error: Exception,
 ) -> dict[str, Any]:
     started = perf_counter()
@@ -228,7 +258,10 @@ def _recover_react_controller_failure(
     )
     failure_observation["summary"] = "The agent orchestration path failed; a recovery response was returned."
     failure_observation["success"] = False
-    observations = [failure_observation]
+    observations = [
+        *[dict(item) for item in list(initial_observations or []) if isinstance(item, dict)],
+        failure_observation,
+    ]
     rendered = render_final_answer(
         question=display_message or message,
         current_goal=router_intent or "orchestration_recovery",

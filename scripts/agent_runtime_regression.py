@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.orchestration.agent_verifier import verify_agent_answer
-from app.orchestration.observations import make_typed_observation
+from app.orchestration.observations import AGENT_CHAT_CONTEXT_OBSERVATION_TYPES, make_typed_observation
 from app.orchestration.trace_evaluator import evaluate_agent_trace
 from app.resilience import make_failure_observation
 from app.metrics import render_metrics
@@ -109,10 +109,32 @@ def main() -> None:
         retry_count=1,
         actor_context=actor,
     )
+    context_observations = [
+        make_typed_observation(
+            observation_type=observation_type,
+            source="agent_chat_context_regression",
+            grounding_kind="state",
+            summary=f"Context observation contract check: {observation_type}",
+            payload={"thread_id": "thread-runtime", "brief_id": "brief-runtime"},
+            provenance={"source": "agent_runtime_regression"},
+            confidence=1.0,
+            actor_context=actor,
+            status="failed" if observation_type == "active_object_resolution_failed" else "completed",
+            success=False if observation_type == "active_object_resolution_failed" else None,
+        )
+        for observation_type in sorted(AGENT_CHAT_CONTEXT_OBSERVATION_TYPES)
+    ]
+    context_contract_ok = all(
+        not (REQUIRED_OBSERVATION_KEYS - set(item))
+        and item.get("observation_type") in AGENT_CHAT_CONTEXT_OBSERVATION_TYPES
+        and item.get("actor_context") == actor
+        for item in context_observations
+    )
     metrics_text = render_metrics().decode("utf-8", errors="ignore")
 
     result = {
         "ok": not missing_keys
+        and context_contract_ok
         and memory_verdict.get("needs_rewrite")
         and confirmation_verdict.get("needs_rewrite")
         and not trace_evaluation.get("ok")
@@ -120,6 +142,7 @@ def main() -> None:
         and "agent_dependency_failures_total" in metrics_text,
         "checks": {
             "typed_observation_contract": not missing_keys,
+            "agent_chat_context_observation_contract": context_contract_ok,
             "memory_boundary_guard": memory_verdict.get("needs_rewrite"),
             "confirmation_guard": confirmation_verdict.get("needs_rewrite"),
             "trace_evaluator_flags_bad_trace": not trace_evaluation.get("ok"),
@@ -131,6 +154,7 @@ def main() -> None:
         "confirmation_verdict": confirmation_verdict,
         "trace_evaluation": trace_evaluation,
         "failure_observation": failure_observation,
+        "context_observation_types": [item.get("observation_type") for item in context_observations],
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:

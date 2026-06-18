@@ -6,6 +6,14 @@ from typing import Any
 from app.orchestration.types import TypedObservation
 
 
+AGENT_CHAT_CONTEXT_OBSERVATION_TYPES = {
+    "active_communication_thread",
+    "communication_brief",
+    "global_entry",
+    "active_object_resolution_failed",
+}
+
+
 def make_typed_observation(
     *,
     observation_type: str,
