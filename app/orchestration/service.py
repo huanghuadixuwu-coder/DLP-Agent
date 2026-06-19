@@ -12,6 +12,8 @@ from app.resilience import make_failure_observation
 
 logger = logging.getLogger(__name__)
 
+ORCHESTRATION_RECOVERY_FINAL_ANSWER_SOURCE = "orchestration_recovery_renderer"
+
 
 def _observation_identity(item: dict[str, Any]) -> tuple[str, str, str]:
     payload = dict(item.get("payload") or {})
@@ -349,7 +351,7 @@ def _recover_react_controller_failure(
             "planner_type": "react_controller",
             "current_goal": router_intent or "orchestration_recovery",
             "termination_reason": "controller_recovery",
-            "final_answer_source": "orchestration_recovery_renderer",
+            "final_answer_source": ORCHESTRATION_RECOVERY_FINAL_ANSWER_SOURCE,
             "tool_observations": observations,
             "verifier_verdict": dict(rendered.get("verifier_verdict") or {}),
             "verifier_rewrite_applied": bool(rendered.get("verifier_rewrite_applied", False)),
@@ -362,7 +364,7 @@ def _recover_react_controller_failure(
         "termination_reason": "controller_recovery",
         "pending_confirmation": {},
         "confirmation_payload": {},
-        "final_answer_source": "orchestration_recovery_renderer",
+        "final_answer_source": ORCHESTRATION_RECOVERY_FINAL_ANSWER_SOURCE,
         "memory_reads": [],
         "tool_observations": observations,
         "node_latencies_ms": {"total": latency_ms},

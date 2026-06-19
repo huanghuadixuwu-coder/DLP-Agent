@@ -86,7 +86,7 @@ def _explicit_brief_reference(message: str) -> bool:
     )
 
 
-def _explicit_prior_assistant_reference(message: str) -> bool:
+def is_explicit_prior_assistant_reference(message: str) -> bool:
     text = message or ""
     lowered = text.lower()
     return any(
@@ -115,11 +115,15 @@ def _explicit_prior_assistant_reference(message: str) -> bool:
     )
 
 
+def _explicit_prior_assistant_reference(message: str) -> bool:
+    return is_explicit_prior_assistant_reference(message)
+
+
 def resolve_mail_source_request(
     *,
     message: str,
     candidates: list[dict[str, Any]],
-    legacy_referential_request: bool = False,
+    prior_answer_compatibility_request: bool = False,
     explicit_summary: bool = False,
 ) -> dict[str, Any]:
     normalized_candidates = [_normalize_candidate(item, index=index) for index, item in enumerate(candidates)]
@@ -257,15 +261,15 @@ def resolve_mail_source_request(
             reason="Selected the prior assistant answer matched by request anchors because no communication brief was available.",
             classifier_source="deterministic_prior_assistant_anchor_match",
         )
-    if (legacy_referential_request or explicit_summary) and len(assistant_candidates) == 1:
+    if (prior_answer_compatibility_request or explicit_summary) and len(assistant_candidates) == 1:
         return _resolution(
             selected_candidate_ids=[assistant_candidates[0]["candidate_id"]],
             source_mode="prior_assistant_answer",
             compose_mode="recipient_ready_summary",
             referential_request=True,
             confidence=0.82,
-            reason="Selected the single prior assistant answer for an explicit referential mail request.",
-            classifier_source="deterministic_prior_assistant_reference",
+            reason="Selected the single prior assistant answer through the explicit prior-answer compatibility shim.",
+            classifier_source="deterministic_prior_answer_compatibility_shim",
         )
 
     try:
@@ -303,7 +307,7 @@ def resolve_mail_source_request(
         return _safe_fallback(
             candidates=normalized_candidates,
             message=message,
-            legacy_referential_request=legacy_referential_request,
+            prior_answer_compatibility_request=prior_answer_compatibility_request,
             explicit_summary=explicit_summary,
             error=str(exc),
         )
@@ -370,7 +374,7 @@ def _safe_fallback(
     *,
     candidates: list[dict[str, str]],
     message: str,
-    legacy_referential_request: bool,
+    prior_answer_compatibility_request: bool,
     explicit_summary: bool,
     error: str,
 ) -> dict[str, Any]:
@@ -426,16 +430,15 @@ def _safe_fallback(
             classifier_source="safe_fallback_communication_brief_ambiguous",
             classifier_error=error,
         )
-    has_high_confidence_reference = any(marker in message or marker in message.lower() for marker in HIGH_CONFIDENCE_REFERENCE_MARKERS)
-    if (legacy_referential_request or explicit_summary or has_high_confidence_reference) and len(assistant_candidates) == 1:
+    if (prior_answer_compatibility_request or explicit_summary) and len(assistant_candidates) == 1:
         return _resolution(
             selected_candidate_ids=[assistant_candidates[0]["candidate_id"]],
             source_mode="prior_assistant_answer",
             compose_mode="recipient_ready_summary",
             referential_request=True,
             confidence=0.72,
-            reason="LLM source resolution failed; used the single explicit prior-answer reference.",
-            classifier_source="safe_fallback",
+            reason="LLM source resolution failed; used the explicit prior-answer compatibility shim.",
+            classifier_source="safe_fallback_prior_answer_compatibility_shim",
             classifier_error=error,
         )
     return _resolution(

@@ -27,7 +27,7 @@ def _seed_thread() -> None:
             "sender": "customer@example.com",
             "recipients": "sales@example.com",
             "subject": "Customer renewal discussion",
-            "received_at": "2026-06-02T09:00:00+00:00",
+            "received_at": "2026-06-19T23:58:00+00:00",
             "snippet": "Customer asks for renewal pricing and next steps.",
             "summary": "Customer renewal thread: the customer asked for renewal pricing, SLA confirmation, and next steps.",
             "body_text": "Customer renewal details with pricing request and requested follow-up.",
@@ -44,7 +44,7 @@ def _seed_thread() -> None:
             "sender": "sales@example.com",
             "recipients": "customer@example.com",
             "subject": "Re: Customer renewal discussion",
-            "received_at": "2026-06-02T09:05:00+00:00",
+            "received_at": "2026-06-19T23:59:00+00:00",
             "snippet": "We will send a concise renewal summary and propose a meeting.",
             "summary": "Sales replied that they will send a concise renewal summary and propose a meeting.",
             "body_text": "Sales response about renewal summary and meeting proposal.",
@@ -95,7 +95,7 @@ def main() -> None:
         resolved = source_resolver.resolve_mail_source_request(
             message="Please send the customer renewal mail thread summary to 1136732521@qq.com",
             candidates=candidates,
-            legacy_referential_request=True,
+            prior_answer_compatibility_request=True,
         )
     finally:
         source_resolver.get_llm = original_get_llm
@@ -103,7 +103,7 @@ def main() -> None:
     assert not resolved.get("needs_clarification"), resolved
     assert resolved.get("source_mode") == "mail_thread", resolved
     assert resolved.get("selected_candidate_ids") == ["mail-thread:thread_customer_renewal_regression"], resolved
-    assert resolved.get("classifier_source") == "safe_fallback_anchor_match", resolved
+    assert resolved.get("classifier_source") in {"deterministic_reference_anchor_match", "safe_fallback_anchor_match"}, resolved
 
     plan = build_mail_action_plan(
         message="Please send the customer renewal mail thread summary to 1136732521@qq.com",

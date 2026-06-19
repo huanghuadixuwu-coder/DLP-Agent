@@ -176,14 +176,14 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `thread_store` to `scripts/communication_copilot_regression.py`; seed two inbound threads for two actors, list them, select one active thread, and verify actor/workspace isolation.
-- [ ] Verify RED: run `docker compose exec -T api python scripts/communication_copilot_regression.py --case thread_store` and confirm the case fails because the communication thread store and active selection do not exist.
-- [ ] Minimal code: create `app/communication/thread_store.py` with `init_communication_thread_store()`, `upsert_thread_projection()`, `list_communication_threads()`, `get_communication_thread()`, `set_active_communication_thread()`, and `get_active_communication_thread()`.
-- [ ] Minimal code: extend `CommunicationThreadRef` with fields needed for workspace display: `status`, `source_message_ids`, `latest_summary`, `risk_hint`, and `updated_at`.
-- [ ] Minimal code: wire `inbound_mail_store.list_recent_inbound_threads()` into thread projection refresh without duplicating raw body storage.
-- [ ] Minimal code: add internal API functions in `app/main.py` for thread list, thread detail, active thread selection, and active thread read.
-- [ ] Verify GREEN: rerun compile and the `thread_store` regression in Docker.
-- [ ] Commit: `git add app/communication app/inbound_mail_store.py app/main.py scripts/communication_copilot_regression.py && git commit -m "Add communication thread source of truth"`
+- [x] Write test: add `thread_store` to `scripts/communication_copilot_regression.py`; seed two inbound threads for two actors, list them, select one active thread, and verify actor/workspace isolation.
+- [x] Verify RED: run `docker compose exec -T api python scripts/communication_copilot_regression.py --case thread_store` and confirm the case fails because the communication thread store and active selection do not exist.
+- [x] Minimal code: create `app/communication/thread_store.py` with `init_communication_thread_store()`, `upsert_thread_projection()`, `list_communication_threads()`, `get_communication_thread()`, `set_active_communication_thread()`, and `get_active_communication_thread()`.
+- [x] Minimal code: extend `CommunicationThreadRef` with fields needed for workspace display: `status`, `source_message_ids`, `latest_summary`, `risk_hint`, and `updated_at`.
+- [x] Minimal code: wire `inbound_mail_store.list_recent_inbound_threads()` into thread projection refresh without duplicating raw body storage.
+- [x] Minimal code: add internal API functions in `app/main.py` for thread list, thread detail, active thread selection, and active thread read.
+- [x] Verify GREEN: rerun compile and the `thread_store` regression in Docker.
+- [x] Commit: `git add app/communication app/inbound_mail_store.py app/main.py scripts/communication_copilot_regression.py && git commit -m "Add communication thread source of truth"`
 
 Repair Track:
 
@@ -223,13 +223,13 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `brief_store`; create an active thread, build a brief, persist it, refresh it after adding a new message, and verify the same actor can retrieve the latest brief while a different actor cannot.
-- [ ] Verify RED: run the new case and confirm there is no persisted brief lifecycle.
-- [ ] Minimal code: create `app/communication/brief_store.py` with `init_communication_brief_store()`, `upsert_communication_brief()`, `get_communication_brief()`, `get_latest_brief_for_thread()`, and `refresh_brief_for_thread()`.
-- [ ] Minimal code: update `brief_service` so brief refresh receives `thread_id`, `actor_context`, `employee_goal`, and grounding refs, then persists a snapshot.
-- [ ] Minimal code: update observation builders to include `brief_persistence_source`, `brief_version`, `thread_id`, and `refresh_reason`.
-- [ ] Verify GREEN: rerun compile, `brief_store`, and `brief_assembly`.
-- [ ] Commit: `git add app/communication app/main.py scripts/communication_copilot_regression.py && git commit -m "Persist communication briefs for thread workspace"`
+- [x] Write test: add `brief_store`; create an active thread, build a brief, persist it, refresh it after adding a new message, and verify the same actor can retrieve the latest brief while a different actor cannot.
+- [x] Verify RED: run the new case and confirm there is no persisted brief lifecycle.
+- [x] Minimal code: create `app/communication/brief_store.py` with `init_communication_brief_store()`, `upsert_communication_brief()`, `get_communication_brief()`, `get_latest_brief_for_thread()`, and `refresh_brief_for_thread()`.
+- [x] Minimal code: update `brief_service` so brief refresh receives `thread_id`, `actor_context`, `employee_goal`, and grounding refs, then persists a snapshot.
+- [x] Minimal code: update observation builders to include `brief_persistence_source`, `brief_version`, `thread_id`, and `refresh_reason`.
+- [x] Verify GREEN: rerun compile, `brief_store`, and `brief_assembly`.
+- [x] Commit: `git add app/communication app/main.py scripts/communication_copilot_regression.py && git commit -m "Persist communication briefs for thread workspace"`
 
 Repair Track:
 
@@ -270,14 +270,14 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `contextual_chat`; select an active thread, ask a grounded product question, request a reply draft, and verify the emitted observations reference the active thread and latest brief.
-- [ ] Write test: extend `contextual_chat` with a global ask that does not bind to the active thread and verify it is marked `global_entry`.
-- [ ] Verify RED: run the case and confirm `/agent/chat` can still operate without stable active object resolution.
-- [ ] Minimal code: add an active object resolution step before planner execution in `app/main.py`.
-- [ ] Minimal code: emit typed observations for `active_communication_thread`, `communication_brief`, `global_entry`, and `active_object_resolution_failed`.
-- [ ] Minimal code: update continuation state so a stale mail draft cannot hijack a fresh thread-grounded question.
-- [ ] Verify GREEN: rerun compile, agent runtime regression, and `contextual_chat`.
-- [ ] Commit: `git add app/main.py app/orchestration app/continuation_state.py scripts/agent_runtime_regression.py scripts/communication_copilot_regression.py && git commit -m "Make agent chat contextual to communication threads"`
+- [x] Write test: add `contextual_chat`; select an active thread, ask a grounded product question, request a reply draft, and verify the emitted observations reference the active thread and latest brief.
+- [x] Write test: extend `contextual_chat` with a global ask that does not bind to the active thread and verify it is marked `global_entry`.
+- [x] Verify RED: run the case and confirm `/agent/chat` can still operate without stable active object resolution.
+- [x] Minimal code: add an active object resolution step before planner execution in `app/main.py`.
+- [x] Minimal code: emit typed observations for `active_communication_thread`, `communication_brief`, `global_entry`, and `active_object_resolution_failed`.
+- [x] Minimal code: update continuation state so a stale mail draft cannot hijack a fresh thread-grounded question.
+- [x] Verify GREEN: rerun compile, agent runtime regression, and `contextual_chat`.
+- [x] Commit: `git add app/main.py app/orchestration app/continuation_state.py scripts/agent_runtime_regression.py scripts/communication_copilot_regression.py && git commit -m "Make agent chat contextual to communication threads"`
 
 Repair Track:
 
@@ -317,14 +317,14 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `workspace_thread_inbox`; assert thread list, selected thread detail, active brief, Copilot input context, draft preview state, and task progress can be loaded from backend state.
-- [ ] Verify RED: run the workspace case and confirm the current workspace is not a full thread inbox plus side panel state flow.
-- [ ] Minimal code: add API calls in `web/streamlit_app.py` for thread list, thread selection, thread detail, brief refresh, and contextual Copilot submit.
-- [ ] Minimal code: organize existing visible areas into thread list, thread/context detail, and Copilot/action panel while preserving the current visual styling.
-- [ ] Minimal code: keep task progress on 8511 sender-facing only; keep high-risk approval and raw diagnostics in 8512.
-- [ ] Verify GREEN: rerun compile and `workspace_thread_inbox`.
-- [ ] Verify browser: run the browser check and manually confirm thread selection survives refresh.
-- [ ] Commit: `git add web/streamlit_app.py app/main.py scripts/communication_copilot_regression.py scripts/communication_workspace_browser_check.py && git commit -m "Reframe user workspace around communication threads"`
+- [x] Write test: add `workspace_thread_inbox`; assert thread list, selected thread detail, active brief, Copilot input context, draft preview state, and task progress can be loaded from backend state.
+- [x] Verify RED: run the workspace case and confirm the current workspace is not a full thread inbox plus side panel state flow.
+- [x] Minimal code: add API calls in `web/streamlit_app.py` for thread list, thread selection, thread detail, brief refresh, and contextual Copilot submit.
+- [x] Minimal code: organize existing visible areas into thread list, thread/context detail, and Copilot/action panel while preserving the current visual styling.
+- [x] Minimal code: keep task progress on 8511 sender-facing only; keep high-risk approval and raw diagnostics in 8512.
+- [x] Verify GREEN: rerun compile and `workspace_thread_inbox`.
+- [x] Verify browser: run the browser check and manually confirm thread selection survives refresh.
+- [x] Commit: `git add web/streamlit_app.py app/main.py scripts/communication_copilot_regression.py scripts/communication_workspace_browser_check.py && git commit -m "Reframe user workspace around communication threads"`
 
 Repair Track:
 
@@ -365,13 +365,13 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `grounded_reply_from_thread`; select a thread, ask a product question, refresh the brief with grounding refs, request an email reply, and verify the draft body is non-empty, non-duplicated, citation-backed, and scoped to the active thread.
-- [ ] Verify RED: run the case and confirm current paths can still draft from a raw answer artifact without stable active thread/brief binding.
-- [ ] Minimal code: convert EnterpriseRAG output into grounding refs on the active brief, including citation ids and missing aspects.
-- [ ] Minimal code: update Mail source resolution so `communication_brief` remains the preferred closeout source and raw answer artifacts are fallback-only compatibility shims.
-- [ ] Minimal code: prevent unrelated assistant greetings, duplicate answer bodies, and old conversation summaries from entering the external body source.
-- [ ] Verify GREEN: rerun RAG, grounded reply, and mail reference regressions.
-- [ ] Commit: `git add app/enterprise_rag/core/service.py app/communication app/mail/source_resolver.py app/main.py scripts/communication_copilot_regression.py scripts/enterprise_rag_regression.py && git commit -m "Ground thread replies through communication briefs"`
+- [x] Write test: add `grounded_reply_from_thread`; select a thread, ask a product question, refresh the brief with grounding refs, request an email reply, and verify the draft body is non-empty, non-duplicated, citation-backed, and scoped to the active thread.
+- [x] Verify RED: run the case and confirm current paths can still draft from a raw answer artifact without stable active thread/brief binding.
+- [x] Minimal code: convert EnterpriseRAG output into grounding refs on the active brief, including citation ids and missing aspects.
+- [x] Minimal code: update Mail source resolution so `communication_brief` remains the preferred closeout source and raw answer artifacts are fallback-only compatibility shims.
+- [x] Minimal code: prevent unrelated assistant greetings, duplicate answer bodies, and old conversation summaries from entering the external body source.
+- [x] Verify GREEN: rerun RAG, grounded reply, and mail reference regressions.
+- [x] Commit: `git add app/enterprise_rag/core/service.py app/communication app/mail/source_resolver.py app/main.py scripts/communication_copilot_regression.py scripts/enterprise_rag_regression.py && git commit -m "Ground thread replies through communication briefs"`
 
 Repair Track:
 
@@ -413,14 +413,14 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `thread_meeting_escalation`; start from a selected thread and brief, request a meeting, verify the meeting proposal references the brief, requires confirmation, and does not create a provider object before confirmation.
-- [ ] Write test: complete the async meeting worker path and verify meeting result can update the brief and produce a follow-up mail draft candidate.
-- [ ] Verify RED: run the case and confirm meeting output is not fully anchored to active thread and brief state.
-- [ ] Minimal code: require `source_brief_id`, `thread_id`, `actor_context`, and idempotency key on meeting escalation tasks.
-- [ ] Minimal code: write meeting result observations back to the brief store as next-action state.
-- [ ] Minimal code: expose meeting result as a Mail Agent closeout candidate without making Meeting Agent own final wording.
-- [ ] Verify GREEN: rerun meeting, cross-domain, and thread meeting regressions.
-- [ ] Commit: `git add app/orchestration app/task_worker.py app/communication app/main.py scripts/meeting_worker_regression.py scripts/cross_domain_workflow_regression.py scripts/communication_copilot_regression.py && git commit -m "Anchor meeting escalation to communication threads"`
+- [x] Write test: add `thread_meeting_escalation`; start from a selected thread and brief, request a meeting, verify the meeting proposal references the brief, requires confirmation, and does not create a provider object before confirmation.
+- [x] Write test: complete the async meeting worker path and verify meeting result can update the brief and produce a follow-up mail draft candidate.
+- [x] Verify RED: run the case and confirm meeting output is not fully anchored to active thread and brief state.
+- [x] Minimal code: require `source_brief_id`, `thread_id`, `actor_context`, and idempotency key on meeting escalation tasks.
+- [x] Minimal code: write meeting result observations back to the brief store as next-action state.
+- [x] Minimal code: expose meeting result as a Mail Agent closeout candidate without making Meeting Agent own final wording.
+- [x] Verify GREEN: rerun meeting, cross-domain, and thread meeting regressions.
+- [x] Commit: `git add app/orchestration app/task_worker.py app/communication app/main.py scripts/meeting_worker_regression.py scripts/cross_domain_workflow_regression.py scripts/communication_copilot_regression.py && git commit -m "Anchor meeting escalation to communication threads"`
 
 Repair Track:
 
@@ -461,13 +461,13 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `thread_governance_recovery`; from an active thread, create a draft, trigger DLP medium risk, perform sender safety confirmation, and verify task audit references thread and brief ids.
-- [ ] Write test: trigger high risk, provider failure, SMTP failure, and worker unavailable states; verify each returns recovery observations tied to the communication thread.
-- [ ] Verify RED: run the case and confirm at least one recovery path lacks thread/brief provenance.
-- [ ] Minimal code: add `thread_id`, `brief_id`, and `communication_context` to governed delivery task metadata.
-- [ ] Minimal code: ensure 8511 displays sender-facing progress and 8512 displays approval/recovery detail without changing visual style.
-- [ ] Verify GREEN: rerun governance and thread recovery regressions.
-- [ ] Commit: `git add app/task_store.py app/task_worker.py app/main.py web/streamlit_app.py web/governance_console.py scripts/mail_m6_ui_governance_regression.py scripts/communication_copilot_regression.py && git commit -m "Tie governance recovery to communication threads"`
+- [x] Write test: add `thread_governance_recovery`; from an active thread, create a draft, trigger DLP medium risk, perform sender safety confirmation, and verify task audit references thread and brief ids.
+- [x] Write test: trigger high risk, provider failure, SMTP failure, and worker unavailable states; verify each returns recovery observations tied to the communication thread.
+- [x] Verify RED: run the case and confirm at least one recovery path lacks thread/brief provenance.
+- [x] Minimal code: add `thread_id`, `brief_id`, and `communication_context` to governed delivery task metadata.
+- [x] Minimal code: ensure 8511 displays sender-facing progress and 8512 displays approval/recovery detail without changing visual style.
+- [x] Verify GREEN: rerun governance and thread recovery regressions.
+- [x] Commit: `git add app/task_store.py app/task_worker.py app/main.py web/streamlit_app.py web/governance_console.py scripts/mail_m6_ui_governance_regression.py scripts/communication_copilot_regression.py && git commit -m "Tie governance recovery to communication threads"`
 
 Repair Track:
 
@@ -512,12 +512,12 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add `legacy_retirement_thread_native`; assert thread-native closeout does not depend on raw answer artifact fallback or chat-first carrier paths.
-- [ ] Verify RED: run the retirement search and regression to identify remaining active carriers.
-- [ ] Minimal code: delete carriers proven safe by Tasks 1-7; convert any still-needed boundary into a named compatibility shim with replacement owner and removal trigger.
-- [ ] Minimal code: update `problem_todolist.md`, `todolist.md`, and `README.md` to reflect the new thread-native state.
-- [ ] Verify GREEN: rerun compile, all communication regression cases, mail, RAG, and search verification.
-- [ ] Commit: `git add app README.md problem_todolist.md todolist.md scripts/communication_copilot_regression.py && git commit -m "Retire chat-first communication carriers"`
+- [x] Write test: add `legacy_retirement_thread_native`; assert thread-native closeout does not depend on raw answer artifact fallback or chat-first carrier paths.
+- [x] Verify RED: run the retirement search and regression to identify remaining active carriers.
+- [x] Minimal code: delete carriers proven safe by Tasks 1-7; convert any still-needed boundary into a named compatibility shim with replacement owner and removal trigger.
+- [x] Minimal code: update `problem_todolist.md`, `todolist.md`, and `README.md` to reflect the new thread-native state.
+- [x] Verify GREEN: rerun compile, all communication regression cases, mail, RAG, and search verification.
+- [x] Commit: `git add app README.md problem_todolist.md todolist.md scripts/communication_copilot_regression.py scripts/continuation_state_regression.py scripts/mail_meeting_source_candidate_regression.py scripts/mail_thread_source_candidate_regression.py && git commit -m "Retire chat-first communication carriers"`
 
 Repair Track:
 

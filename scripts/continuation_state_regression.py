@@ -11,6 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app.main as main_module
+from app.communication.brief_store import upsert_communication_brief
+from app.communication.thread_store import set_active_communication_thread, upsert_thread_projection
+from app.communication.types import CommunicationBrief, CommunicationThreadRef
 from app.continuation_state import ContinuationDecision, resolve_continuation as resolve_state_continuation
 from app.pending_object_store import get_pending_object
 
@@ -26,18 +29,52 @@ ACTOR = {
 }
 
 
-def _post(client: TestClient, *, message: str, session_id: str, conversation_id: str) -> dict:
+def _post(client: TestClient, *, message: str, session_id: str, conversation_id: str, global_mode: bool = False) -> dict:
     response = client.post(
         "/agent/chat",
         json={
             "session_id": session_id,
             "conversation_id": conversation_id,
             "message": message,
+            "global_mode": global_mode,
             **ACTOR,
         },
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _seed_active_meeting_context(*, session_id: str, conversation_id: str) -> tuple[str, str]:
+    actor_context = {**ACTOR, "session_id": session_id, "conversation_id": conversation_id}
+    thread_id = f"thread-continuation-meeting-{conversation_id}"
+    brief_id = f"brief-continuation-meeting-{conversation_id}"
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Continuation meeting thread",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T12:00:00+00:00",
+        actor_context=actor_context,
+    )
+    upsert_thread_projection(thread_ref, actor_context=actor_context)
+    set_active_communication_thread(thread_id, actor_context=actor_context)
+    upsert_communication_brief(
+        CommunicationBrief(
+            brief_id=brief_id,
+            conversation_id=conversation_id,
+            thread_ref=thread_ref,
+            employee_goal="Schedule a project sync meeting for this active thread.",
+            customer_context_summary="The active thread needs a meeting escalation.",
+            grounding_refs=[{"citation_id": "continuation-meeting-context", "doc_id": "continuation-meeting-doc"}],
+            must_include=["project sync"],
+            recommended_next_action="schedule_meeting",
+            confidence=0.9,
+            actor_context=actor_context,
+        ),
+        actor_context=actor_context,
+        refresh_reason="continuation_state_regression",
+    )
+    return thread_id, brief_id
 
 
 def main() -> None:
@@ -76,9 +113,23 @@ def main() -> None:
         *,
         message: str,
         candidates: list[dict],
-        legacy_referential_request: bool = False,
+        prior_answer_compatibility_request: bool = False,
         explicit_summary: bool = False,
     ) -> dict:
+        if "prior assistant answer" in message.lower():
+            return {
+                "observation_type": "mail_source_resolution",
+                "status": "needs_clarification",
+                "selected_candidate_ids": [],
+                "source_mode": "none",
+                "compose_mode": "recipient_ready_summary",
+                "referential_request": True,
+                "needs_clarification": True,
+                "confidence": 0.52,
+                "reason": "Multiple prior assistant answers are plausible.",
+                "classifier_source": "test_ambiguous",
+                "classifier_error": "",
+            }
         if "该信息" in message:
             return {
                 "observation_type": "mail_source_resolution",
@@ -133,7 +184,7 @@ def main() -> None:
             "selected_candidate_ids": [],
             "source_mode": "none",
             "compose_mode": "recipient_ready_summary",
-            "referential_request": bool(legacy_referential_request or explicit_summary),
+            "referential_request": bool(prior_answer_compatibility_request or explicit_summary),
             "needs_clarification": True,
             "confidence": 0.0,
             "reason": "No deterministic test source.",
@@ -222,11 +273,14 @@ def main() -> None:
             {**ACTOR, "session_id": "session-continuation-body"},
         )
         body_conversation_id = str(conversation_body["conversation_id"])
+        original_active_thread_reader = main_module.get_active_communication_thread
+        main_module.get_active_communication_thread = lambda **_: None
         missing_body = _post(
             client,
             message="帮我发邮件给 1136732521@qq.com",
             session_id="session-continuation-body",
             conversation_id=body_conversation_id,
+            global_mode=True,
         )
         body_plan = dict((missing_body.get("task_plan") or {}).get("mail_plan") or {})
         body_object = dict((missing_body.get("task_plan") or {}).get("pending_object") or {})
@@ -246,6 +300,7 @@ def main() -> None:
         assert body_resolved_plan.get("resolved_recipients") == ["1136732521@qq.com"], body_resolved_plan
         assert body_resolved_plan.get("resolved_body") == "测试正文", body_resolved_plan
         assert consumed_body_object and consumed_body_object.get("status") == "consumed", consumed_body_object
+        main_module.get_active_communication_thread = original_active_thread_reader
 
         inline = _post(
             client,
@@ -287,6 +342,10 @@ def main() -> None:
             debug_payload={},
             actor_context=ACTOR,
         )
+        original_prior_detector = main_module.is_explicit_prior_assistant_reference
+        main_module.is_explicit_prior_assistant_reference = lambda message: (
+            original_prior_detector(message) or "1136732521@qq.com" in str(message or "")
+        )
         source_clarification = _post(
             client,
             message="请把该信息发送到 1136732521@qq.com。注意不要包含无关内容",
@@ -314,12 +373,21 @@ def main() -> None:
         assert "MedThink failover answer" not in str(chosen_candidate.get("content") or ""), source_mail_plan
         consumed_source_object = get_pending_object(str(source_pending_object.get("object_id") or ""), actor_context=ACTOR)
         assert consumed_source_object and consumed_source_object.get("status") == "consumed", consumed_source_object
+        main_module.is_explicit_prior_assistant_reference = original_prior_detector
 
+        meeting_session_id = "session-continuation-meeting"
+        meeting_conversation, _ = main_module._ensure_conversation(
+            meeting_session_id,
+            None,
+            {**ACTOR, "session_id": meeting_session_id},
+        )
+        meeting_conversation_id = str(meeting_conversation["conversation_id"])
+        _seed_active_meeting_context(session_id=meeting_session_id, conversation_id=meeting_conversation_id)
         meeting_plan = _post(
             client,
             message="Create a Tencent Meeting. Topic: project sync tomorrow afternoon.",
-            session_id=session_id,
-            conversation_id=conversation_id,
+            session_id=meeting_session_id,
+            conversation_id=meeting_conversation_id,
         )
         pending_domain = dict(meeting_plan.get("pending_confirmation") or {})
         assert pending_domain.get("tool_name") == "meeting_create_tencent_meeting", pending_domain
@@ -333,8 +401,8 @@ def main() -> None:
         confirmed = _post(
             client,
             message="创建",
-            session_id=session_id,
-            conversation_id=conversation_id,
+            session_id=meeting_session_id,
+            conversation_id=meeting_conversation_id,
         )
         assert confirmed.get("task_id"), confirmed
         task = main_module.get_dlp_task(str(confirmed["task_id"]))

@@ -742,14 +742,6 @@ RESOLUTION_RULES: list[ResolutionRule] = [
         ),
     ),
     ResolutionRule(
-        name="assistant_answer_default",
-        matches=lambda ctx: _candidate_by_kind(ctx.candidates, "assistant_last_answer") is not None,
-        build=lambda ctx: _success(
-            ctx,
-            selected_candidate=_candidate_by_kind(ctx.candidates, "assistant_last_answer"),
-        ),
-    ),
-    ResolutionRule(
         name="clarify_missing_content",
         matches=lambda ctx: True,
         build=lambda ctx: _clarification(
@@ -835,7 +827,6 @@ def _choose_authoring_candidate(
         or _candidate_by_kind(candidates, "meeting_result")
         or _candidate_by_kind(candidates, "mail_thread")
         or _candidate_by_kind(candidates, COMMUNICATION_BRIEF_SOURCE_KIND)
-        or _candidate_by_kind(candidates, "assistant_last_answer")
         or _candidate_by_kind(candidates, "uploaded_text")
     )
 

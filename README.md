@@ -13,9 +13,9 @@ Framing contract:
 - Local Docker Compose is the acceptance baseline; local host Python is not a
   valid completion signal.
 - Runtime migration happens only after replacement owner paths are
-  regression-proven. The retired internal orchestration fallback is now covered
-  by typed recovery observations; remaining active compatibility boundaries stay
-  documented in the trackers until their owners are proven.
+  regression-proven. Thread-native closeout is now owned by
+  `communication_thread` + `communication_brief`; raw assistant answer artifacts
+  are retained only for explicit prior-answer compatibility.
 - Top-level docs must not present the product as a generic conversation surface
   or retrieval-centered system.
 
@@ -438,7 +438,7 @@ The PostgreSQL-backed pending object registry covers:
 - source, recipient, and body clarifications
 - DLP and domain tasks
 - upload artifacts
-- assistant answer artifacts
+- explicit prior-answer compatibility artifacts
 
 Open-ended draft edits use a bounded structured continuation classifier. The
 classifier only decides whether a message patches an existing draft, starts a

@@ -418,7 +418,7 @@ def _persona_or_chitchat(payload: dict[str, Any], _: OrchestrationContext, __: d
     return {"answer": answer}
 
 
-def _legacy_tool_registry() -> dict[str, ToolDefinition]:
+def _built_in_tool_registry() -> dict[str, ToolDefinition]:
     return {
         "tool_catalog_list": ToolDefinition(
             "tool_catalog_list",
@@ -569,7 +569,7 @@ def _legacy_tool_registry() -> dict[str, ToolDefinition]:
     }
 
 
-def _legacy_tool_executor_map() -> dict[str, ToolCallable]:
+def _built_in_tool_executor_map() -> dict[str, ToolCallable]:
     return {
         "tool_catalog_list": _tool_catalog_list,
         "conversation_context_fetch": _conversation_context_fetch,
@@ -593,7 +593,7 @@ def _legacy_tool_executor_map() -> dict[str, ToolCallable]:
 def build_tool_registry() -> dict[str, ToolDefinition]:
     dynamic = get_dynamic_tool_registry()
     merged = dict(dynamic)
-    for name, definition in _legacy_tool_registry().items():
+    for name, definition in _built_in_tool_registry().items():
         merged.setdefault(name, definition)
     return merged
 
@@ -601,7 +601,7 @@ def build_tool_registry() -> dict[str, ToolDefinition]:
 def build_tool_executor_map() -> dict[str, ToolCallable]:
     dynamic = get_dynamic_tool_executor_map()
     merged = dict(dynamic)
-    for name, handler in _legacy_tool_executor_map().items():
+    for name, handler in _built_in_tool_executor_map().items():
         merged.setdefault(name, handler)
     return merged
 

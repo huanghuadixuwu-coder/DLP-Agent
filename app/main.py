@@ -105,7 +105,7 @@ from app.mail.draft_store import (
 )
 from app.mail.content_parser import parse_message_content_candidates
 from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
-from app.mail.source_resolver import resolve_mail_source_request
+from app.mail.source_resolver import is_explicit_prior_assistant_reference, resolve_mail_source_request
 from app.disambiguation_lab import answer_apple_query
 from app.labs_long_doc import allocate_context
 from app.pending_object_store import (
@@ -811,6 +811,9 @@ def _collect_outbound_candidates(
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     context_snapshot = dict(upload_context or {})
+    prior_answer_compatibility_allowed = bool(getattr(payload, "global_mode", False)) or is_explicit_prior_assistant_reference(
+        str(payload.message or "")
+    )
 
     def _communication_brief_candidate_content(brief_payload: dict[str, Any]) -> str:
         thread_ref = dict(brief_payload.get("thread_ref") or {})
@@ -932,7 +935,7 @@ def _collect_outbound_candidates(
                 upload_blob_id=str(recalled_upload.get("upload_blob_id") or ""),
             )
 
-    if actor_context:
+    if actor_context and prior_answer_compatibility_allowed:
         for artifact in list_active_pending_objects(
             conversation_id=conversation_id,
             actor_context=actor_context,
@@ -1065,7 +1068,8 @@ def _collect_outbound_candidates(
             )
             break
     assistant_candidate_count = 0
-    for turn in reversed(turns):
+    assistant_turns = reversed(turns) if prior_answer_compatibility_allowed else []
+    for turn in assistant_turns:
         role = str(turn.get("role") or "").lower()
         debug_payload = dict(turn.get("debug_payload") or {})
         if role == "assistant" and (
@@ -2297,7 +2301,7 @@ def _build_mail_action_plan(
     source_resolution = resolve_mail_source_request(
         message=str(payload.message or ""),
         candidates=candidates,
-        legacy_referential_request=referential_request,
+        prior_answer_compatibility_request=referential_request,
         explicit_summary=explicit_summary,
     )
     result = build_mail_action_plan(
@@ -3001,7 +3005,7 @@ def _resolve_pending_mail_source_clarification(
     source_resolution = resolve_mail_source_request(
         message=user_message,
         candidates=candidates,
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     destination_email = _first_resolved_recipient(mail_plan) or _extract_destination_email(original_message)

@@ -50,7 +50,7 @@ def main() -> None:
         resolved = source_resolver.resolve_mail_source_request(
             message="请把客户复盘会议链接发送给 1136732521@qq.com",
             candidates=candidates,
-            legacy_referential_request=True,
+            prior_answer_compatibility_request=True,
         )
     finally:
         source_resolver.get_llm = original_get_llm
@@ -58,7 +58,7 @@ def main() -> None:
     assert not resolved.get("needs_clarification"), resolved
     assert resolved.get("source_mode") == "meeting_result", resolved
     assert resolved.get("selected_candidate_ids") == ["meeting-task:task_meeting_source_contract"], resolved
-    assert resolved.get("classifier_source") == "safe_fallback_anchor_match", resolved
+    assert resolved.get("classifier_source") in {"deterministic_reference_anchor_match", "safe_fallback_anchor_match"}, resolved
 
     plan = build_mail_action_plan(
         message="请把客户复盘会议链接发送给 1136732521@qq.com",

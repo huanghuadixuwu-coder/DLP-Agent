@@ -1429,7 +1429,7 @@ def run_mail_closeout() -> dict[str, Any]:
     source_resolution = resolve_mail_source_request(
         message="Please email the customer at customer@example.com with the closeout.",
         candidates=candidates,
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=True,
     )
     _assert_equal(source_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "source_mode")
@@ -1460,7 +1460,7 @@ def run_mail_closeout() -> dict[str, Any]:
                 "content_type": "application/json",
             },
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=True,
     )
     _assert_equal(explicit_thread_resolution["source_mode"], "mail_thread", "explicit thread source mode")
@@ -1487,7 +1487,7 @@ def run_mail_closeout() -> dict[str, Any]:
                 "content_type": "application/json",
             },
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     _assert_equal(upload_resolution["source_mode"], "uploaded_content", "upload source mode")
@@ -1511,7 +1511,7 @@ def run_mail_closeout() -> dict[str, Any]:
                 "content_type": "application/json",
             },
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=True,
     )
     _assert_equal(prior_answer_resolution["source_mode"], "prior_assistant_answer", "prior answer source mode")
@@ -1539,16 +1539,16 @@ def run_mail_closeout() -> dict[str, Any]:
                 "content_type": "application/json",
             },
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=True,
     )
-    _assert_equal(anchored_prior_answer_resolution["source_mode"], "prior_assistant_answer", "anchored prior answer source mode")
+    _assert_equal(anchored_prior_answer_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "anchored request prefers brief source mode")
     _assert_equal(
         anchored_prior_answer_resolution["selected_candidate_ids"],
-        ["assistant-turn:medthink-failover"],
-        "anchored prior answer selected candidate",
+        ["communication-brief:brief_closeout_123"],
+        "anchored request selected brief candidate",
     )
-    _assert_equal(anchored_prior_answer_resolution["needs_clarification"], False, "anchored prior answer clarification")
+    _assert_equal(anchored_prior_answer_resolution["needs_clarification"], False, "anchored request clarification")
 
     plan_result = build_mail_action_plan(
         message="Please email the customer at customer@example.com with the closeout.",
@@ -2140,7 +2140,7 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
             },
             brief_candidates[0],
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=True,
     )
     _assert_equal(source_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "brief beats incidental thread")
@@ -2287,7 +2287,7 @@ def run_grounded_reply_from_thread() -> dict[str, Any]:
     brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
     assistant_candidates = [item for item in candidates if item.get("kind") == "assistant_last_answer"]
     _assert_equal(len(brief_candidates), 1, "grounded reply brief candidate count")
-    _assert_true(assistant_candidates, "explicit assistant source candidates remain available with active brief")
+    _assert_equal(assistant_candidates, [], "thread-native closeout raw answer candidates retired")
 
     plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
     mail_plan = dict(plan_result.get("mail_plan") or {})
@@ -2549,7 +2549,10 @@ def run_default_closeout_prefers_brief_with_generic_overlap() -> dict[str, Any]:
     )
     candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
     _assert_equal(len([item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]), 1, "default closeout brief candidate")
-    _assert_true(any(item.get("kind") == "assistant_last_answer" for item in candidates), "default closeout raw answer candidate retained")
+    _assert_true(
+        not any(item.get("kind") == "assistant_last_answer" for item in candidates),
+        "default closeout raw answer candidate retired",
+    )
     plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
     mail_plan = dict(plan_result.get("mail_plan") or {})
     source_resolution = dict(mail_plan.get("source_resolution") or {})
@@ -2670,7 +2673,7 @@ def run_prior_answer_without_topic_overlap() -> dict[str, Any]:
                 "content_type": "text/plain",
             },
         ],
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     _assert_equal(ambiguous_resolution.get("source_mode"), "none", "ambiguous prior source mode")
@@ -2716,7 +2719,7 @@ def run_chinese_prior_answer_with_active_brief() -> dict[str, Any]:
     resolution = resolve_mail_source_request(
         message="请把前面提到的 MedThink EU 回答发给 customer@example.com。",
         candidates=candidates,
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     _assert_equal(resolution.get("source_mode"), "prior_assistant_answer", "Chinese prior answer source mode")
@@ -2755,13 +2758,13 @@ def run_prior_answer_unavailable_with_active_brief() -> dict[str, Any]:
     english_resolution = resolve_mail_source_request(
         message="Please email customer@example.com the prior answer.",
         candidates=candidates,
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     chinese_resolution = resolve_mail_source_request(
         message="请把刚才的回答发给 customer@example.com。",
         candidates=candidates,
-        legacy_referential_request=True,
+        prior_answer_compatibility_request=True,
         explicit_summary=False,
     )
     for label, resolution in (("English unavailable", english_resolution), ("Chinese unavailable", chinese_resolution)):
@@ -2853,7 +2856,10 @@ def run_polish_rewrite_from_active_brief() -> dict[str, Any]:
         roles=actor_context["roles"],
     )
     candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
-    _assert_true(any(item.get("kind") == "assistant_last_answer" for item in candidates), "polish raw assistant candidate retained")
+    _assert_true(
+        not any(item.get("kind") == "assistant_last_answer" for item in candidates),
+        "polish raw assistant candidate retired",
+    )
     plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
     mail_plan = dict(plan_result.get("mail_plan") or {})
     source_resolution = dict(mail_plan.get("source_resolution") or {})
@@ -4508,6 +4514,131 @@ def run_thread_governance_recovery() -> dict[str, Any]:
     }
 
 
+def run_legacy_retirement_thread_native() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-legacy-retirement-{suffix}"
+    conversation_id = f"conversation-legacy-retirement-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-legacy-retirement-{suffix}",
+        "user_id": f"user-legacy-retirement-{suffix}",
+        "workspace_id": "workspace-legacy-retirement",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-legacy-retirement-{suffix}"
+    raw_answer = "RAW_ASSISTANT_ARTIFACT_MUST_NOT_BE_A_THREAD_NATIVE_CLOSEOUT_CARRIER"
+
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-legacy-retirement-1-{suffix}",
+        uid=f"uid-legacy-retirement-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Thread-native closeout",
+        received_at="2026-06-19T16:00:00+00:00",
+        summary="Customer needs the active thread closeout from the persisted brief.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "legacy retirement active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Thread-native closeout",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T16:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-legacy-retirement-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Prepare the active customer closeout from the thread-native brief.",
+        customer_context_summary="The customer wants a concise closeout grounded in the active thread.",
+        grounding_refs=[{"citation_id": "legacy-retirement-cite", "doc_id": "legacy-retirement-doc"}],
+        must_include=["thread-native closeout fact"],
+        recommended_next_action="draft_with_grounding",
+        confidence=0.91,
+        actor_context=actor_context,
+    )
+    _assert_true(
+        upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="legacy_retirement_thread_native"),
+        "legacy retirement stored brief",
+    )
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"raw-artifact-{suffix}",
+        answer_summary=raw_answer,
+        intent="enterprise_rag_query",
+        citations=[{"doc_id": "raw-artifact-doc", "title": "Raw artifact"}],
+        actor_context=actor_context,
+    )
+
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email customer@example.com the active thread closeout.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    kinds = [str(item.get("kind") or "") for item in candidates]
+    _assert_equal(kinds.count(COMMUNICATION_BRIEF_SOURCE_KIND), 1, "thread-native brief candidate count")
+    if "assistant_last_answer" in kinds:
+        raise AssertionError("thread-native closeout exposed raw assistant answer artifact carrier")
+
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(source_resolution.get("source_mode"), COMMUNICATION_BRIEF_SOURCE_KIND, "thread-native source mode")
+    _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "thread-native selected source")
+    if raw_answer in json.dumps(mail_plan, ensure_ascii=False):
+        raise AssertionError("raw answer artifact leaked into thread-native closeout plan")
+
+    explicit_payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email customer@example.com the prior assistant answer.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    explicit_candidates = main_module._collect_outbound_candidates(
+        explicit_payload,
+        conversation_id,
+        {},
+        actor_context=actor_context,
+    )
+    _assert_true(
+        any(item.get("kind") == "assistant_last_answer" for item in explicit_candidates),
+        "explicit prior-answer compatibility shim remains available",
+    )
+
+    return {
+        "ok": True,
+        "case": "legacy_retirement_thread_native",
+        "thread_id": thread_id,
+        "brief_id": brief.brief_id,
+        "candidate_kinds": kinds,
+        "explicit_compat_candidates": len(explicit_candidates),
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -4637,7 +4768,14 @@ def main() -> int:
         "workspace_thread_inbox": run_workspace_thread_inbox,
         "thread_meeting_escalation": run_thread_meeting_escalation,
         "thread_governance_recovery": run_thread_governance_recovery,
+        "legacy_retirement_thread_native": run_legacy_retirement_thread_native,
     }
+    if args.case_name == "all":
+        results = []
+        for case_name, case in cases.items():
+            results.append(case())
+        print(json.dumps({"ok": True, "case": "all", "results": results}, ensure_ascii=False, sort_keys=True))
+        return 0
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)
         return 2
