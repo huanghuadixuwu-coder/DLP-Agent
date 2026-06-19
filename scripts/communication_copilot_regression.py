@@ -2565,6 +2565,124 @@ def run_default_closeout_prefers_brief_with_generic_overlap() -> dict[str, Any]:
     }
 
 
+def run_prior_answer_without_topic_overlap() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.mail.source_resolver import resolve_mail_source_request
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-prior-no-overlap-{suffix}"
+    conversation_id = f"conversation-prior-no-overlap-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-prior-no-overlap-{suffix}",
+        "user_id": f"user-prior-no-overlap-{suffix}",
+        "workspace_id": "workspace-prior-no-overlap",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-prior-no-overlap-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-prior-no-overlap-1-{suffix}",
+        uid=f"uid-prior-no-overlap-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Active brief unrelated to prior answer",
+        received_at="2026-06-19T13:00:00+00:00",
+        summary="Active thread has a brief, but the user explicitly asks for a prior answer.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "prior no-overlap active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Active brief unrelated to prior answer",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T13:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-prior-no-overlap-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Prepare the active customer closeout.",
+        customer_context_summary="This active brief must not override explicit prior-answer intent.",
+        grounding_refs=[{"citation_id": "prior-no-overlap-brief-cite", "doc_id": "prior-no-overlap-brief-doc"}],
+        must_include=["active thread fact"],
+        recommended_next_action="draft_with_grounding",
+        confidence=0.9,
+        actor_context=actor_context,
+    )
+    _assert_true(upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="prior_no_overlap_regression"), "stored prior no-overlap brief")
+    prior_answer = "Zebra lantern protocol uses amber checkpoints before lunar archival."
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"zebra-lantern-{suffix}",
+        answer_summary=prior_answer,
+        intent="enterprise_rag_query",
+        citations=[{"doc_id": "zebra-lantern-doc", "title": "Zebra lantern protocol"}],
+        actor_context=actor_context,
+    )
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email customer@example.com the prior answer.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
+    assistant_candidates = [item for item in candidates if item.get("kind") == "assistant_last_answer"]
+    _assert_equal(len(brief_candidates), 1, "prior no-overlap active brief candidate")
+    _assert_equal(len(assistant_candidates), 1, "prior no-overlap assistant candidate")
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(source_resolution.get("source_mode"), "prior_assistant_answer", "prior no-overlap source mode")
+    _assert_equal(source_resolution.get("selected_candidate_ids"), [assistant_candidates[0]["candidate_id"]], "prior no-overlap selected source")
+    _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), "assistant_last_answer", "prior no-overlap selected candidate")
+    if brief.brief_id in json.dumps(mail_plan.get("reference_sources") or [], ensure_ascii=False):
+        raise AssertionError("active brief overrode explicit prior-answer request without topic overlap")
+
+    ambiguous_resolution = resolve_mail_source_request(
+        message="Please email customer@example.com the prior answer.",
+        candidates=[
+            *brief_candidates,
+            assistant_candidates[0],
+            {
+                "candidate_id": f"assistant-turn:second-prior-{suffix}",
+                "kind": "assistant_last_answer",
+                "label": "second unrelated source",
+                "content": "Blue orchard schedule uses quiet morning windows.",
+                "content_type": "text/plain",
+            },
+        ],
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    _assert_equal(ambiguous_resolution.get("source_mode"), "none", "ambiguous prior source mode")
+    _assert_equal(ambiguous_resolution.get("needs_clarification"), True, "ambiguous prior clarification")
+
+    return {
+        "ok": True,
+        "case": "prior_answer_without_topic_overlap",
+        "source_mode": source_resolution.get("source_mode"),
+        "ambiguous_status": ambiguous_resolution.get("status"),
+        "candidate_count": len(candidates),
+    }
+
+
 def run_polish_rewrite_from_active_brief() -> dict[str, Any]:
     import app.main as main_module
     from app.communication.brief_store import upsert_communication_brief
@@ -3426,6 +3544,7 @@ def main() -> int:
         "grounded_reply_from_thread": run_grounded_reply_from_thread,
         "explicit_prior_answer_with_active_brief": run_explicit_prior_answer_with_active_brief,
         "default_closeout_prefers_brief_with_generic_overlap": run_default_closeout_prefers_brief_with_generic_overlap,
+        "prior_answer_without_topic_overlap": run_prior_answer_without_topic_overlap,
         "polish_rewrite_from_active_brief": run_polish_rewrite_from_active_brief,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,

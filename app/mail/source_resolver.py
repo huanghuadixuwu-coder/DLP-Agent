@@ -176,6 +176,25 @@ def resolve_mail_source_request(
             reason="Selected the prior assistant answer matched by explicit request anchors before default communication brief closeout.",
             classifier_source="deterministic_prior_assistant_anchor_match",
         )
+    if _explicit_prior_assistant_reference(message):
+        if len(assistant_candidates) == 1:
+            return _resolution(
+                selected_candidate_ids=[assistant_candidates[0]["candidate_id"]],
+                source_mode="prior_assistant_answer",
+                compose_mode="recipient_ready_summary",
+                referential_request=True,
+                confidence=0.88,
+                reason="Selected the single prior assistant answer explicitly requested by the user.",
+                classifier_source="deterministic_explicit_prior_assistant_reference",
+            )
+        if len(assistant_candidates) > 1:
+            return _resolution(
+                source_mode="none",
+                needs_clarification=True,
+                confidence=0.86,
+                reason="The user requested a prior assistant answer, but multiple prior answers are available.",
+                classifier_source="deterministic_explicit_prior_assistant_ambiguous",
+            )
     competing_reference_candidates = [
         item
         for item in normalized_candidates
