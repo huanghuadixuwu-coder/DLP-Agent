@@ -1157,6 +1157,7 @@ def _workspace_task_progress(
     thread_id: str,
     brief_id: str,
     draft_id: str,
+    draft_task_id: str = "",
 ) -> list[dict[str, Any]]:
     workspace_task_reader = bool({"admin", "approver"}.intersection({str(role).lower() for role in actor.roles}))
     tasks = list_dlp_tasks(
@@ -1166,18 +1167,20 @@ def _workspace_task_progress(
         workspace_id=None if actor.is_local_dev else actor.workspace_id,
     )
     selected: list[dict[str, Any]] = []
-    has_selected_scope = bool(thread_id or brief_id or draft_id)
+    has_selected_scope = bool(thread_id or brief_id or draft_id or draft_task_id)
     for task in tasks:
         payload = dict(task.get("domain_payload") or {})
+        task_id = str(task.get("task_id") or "")
         matches_thread = bool(thread_id) and str(payload.get("thread_id") or "") == thread_id
         matches_brief = bool(brief_id) and str(payload.get("brief_id") or "") == brief_id
         matches_draft = bool(draft_id) and str(task.get("mail_draft_id") or "") == draft_id
+        matches_draft_task = bool(draft_task_id) and task_id == draft_task_id
         matches_conversation = (
             not has_selected_scope
             and bool(conversation_id)
             and str(task.get("conversation_id") or "") == conversation_id
         )
-        if matches_thread or matches_brief or matches_draft or matches_conversation:
+        if matches_thread or matches_brief or matches_draft or matches_draft_task or matches_conversation:
             selected.append(_task_progress_payload(task))
     return selected[:20]
 
@@ -1795,6 +1798,7 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[st
         scenario_name=payload.scenario_name,
         fault_injection=fault_injection,
         expected_outcome=dict(payload.expected_outcome or {}),
+        domain_payload=dict(payload.domain_payload or {}),
         mail_draft_id=str(payload.mail_draft_id or ""),
         idempotency_key=str(payload.idempotency_key or ""),
         tenant_id=actor.tenant_id,
@@ -5435,6 +5439,18 @@ def _handle_async_outbound_agent_request(
     )
 
 
+def _mail_plan_domain_payload(mail_plan: dict[str, Any]) -> dict[str, Any]:
+    plan = dict(mail_plan or {})
+    thread_ref = dict(plan.get("thread_ref") or {})
+    payload = {
+        "thread_id": str(thread_ref.get("thread_id") or plan.get("thread_id") or ""),
+        "brief_id": str(plan.get("source_brief_id") or plan.get("brief_id") or ""),
+        "draft_id": str(plan.get("draft_id") or ""),
+        "communication_context_source": "mail_plan",
+    }
+    return {key: value for key, value in payload.items() if value}
+
+
 def _create_dlp_task_from_mail_plan(
     *,
     session_id: str,
@@ -5486,6 +5502,7 @@ def _create_dlp_task_from_mail_plan(
             roles=list((actor_context or {}).get("roles") or []),
             mail_draft_id=draft_id,
             idempotency_key=idempotency_key,
+            domain_payload=_mail_plan_domain_payload(mail_plan),
         ),
         actor_context=actor_context,
     )
@@ -6691,16 +6708,14 @@ def internal_communication_workspace_api(
     requested_thread_id = str(thread_id or "").strip()
     selected_thread: dict[str, Any] | None = None
     if requested_thread_id:
-        selected_thread = set_active_communication_thread(requested_thread_id, actor_context=actor_context)
-        if not selected_thread:
-            selected_thread = get_communication_thread(requested_thread_id, actor_context=actor_context, refresh=refresh)
+        selected_thread = get_communication_thread(requested_thread_id, actor_context=actor_context, refresh=refresh)
     if not selected_thread:
         selected_thread = get_active_communication_thread(actor_context=actor_context)
     if not selected_thread and threads:
-        selected_thread = set_active_communication_thread(str(threads[0].get("thread_id") or ""), actor_context=actor_context)
+        selected_thread = dict(threads[0])
     selected_thread = dict(selected_thread or {})
     selected_thread_id = str(selected_thread.get("thread_id") or "")
-    active_thread = get_active_communication_thread(actor_context=actor_context) if selected_thread_id else None
+    active_thread = get_active_communication_thread(actor_context=actor_context)
     latest_brief = _communication_brief_record_payload(
         get_latest_brief_for_thread(selected_thread_id, actor_context=actor_context) if selected_thread_id else None
     )
@@ -6724,6 +6739,7 @@ def internal_communication_workspace_api(
         thread_id=selected_thread_id,
         brief_id=brief_id,
         draft_id=str(draft_preview.get("draft_id") or ""),
+        draft_task_id=str(draft_preview.get("dlp_task_id") or ""),
     )
 
     return {

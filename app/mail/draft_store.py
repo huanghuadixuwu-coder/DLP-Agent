@@ -247,7 +247,11 @@ def get_latest_active_mail_draft_for_thread(
 
     init_mail_draft_store()
     actor = actor_from_mapping(actor_context or {}, conversation_id=conversation_id)
-    statuses = ["pending_confirmation", "queued_dlp"] if pending_confirmation_only else sorted(ACTIVE_DRAFT_STATUSES)
+    statuses = (
+        ["pending_confirmation", "queued_dlp"]
+        if pending_confirmation_only
+        else sorted({*ACTIVE_DRAFT_STATUSES, "queued_dlp"})
+    )
     placeholders = ", ".join(["%s"] * len(statuses))
     with _connect() as conn:
         rows = conn.execute(

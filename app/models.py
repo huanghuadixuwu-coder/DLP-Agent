@@ -421,6 +421,7 @@ class DlpTaskCreateRequest(BaseModel):
     roles: list[str] = Field(default_factory=list)
     mail_draft_id: str = ""
     idempotency_key: str = ""
+    domain_payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class DlpTaskApprovalRequest(BaseModel):

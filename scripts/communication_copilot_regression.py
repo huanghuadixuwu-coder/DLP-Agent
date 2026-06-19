@@ -2474,7 +2474,7 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
     from app.communication.thread_store import set_active_communication_thread
     from app.communication.types import CommunicationBrief, CommunicationThreadRef
     from app.config import get_settings
-    from app.mail.draft_store import upsert_mail_draft
+    from app.mail.draft_store import bind_mail_draft_task, upsert_mail_draft
     from app.task_store import create_dlp_task
 
     suffix = uuid4().hex[:8]
@@ -2547,7 +2547,7 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         mail_plan={
             "draft_id": f"draft-workspace-inbox-{suffix}",
             "mail_action_type": "send_reply",
-            "status": "draft_ready",
+            "status": "pending_confirmation",
             "resolved_recipients": ["customer@example.com"],
             "resolved_subject": "Re: Thread inbox workspace renewal",
             "resolved_body": "Draft preview body scoped to the selected thread.",
@@ -2555,7 +2555,7 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
             "source_brief_id": brief.brief_id,
         },
         actor_context=actor_context,
-        status="draft_ready",
+        status="pending_confirmation",
     )
     _assert_true(stored_draft, "workspace draft preview")
     created_task = create_dlp_task(
@@ -2568,13 +2568,24 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         destination_email="customer@example.com",
         status="pending_approval",
         domain_action="mail_send",
-        domain_payload={"thread_id": thread_id, "brief_id": brief.brief_id},
+        domain_payload={},
         mail_draft_id=str(stored_draft["draft_id"]),
         tenant_id=actor_context["tenant_id"],
         user_id=actor_context["user_id"],
         workspace_id=actor_context["workspace_id"],
     )
     _assert_true(created_task, "workspace task progress")
+    bound_selected_draft = bind_mail_draft_task(
+        str(stored_draft["draft_id"]),
+        actor_context=actor_context,
+        confirmation_key=str(stored_draft["confirmation_key"]),
+        task_id=str(created_task["task_id"]),
+    )
+    _assert_equal(
+        (bound_selected_draft or {}).get("status"),
+        "queued_dlp",
+        "selected draft queued after DLP bind",
+    )
     other_thread_id = f"thread-workspace-other-{suffix}"
     _seed_thread_store_message(
         actor_context=actor_context,
@@ -2622,7 +2633,7 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         mail_plan={
             "draft_id": f"draft-workspace-other-{suffix}",
             "mail_action_type": "send_reply",
-            "status": "draft_ready",
+            "status": "pending_confirmation",
             "resolved_recipients": ["other-customer@example.com"],
             "resolved_subject": "Re: Other thread in same conversation",
             "resolved_body": "This other draft must not appear for the selected thread.",
@@ -2630,27 +2641,9 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
             "source_brief_id": other_brief.brief_id,
         },
         actor_context=actor_context,
-        status="draft_ready",
+        status="pending_confirmation",
     )
     _assert_true(other_draft, "other workspace draft")
-    with psycopg.connect(get_settings().postgres_dsn) as conn:
-        conn.execute(
-            """
-            UPDATE mail_drafts
-            SET status = 'draft_ready', updated_at = %s
-            WHERE draft_id = %s
-            """,
-            ("2026-06-18T10:06:00+00:00", stored_draft["draft_id"]),
-        )
-        conn.execute(
-            """
-            UPDATE mail_drafts
-            SET status = 'draft_ready', updated_at = %s
-            WHERE draft_id = %s
-            """,
-            ("2026-06-18T10:07:00+00:00", other_draft["draft_id"]),
-        )
-        conn.commit()
     other_task = create_dlp_task(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -2661,15 +2654,72 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         destination_email="other-customer@example.com",
         status="pending_approval",
         domain_action="mail_send",
-        domain_payload={"thread_id": other_thread_id, "brief_id": other_brief.brief_id},
+        domain_payload={},
         mail_draft_id=str(other_draft["draft_id"]),
         tenant_id=actor_context["tenant_id"],
         user_id=actor_context["user_id"],
         workspace_id=actor_context["workspace_id"],
     )
     _assert_true(other_task, "other workspace task")
+    bound_other_draft = bind_mail_draft_task(
+        str(other_draft["draft_id"]),
+        actor_context=actor_context,
+        confirmation_key=str(other_draft["confirmation_key"]),
+        task_id=str(other_task["task_id"]),
+    )
+    _assert_equal(
+        (bound_other_draft or {}).get("status"),
+        "queued_dlp",
+        "other draft queued after DLP bind",
+    )
+    with psycopg.connect(get_settings().postgres_dsn) as conn:
+        conn.execute(
+            """
+            UPDATE mail_drafts
+            SET status = 'queued_dlp', updated_at = %s
+            WHERE draft_id = %s
+            """,
+            ("2026-06-18T10:06:00+00:00", stored_draft["draft_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE mail_drafts
+            SET status = 'queued_dlp', updated_at = %s
+            WHERE draft_id = %s
+            """,
+            ("2026-06-18T10:07:00+00:00", other_draft["draft_id"]),
+        )
+        conn.commit()
 
     client = TestClient(main_module.app)
+    deep_link_response = client.get(
+        "/internal/communication/workspace",
+        params={
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "thread_id": other_thread_id,
+        },
+        headers=headers,
+    )
+    _assert_equal(deep_link_response.status_code, 200, "workspace deep-link API status")
+    deep_link_workspace = deep_link_response.json()
+    _assert_equal(
+        (deep_link_workspace.get("selected_thread") or {}).get("thread_id"),
+        other_thread_id,
+        "workspace deep-link displays requested thread",
+    )
+    _assert_equal(
+        (deep_link_workspace.get("active_thread") or {}).get("thread_id"),
+        thread_id,
+        "workspace GET does not overwrite active thread",
+    )
+    active_after_deep_link = client.get("/internal/communication/threads/active", headers=headers)
+    _assert_equal(active_after_deep_link.status_code, 200, "active thread API status after deep-link")
+    _assert_equal(
+        (active_after_deep_link.json().get("active_thread") or {}).get("thread_id"),
+        thread_id,
+        "active thread survives read-only workspace GET",
+    )
     response = client.get(
         "/internal/communication/workspace",
         params={
