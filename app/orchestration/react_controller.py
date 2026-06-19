@@ -16,7 +16,7 @@ from app.graph import get_llm
 from app.hermes_dynamic_memory import get_recent_compactions, get_structured_turn_summaries, get_user_memory_context, get_workspace_memory_context
 from app.observability import estimate_cost, normalize_usage
 from app.orchestration.final_renderer import fallback_final_answer, render_final_answer
-from app.orchestration.observations import make_typed_observation
+from app.orchestration.observations import AGENT_CHAT_CONTEXT_OBSERVATION_TYPES, make_typed_observation
 from app.orchestration.registry import build_tool_executor_map, build_tool_registry
 from app.orchestration.types import OrchestrationContext, PendingConfirmation, ReactTraceStep
 
@@ -682,7 +682,22 @@ def _direct_answer_requires_grounding(state: dict[str, Any]) -> bool:
         return False
     if required_grounding == "memory":
         return not bool(state.get("memory_reads"))
+    if required_grounding in {"tool", "retrieval"}:
+        return not any(
+            _is_tool_or_retrieval_grounding_observation(item)
+            for item in list(state.get("observations") or [])
+            if isinstance(item, dict)
+        )
     return not bool(state.get("observations"))
+
+
+def _is_tool_or_retrieval_grounding_observation(observation: dict[str, Any]) -> bool:
+    observation_type = str(observation.get("observation_type") or "")
+    if observation_type in AGENT_CHAT_CONTEXT_OBSERVATION_TYPES:
+        return False
+    if not bool(observation.get("success", True)):
+        return False
+    return str(observation.get("grounding_kind") or "") in {"tool", "retrieval"}
 
 
 def _auto_ground_before_direct_answer(

@@ -143,11 +143,15 @@ def main() -> None:
         actor_context=actor,
     )
     captured_react_state: dict[str, list[dict[str, object]]] = {}
+    grounding_tool_calls: list[dict[str, object]] = []
     original_think_next_step = react_controller._think_next_step
+    original_build_tool_executor_map = react_controller.build_tool_executor_map
 
     def _capture_initial_state(state: dict[str, object], _registry: dict[str, object]) -> dict[str, object]:
-        captured_react_state["observations"] = list(state.get("observations") or [])
-        captured_react_state["tool_observations"] = list(state.get("tool_observations") or [])
+        captured_react_state.setdefault("first_observations", list(state.get("observations") or []))
+        captured_react_state.setdefault("first_tool_observations", list(state.get("tool_observations") or []))
+        captured_react_state["last_observations"] = list(state.get("observations") or [])
+        captured_react_state["last_tool_observations"] = list(state.get("tool_observations") or [])
         return {
             "current_goal": "contextual_qa",
             "thought_summary": "Initial observations were available before planning.",
@@ -157,8 +161,17 @@ def main() -> None:
             "tool_input": {},
         }
 
+    def _fake_enterprise_rag_query(payload: dict[str, object], *_args: object) -> dict[str, object]:
+        grounding_tool_calls.append(dict(payload))
+        return {
+            "answer": "Grounded answer from fake EnterpriseRAG.",
+            "supporting_doc_ids": ["doc-runtime-grounding"],
+            "citations_brief": [{"doc_id": "doc-runtime-grounding", "title": "Runtime grounding"}],
+        }
+
     try:
         react_controller._think_next_step = _capture_initial_state
+        react_controller.build_tool_executor_map = lambda: {"enterprise_rag_query": _fake_enterprise_rag_query}
         react_result = react_controller.run_react_agent_request(
             session_id="session-runtime-live-state",
             conversation_id="conversation-runtime-live-state",
@@ -173,11 +186,17 @@ def main() -> None:
         )
     finally:
         react_controller._think_next_step = original_think_next_step
+        react_controller.build_tool_executor_map = original_build_tool_executor_map
 
     react_initial_state_ok = (
-        captured_react_state.get("observations", [{}])[0].get("observation_type") == "active_communication_thread"
-        and captured_react_state.get("tool_observations", [{}])[0].get("observation_type") == "active_communication_thread"
+        captured_react_state.get("first_observations", [{}])[0].get("observation_type") == "active_communication_thread"
+        and captured_react_state.get("first_tool_observations", [{}])[0].get("observation_type") == "active_communication_thread"
         and (react_result.get("tool_observations") or [{}])[0].get("observation_type") == "active_communication_thread"
+    )
+    react_required_grounding_ok = (
+        len(grounding_tool_calls) == 1
+        and any(item.get("tool_name") == "enterprise_rag_query" for item in list(react_result.get("tool_calls") or []))
+        and any(item.get("observation_type") == "enterprise_answer" for item in list(react_result.get("tool_observations") or []))
     )
     metrics_text = render_metrics().decode("utf-8", errors="ignore")
 
@@ -185,6 +204,7 @@ def main() -> None:
         "ok": not missing_keys
         and context_contract_ok
         and react_initial_state_ok
+        and react_required_grounding_ok
         and memory_verdict.get("needs_rewrite")
         and confirmation_verdict.get("needs_rewrite")
         and not trace_evaluation.get("ok")
@@ -194,6 +214,7 @@ def main() -> None:
             "typed_observation_contract": not missing_keys,
             "agent_chat_context_observation_contract": context_contract_ok,
             "react_initial_observations_live_before_planning": react_initial_state_ok,
+            "react_context_observations_do_not_satisfy_tool_grounding": react_required_grounding_ok,
             "memory_boundary_guard": memory_verdict.get("needs_rewrite"),
             "confirmation_guard": confirmation_verdict.get("needs_rewrite"),
             "trace_evaluator_flags_bad_trace": not trace_evaluation.get("ok"),
@@ -207,8 +228,9 @@ def main() -> None:
         "failure_observation": failure_observation,
         "context_observation_types": [item.get("observation_type") for item in context_observations],
         "react_captured_initial_types": [
-            item.get("observation_type") for item in captured_react_state.get("observations", [])
+            item.get("observation_type") for item in captured_react_state.get("first_observations", [])
         ],
+        "react_grounding_tool_calls": grounding_tool_calls,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
