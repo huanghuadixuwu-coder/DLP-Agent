@@ -6,9 +6,10 @@ from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
 from app.mail.source_resolver import apply_source_resolution
 
-REFERENCE_CANDIDATE_KINDS = {"assistant_last_answer", "meeting_result", "mail_thread", "user_recent_text"}
+REFERENCE_CANDIDATE_KINDS = {"assistant_last_answer", "meeting_result", "mail_thread", "user_recent_text", COMMUNICATION_BRIEF_SOURCE_KIND}
 
 
 @dataclass(frozen=True)
@@ -819,12 +820,21 @@ def _detect_mail_action_type(message: str) -> str:
     return "send_message"
 
 
-def _choose_authoring_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _choose_authoring_candidate(
+    candidates: list[dict[str, Any]],
+    source_resolution: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    selected_ids = [str(item) for item in list((source_resolution or {}).get("selected_candidate_ids") or []) if str(item)]
+    for candidate_id in selected_ids:
+        selected = next((item for item in candidates if str(item.get("candidate_id") or "") == candidate_id), None)
+        if selected:
+            return selected
     return (
         _candidate_by_kind(candidates, "user_inline_text")
         or _candidate_by_kind(candidates, "user_recent_text")
         or _candidate_by_kind(candidates, "meeting_result")
         or _candidate_by_kind(candidates, "mail_thread")
+        or _candidate_by_kind(candidates, COMMUNICATION_BRIEF_SOURCE_KIND)
         or _candidate_by_kind(candidates, "assistant_last_answer")
         or _candidate_by_kind(candidates, "uploaded_text")
     )
@@ -870,7 +880,7 @@ def build_mail_action_plan(
             "clarification_kind": "missing_target_message",
         }
     if action_type in {"polish_body", "rewrite_body"}:
-        candidate = _choose_authoring_candidate(candidates)
+        candidate = _choose_authoring_candidate(candidates, source_resolution=source_resolution)
         has_source, constraints, body_sources, reference_sources, compose_mode = _render_authoring_draft(message, candidate)
         if not has_source:
             return {
@@ -904,6 +914,7 @@ def build_mail_action_plan(
                 source_policy=_mail_source_policy(),
                 compose_mode=compose_mode,
                 reference_sources=reference_sources,
+                source_resolution=dict(source_resolution or {}),
                 source_artifacts=_source_artifacts(candidate, None),
                 provenance_refs=_source_artifacts(candidate, None),
             ),

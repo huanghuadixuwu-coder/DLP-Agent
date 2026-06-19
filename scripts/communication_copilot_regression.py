@@ -1542,10 +1542,10 @@ def run_mail_closeout() -> dict[str, Any]:
         legacy_referential_request=True,
         explicit_summary=True,
     )
-    _assert_equal(anchored_prior_answer_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "anchored prior answer source mode")
+    _assert_equal(anchored_prior_answer_resolution["source_mode"], "prior_assistant_answer", "anchored prior answer source mode")
     _assert_equal(
         anchored_prior_answer_resolution["selected_candidate_ids"],
-        ["communication-brief:brief_closeout_123"],
+        ["assistant-turn:medthink-failover"],
         "anchored prior answer selected candidate",
     )
     _assert_equal(anchored_prior_answer_resolution["needs_clarification"], False, "anchored prior answer clarification")
@@ -2285,7 +2285,7 @@ def run_grounded_reply_from_thread() -> dict[str, Any]:
     brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
     assistant_candidates = [item for item in candidates if item.get("kind") == "assistant_last_answer"]
     _assert_equal(len(brief_candidates), 1, "grounded reply brief candidate count")
-    _assert_equal(assistant_candidates, [], "raw answer fallback suppressed when active brief exists")
+    _assert_true(assistant_candidates, "explicit assistant source candidates remain available with active brief")
 
     plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
     mail_plan = dict(plan_result.get("mail_plan") or {})
@@ -2369,6 +2369,200 @@ def run_grounded_reply_from_thread() -> dict[str, Any]:
         "source_mode": source_resolution.get("source_mode"),
         "candidate_count": len(candidates),
         "resolved_body_chars": len(resolved_body),
+    }
+
+
+def run_explicit_prior_answer_with_active_brief() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-explicit-prior-{suffix}"
+    conversation_id = f"conversation-explicit-prior-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-explicit-prior-{suffix}",
+        "user_id": f"user-explicit-prior-{suffix}",
+        "workspace_id": "workspace-explicit-prior",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-explicit-prior-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-explicit-prior-1-{suffix}",
+        uid=f"uid-explicit-prior-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="active-customer@example.com",
+        recipients="rep@example.com",
+        subject="Active renewal thread",
+        received_at="2026-06-19T10:00:00+00:00",
+        summary="Active thread has a renewal brief, but the user may reference a separate prior answer.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "explicit prior active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Active renewal thread",
+        participants=["active-customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T10:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-explicit-prior-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Prepare renewal closeout from the active thread.",
+        customer_context_summary="Active thread should remain default closeout context only.",
+        grounding_refs=[{"citation_id": "active-brief-cite", "doc_id": "active-brief-doc"}],
+        must_include=["active thread renewal fact"],
+        recommended_next_action="draft_with_grounding",
+        confidence=0.88,
+        actor_context=actor_context,
+    )
+    _assert_true(upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="explicit_prior_regression"), "stored active brief")
+    prior_answer = "Global rollout answer says the neutral migration window is Wednesday at 14:00 UTC."
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"global-answer-{suffix}",
+        answer_summary=prior_answer,
+        intent="enterprise_rag_query",
+        citations=[{"doc_id": "global-rollout-doc", "title": "Global rollout answer"}],
+        actor_context=actor_context,
+    )
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email customer@example.com the Global rollout answer from the prior assistant answer.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
+    assistant_candidates = [item for item in candidates if item.get("kind") == "assistant_last_answer"]
+    _assert_equal(len(brief_candidates), 1, "explicit prior active brief candidate")
+    _assert_equal(len(assistant_candidates), 1, "explicit prior assistant candidate retained")
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(source_resolution.get("source_mode"), "prior_assistant_answer", "explicit prior source mode")
+    _assert_equal(source_resolution.get("selected_candidate_ids"), [assistant_candidates[0]["candidate_id"]], "explicit prior selected source")
+    _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), "assistant_last_answer", "explicit prior selected candidate")
+    if brief.brief_id in json.dumps(mail_plan.get("reference_sources") or [], ensure_ascii=False):
+        raise AssertionError("active brief silently overrode explicit prior assistant source")
+
+    return {
+        "ok": True,
+        "case": "explicit_prior_answer_with_active_brief",
+        "source_mode": source_resolution.get("source_mode"),
+        "selected_candidate": source_resolution.get("selected_candidate_ids"),
+        "candidate_count": len(candidates),
+    }
+
+
+def run_polish_rewrite_from_active_brief() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-polish-brief-{suffix}"
+    conversation_id = f"conversation-polish-brief-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-polish-brief-{suffix}",
+        "user_id": f"user-polish-brief-{suffix}",
+        "workspace_id": "workspace-polish-brief",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-polish-brief-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-polish-brief-1-{suffix}",
+        uid=f"uid-polish-brief-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Polish active brief",
+        received_at="2026-06-19T11:00:00+00:00",
+        summary="Customer needs a polished closeout from the active brief.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "polish active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Polish active brief",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T11:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-polish-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Polish the active brief into recipient-ready wording.",
+        customer_context_summary="Customer wants a concise enterprise support closeout.",
+        grounding_refs=[{"citation_id": "polish-brief-cite", "doc_id": "polish-brief-doc"}],
+        must_include=["support will monitor the rollout"],
+        recommended_next_action="draft_with_grounding",
+        confidence=0.9,
+        actor_context=actor_context,
+    )
+    _assert_true(upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="polish_brief_regression"), "stored polish brief")
+    raw_answer = "RAW_ASSISTANT_ANSWER_SHOULD_NOT_BE_POLISHED_WHEN_BRIEF_SELECTED"
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"raw-polish-answer-{suffix}",
+        answer_summary=raw_answer,
+        intent="enterprise_rag_query",
+        citations=[{"doc_id": "raw-polish-doc", "title": "Raw polish answer"}],
+        actor_context=actor_context,
+    )
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please polish the latest active brief.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    _assert_true(any(item.get("kind") == "assistant_last_answer" for item in candidates), "polish raw assistant candidate retained")
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(plan_result.get("mode"), "draft_only", "polish brief mode")
+    _assert_equal(source_resolution.get("source_mode"), COMMUNICATION_BRIEF_SOURCE_KIND, "polish brief source mode")
+    _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "polish selected brief")
+    _assert_equal(list(mail_plan.get("reference_sources") or [])[0].get("role"), COMMUNICATION_BRIEF_SOURCE_KIND, "polish reference role")
+    if raw_answer in json.dumps(mail_plan.get("reference_sources") or [], ensure_ascii=False):
+        raise AssertionError("polish/rewrite selected raw assistant answer instead of active brief")
+
+    return {
+        "ok": True,
+        "case": "polish_rewrite_from_active_brief",
+        "source_mode": source_resolution.get("source_mode"),
+        "target_object": mail_plan.get("target_object"),
+        "candidate_count": len(candidates),
     }
 
 
@@ -3135,6 +3329,8 @@ def main() -> int:
         "retirement": run_retirement,
         "runtime_brief_closeout": run_runtime_brief_closeout,
         "grounded_reply_from_thread": run_grounded_reply_from_thread,
+        "explicit_prior_answer_with_active_brief": run_explicit_prior_answer_with_active_brief,
+        "polish_rewrite_from_active_brief": run_polish_rewrite_from_active_brief,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,
     }
