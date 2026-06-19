@@ -19,6 +19,7 @@ class DomainAgentDefinition:
     provider_constraints: list[str] = field(default_factory=list)
     communication_role: str = ""
     communication_input_kind: str = ""
+    communication_closeout_owner: str = ""
     returns_observation_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +94,7 @@ def build_domain_agent_catalog() -> dict[str, DomainAgentDefinition]:
             ),
             communication_role=subordinate_metadata.get("communication_role", ""),
             communication_input_kind=subordinate_metadata.get("communication_input_kind", ""),
+            communication_closeout_owner=subordinate_metadata.get("communication_closeout_owner", ""),
             returns_observation_type=subordinate_metadata.get("returns_observation_type", ""),
         )
 
@@ -142,6 +144,7 @@ def _communication_subordinate_metadata(agent_name: str) -> dict[str, str]:
         "meeting": {
             "communication_role": "escalation_provider",
             "communication_input_kind": "meeting_escalation_candidate",
+            "communication_closeout_owner": "mail_agent",
             "returns_observation_type": "meeting_result",
         },
     }.get(agent_name, {})

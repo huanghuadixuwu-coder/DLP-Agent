@@ -12,22 +12,35 @@ if str(ROOT) not in sys.path:
 
 import app.main as main_module
 import app.task_worker as task_worker
+from app.auth_store import create_login_code, verify_login_code
+from app.communication.brief_store import get_latest_brief_for_thread, upsert_communication_brief
+from app.communication.thread_store import set_active_communication_thread, upsert_thread_projection
+from app.communication.types import CommunicationBrief, CommunicationThreadRef
 
 app = main_module.app
 
 
-def _post(client: TestClient, *, message: str, session_id: str, conversation_id: str) -> dict:
+def _post(
+    client: TestClient,
+    *,
+    message: str,
+    session_id: str,
+    conversation_id: str,
+    actor_context: dict,
+    headers: dict,
+) -> dict:
     response = client.post(
         "/agent/chat",
         json={
             "session_id": session_id,
             "conversation_id": conversation_id,
             "message": message,
-            "tenant_id": "tenant-cross-domain",
-            "user_id": "user-cross-domain",
-            "workspace_id": "workspace-cross-domain",
-            "roles": ["admin", "user", "viewer"],
+            "tenant_id": actor_context["tenant_id"],
+            "user_id": actor_context["user_id"],
+            "workspace_id": actor_context["workspace_id"],
+            "roles": list(actor_context.get("roles") or ["admin", "user", "viewer"]),
         },
+        headers=headers,
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -103,6 +116,9 @@ def main() -> None:
             }
         assert action == "meeting_create_tencent_meeting", action
         assert allow_side_effects is True
+        assert parameters["thread_id"].startswith("thread-cross-domain-"), parameters
+        assert parameters["source_brief_id"].startswith("brief-cross-domain-"), parameters
+        assert parameters["actor_context"]["tenant_id"] == actor_context["tenant_id"], parameters
         return {
             "ok": True,
             "action": action,
@@ -131,29 +147,72 @@ def main() -> None:
     task_worker.dispatch_tool_call = _fake_dispatch
 
     session_id = "session-cross-domain-workflow"
+    login = create_login_code("cross-domain@example.com")
+    auth = verify_login_code("cross-domain@example.com", str(login["code"]))
+    auth_actor = dict(auth["user"])
     actor_context = {
-        "tenant_id": "tenant-cross-domain",
-        "user_id": "user-cross-domain",
-        "workspace_id": "workspace-cross-domain",
-        "roles": ["admin", "user", "viewer"],
+        "tenant_id": str(auth_actor["tenant_id"]),
+        "user_id": str(auth_actor["user_id"]),
+        "workspace_id": str(auth_actor["workspace_id"]),
+        "roles": list(auth_actor.get("roles") or ["admin", "user", "viewer"]),
         "session_id": session_id,
     }
+    headers = {"x-auth-session": str(auth["session_token"])}
     with TestClient(app) as client:
         conversation, _ = main_module._ensure_conversation(session_id, None, actor_context)
         conversation_id = str(conversation["conversation_id"])
+        actor_context["conversation_id"] = conversation_id
+        thread_id = f"thread-cross-domain-{conversation_id}"
+        brief_id = f"brief-cross-domain-{conversation_id}"
+        thread_ref = CommunicationThreadRef(
+            thread_id=thread_id,
+            source="mail",
+            subject="Customer follow-up meeting",
+            participants=["customer@example.com", "rep@example.com"],
+            latest_summary="Customer asked for a follow-up meeting.",
+            actor_context=actor_context,
+        )
+        upsert_thread_projection(thread_ref, actor_context=actor_context)
+        assert set_active_communication_thread(thread_id, actor_context=actor_context), thread_id
+        upsert_communication_brief(
+            CommunicationBrief(
+                brief_id=brief_id,
+                conversation_id=conversation_id,
+                thread_ref=thread_ref,
+                employee_goal="Schedule a customer follow-up meeting and prepare the invitation.",
+                customer_context_summary="Customer asked for a follow-up meeting.",
+                recommended_next_action="schedule_meeting",
+                confidence=0.84,
+                actor_context=actor_context,
+            ),
+            actor_context=actor_context,
+            refresh_reason="cross_domain_meeting_escalation_seed",
+        )
 
         plan_response = _post(
             client,
             message="Summarize the latest customer email and create a Tencent Meeting about customer follow-up tomorrow afternoon.",
             session_id=session_id,
             conversation_id=conversation_id,
+            actor_context=actor_context,
+            headers=headers,
         )
         pending_domain = dict(plan_response.get("pending_confirmation") or {})
         assert pending_domain.get("tool_name") == "meeting_create_tencent_meeting", pending_domain
+        pending_tool_input = dict(pending_domain.get("tool_input") or {})
+        assert pending_tool_input.get("thread_id") == thread_id, pending_domain
+        assert pending_tool_input.get("source_brief_id") == brief_id, pending_domain
         assert any(call.get("tool_name") == "inbound_mail_summary" for call in plan_response.get("tool_calls", [])), plan_response.get("tool_calls")
         assert any(call.get("tool_name") == "privacy_scan" for call in plan_response.get("tool_calls", [])), plan_response.get("tool_calls")
 
-        confirm_meeting = _post(client, message="confirm", session_id=session_id, conversation_id=conversation_id)
+        confirm_meeting = _post(
+            client,
+            message="confirm",
+            session_id=session_id,
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+            headers=headers,
+        )
         meeting_task_id = str(confirm_meeting.get("task_id") or "")
         assert meeting_task_id and confirm_meeting.get("task_status") == "queued", confirm_meeting
         assert enqueued_meetings == [meeting_task_id], enqueued_meetings
@@ -162,16 +221,39 @@ def main() -> None:
         assert meeting_worker_result["status"] == "completed", meeting_worker_result
         assert meeting_worker_result["result"]["communication_role"] == "escalation_provider", meeting_worker_result
         assert meeting_worker_result["result"]["communication_input_kind"] == "meeting_result", meeting_worker_result
+        assert meeting_worker_result["result"]["thread_id"] == thread_id, meeting_worker_result
+        latest_brief = get_latest_brief_for_thread(thread_id, actor_context=actor_context)
+        assert dict((latest_brief or {}).get("brief") or {}).get("recommended_next_action") == "draft_meeting_followup_via_mail_agent", latest_brief
 
-        result_response = _post(client, message="show meeting result", session_id=session_id, conversation_id=conversation_id)
+        result_response = _post(
+            client,
+            message="show meeting result",
+            session_id=session_id,
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+            headers=headers,
+        )
         assert result_response["intent"] == "meeting_result", result_response
-        result_observation = dict(list(result_response.get("tool_observations") or [])[0])
+        result_observation = next(
+            dict(item)
+            for item in list(result_response.get("tool_observations") or [])
+            if dict(item).get("observation_type") == "meeting_result"
+        )
         result_payload = dict(result_observation.get("payload") or {})
         assert result_payload.get("communication_role") == "escalation_provider", result_payload
         assert result_payload.get("communication_input_kind") == "meeting_result", result_payload
         assert result_payload.get("communication_closeout_owner") == "mail_agent", result_payload
+        assert result_payload.get("thread_id") == thread_id, result_payload
+        assert result_payload.get("source_brief_id") == brief_id, result_payload
 
-        invitation_response = _post(client, message="send to alice@example.com", session_id=session_id, conversation_id=conversation_id)
+        invitation_response = _post(
+            client,
+            message="send to alice@example.com",
+            session_id=session_id,
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+            headers=headers,
+        )
         pending_mail = dict(invitation_response.get("pending_confirmation") or {})
         mail_plan = dict(pending_mail.get("mail_plan") or {})
         assert pending_mail.get("action_name") == "send_mail_plan", pending_mail
@@ -180,8 +262,17 @@ def main() -> None:
         assert mail_plan.get("communication_role") == "escalation_provider", mail_plan
         assert mail_plan.get("communication_input_kind") == "meeting_result", mail_plan
         assert mail_plan.get("communication_closeout_owner") == "mail_agent", mail_plan
+        assert mail_plan.get("source_brief_id") == brief_id, mail_plan
+        assert dict(mail_plan.get("thread_ref") or {}).get("thread_id") == thread_id, mail_plan
 
-        confirm_mail = _post(client, message="confirm", session_id=session_id, conversation_id=conversation_id)
+        confirm_mail = _post(
+            client,
+            message="confirm",
+            session_id=session_id,
+            conversation_id=conversation_id,
+            actor_context=actor_context,
+            headers=headers,
+        )
         dlp_task_id = str(confirm_mail.get("task_id") or "")
         assert dlp_task_id, confirm_mail
         assert dlp_task_id in enqueued_dlp, (dlp_task_id, enqueued_dlp)

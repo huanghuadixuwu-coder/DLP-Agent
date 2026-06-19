@@ -223,6 +223,7 @@ def _execute_one(
 ) -> dict[str, Any]:
     registry = build_tool_registry()
     definition = registry[item.action or item.capability]
+    effective_parameters = _effective_parameters(item, context)
     if (definition.side_effectful or definition.requires_confirmation or item.confirmation_required) and not allow_side_effects:
         record_side_effect_blocked(item.agent, item.action or item.capability)
         return make_typed_observation(
@@ -236,9 +237,13 @@ def _execute_one(
                 "task_id": item.task_id,
                 "agent": item.agent,
                 "action": item.action or item.capability,
-                "parameters": item.parameters,
+                "parameters": effective_parameters,
                 "risk": item.risk,
-                "idempotency_key": item.idempotency_key,
+                "idempotency_key": str(effective_parameters.get("idempotency_key") or item.idempotency_key or ""),
+                "thread_id": str(effective_parameters.get("thread_id") or ""),
+                "source_brief_id": str(effective_parameters.get("source_brief_id") or effective_parameters.get("brief_id") or ""),
+                "brief_id": str(effective_parameters.get("brief_id") or effective_parameters.get("source_brief_id") or ""),
+                "actor_context": dict(effective_parameters.get("actor_context") or context.actor_context or {}),
                 "confirmation_required": True,
             },
             provenance={"source": "dag_executor", "agent": item.agent, "action": item.action or item.capability},
@@ -255,7 +260,7 @@ def _execute_one(
     }
     dispatched = dispatch_tool_call(
         item.action or item.capability,
-        item.parameters,
+        effective_parameters,
         context,
         dependency_payloads,
         allow_side_effects=allow_side_effects,
@@ -280,7 +285,10 @@ def _execute_one(
             "task_id": item.task_id,
             "agent": item.agent,
             "action": item.action or item.capability,
-            "idempotency_key": item.idempotency_key,
+            "idempotency_key": str(effective_parameters.get("idempotency_key") or item.idempotency_key or ""),
+            "thread_id": str(effective_parameters.get("thread_id") or ""),
+            "source_brief_id": str(effective_parameters.get("source_brief_id") or effective_parameters.get("brief_id") or ""),
+            "brief_id": str(effective_parameters.get("brief_id") or effective_parameters.get("source_brief_id") or ""),
         },
         provenance={"source": item.action or item.capability, "agent": item.agent},
         confidence=0.88 if dispatched.get("ok") else 0.35,
@@ -288,6 +296,57 @@ def _execute_one(
         actor_context=context.actor_context,
         success=bool(dispatched.get("ok")),
     )
+
+
+def _effective_parameters(item: AgentSubtask, context: OrchestrationContext) -> dict[str, Any]:
+    parameters = dict(item.parameters or {})
+    action = item.action or item.capability
+    if not (item.agent == "meeting" or action.startswith("meeting_")):
+        return parameters
+
+    idempotency_key = str(parameters.get("idempotency_key") or item.idempotency_key or "").strip()
+    if idempotency_key:
+        parameters["idempotency_key"] = idempotency_key
+    if context.actor_context:
+        parameters["actor_context"] = dict(context.actor_context or {})
+
+    agent_chat_context = _agent_chat_context(context)
+    if not agent_chat_context:
+        return parameters
+
+    server_global_mode = (
+        bool(agent_chat_context.get("global_mode"))
+        and bool(agent_chat_context.get("server_global_mode"))
+        and str(agent_chat_context.get("global_mode_source") or "") == "agent_chat_context"
+    )
+    parameters["global_mode"] = server_global_mode
+    parameters["server_global_mode"] = server_global_mode
+    parameters["global_mode_source"] = "agent_chat_context" if server_global_mode else ""
+    thread_id = str(agent_chat_context.get("thread_id") or "").strip()
+    brief_id = str(agent_chat_context.get("brief_id") or agent_chat_context.get("source_brief_id") or "").strip()
+    parameters["thread_id"] = thread_id
+    parameters["source_brief_id"] = brief_id
+    parameters["brief_id"] = brief_id
+    if context.actor_context:
+        parameters["actor_context"] = dict(context.actor_context or {})
+    else:
+        parameters.pop("actor_context", None)
+    active_thread = agent_chat_context.get("active_thread")
+    if isinstance(active_thread, dict):
+        parameters["thread_ref"] = dict(active_thread)
+    else:
+        parameters.pop("thread_ref", None)
+    if thread_id or brief_id:
+        parameters.setdefault("communication_role", "escalation_provider")
+        parameters.setdefault("communication_input_kind", "meeting_escalation_candidate")
+        parameters.setdefault("communication_closeout_owner", "mail_agent")
+    return parameters
+
+
+def _agent_chat_context(context: OrchestrationContext) -> dict[str, Any]:
+    upload_context = dict(context.upload_context or {})
+    candidate = upload_context.get("agent_chat_context")
+    return dict(candidate or {}) if isinstance(candidate, dict) else {}
 
 
 def _dependency_blocked_observation(
@@ -344,5 +403,6 @@ def _communication_subordinate_metadata(agent: str, action: str) -> dict[str, st
         return {
             "communication_role": "escalation_provider",
             "communication_input_kind": "meeting_escalation_candidate",
+            "communication_closeout_owner": "mail_agent",
         }
     return {}

@@ -7,7 +7,7 @@ from app.communication.thread_context import (
     CommunicationThreadContext,
     resolve_communication_thread_context,
 )
-from app.communication.types import CommunicationBrief, new_communication_id
+from app.communication.types import CommunicationBrief, CommunicationThreadRef, new_communication_id
 from app.orchestration.types import TypedObservation
 
 
@@ -236,3 +236,114 @@ def assemble_communication_brief_observation(
             "refresh_reason": str(stored.get("refresh_reason") or refresh_reason),
         }
     return brief, build_communication_brief_observation(brief, persistence_metadata=persistence_metadata)
+
+
+def record_meeting_result_on_brief(
+    *,
+    source_brief_id: str,
+    thread_id: str,
+    meeting_result: dict[str, Any],
+    task_id: str = "",
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach a completed meeting result to the thread brief as next-action state."""
+
+    brief_key = str(source_brief_id or "").strip()
+    thread_key = str(thread_id or "").strip()
+    if not brief_key or not thread_key:
+        return {}
+
+    from app.communication.brief_store import get_communication_brief, get_latest_brief_for_thread, upsert_communication_brief
+
+    actor = dict(actor_context or {})
+    stored = get_communication_brief(brief_key, actor_context=actor) or get_latest_brief_for_thread(thread_key, actor_context=actor)
+    brief_payload = dict((stored or {}).get("brief") or {})
+    if not brief_payload:
+        return {}
+
+    thread_ref_payload = dict(brief_payload.get("thread_ref") or {})
+    thread_ref_payload["thread_id"] = str(thread_ref_payload.get("thread_id") or thread_key)
+    if actor and not thread_ref_payload.get("actor_context"):
+        thread_ref_payload["actor_context"] = actor
+    thread_ref = CommunicationThreadRef(
+        **{
+            key: value
+            for key, value in thread_ref_payload.items()
+            if key in CommunicationThreadRef.__dataclass_fields__
+        }
+    )
+
+    meeting_ref = _meeting_result_brief_ref(meeting_result, task_id=task_id)
+    grounding_refs = _append_unique_meeting_ref(list(brief_payload.get("grounding_refs") or []), meeting_ref)
+    source_observation_ids = _dedupe_strings(
+        [
+            *list(brief_payload.get("source_observation_ids") or []),
+            f"meeting_task:{task_id}" if task_id else "",
+        ],
+        limit=12,
+    )
+    meeting_url = str(meeting_ref.get("meeting_url") or "").strip()
+    meeting_code = str(meeting_ref.get("meeting_code") or "").strip()
+    must_include = _dedupe_strings(
+        [
+            *list(brief_payload.get("must_include") or []),
+            f"meeting_url={meeting_url}" if meeting_url else "",
+            f"meeting_code={meeting_code}" if meeting_code else "",
+        ],
+        limit=12,
+    )
+
+    brief = CommunicationBrief(
+        brief_id=str(brief_payload.get("brief_id") or brief_key),
+        conversation_id=str(brief_payload.get("conversation_id") or ""),
+        thread_ref=thread_ref,
+        employee_goal=str(brief_payload.get("employee_goal") or ""),
+        customer_context_summary=str(brief_payload.get("customer_context_summary") or ""),
+        grounding_refs=grounding_refs,
+        must_include=must_include,
+        must_avoid=list(brief_payload.get("must_avoid") or []),
+        open_questions=list(brief_payload.get("open_questions") or []),
+        recommended_next_action="draft_meeting_followup_via_mail_agent",
+        source_observation_ids=source_observation_ids,
+        confidence=max(float(brief_payload.get("confidence") or 0.0), 0.88),
+        created_at=str(brief_payload.get("created_at") or ""),
+        actor_context=actor or dict(brief_payload.get("actor_context") or {}),
+    )
+    return upsert_communication_brief(
+        brief,
+        actor_context=actor or brief.actor_context,
+        refresh_reason="meeting_result_completed",
+    )
+
+
+def _meeting_result_brief_ref(meeting_result: dict[str, Any], *, task_id: str = "") -> dict[str, Any]:
+    result = dict(meeting_result or {})
+    normalized = dict(result.get("normalized_request") or {})
+    return {
+        "kind": "meeting_result",
+        "source_type": "meeting_result",
+        "communication_role": "escalation_provider",
+        "communication_input_kind": "meeting_result",
+        "communication_closeout_owner": "mail_agent",
+        "task_id": str(task_id or result.get("task_id") or ""),
+        "meeting_id": str(result.get("meeting_id") or ""),
+        "meeting_code": str(result.get("meeting_code") or ""),
+        "meeting_url": str(result.get("meeting_url") or result.get("join_url") or ""),
+        "topic": str(result.get("subject") or normalized.get("topic") or ""),
+        "start_time": str(result.get("start_time") or normalized.get("start_time") or ""),
+        "end_time": str(result.get("end_time") or normalized.get("end_time") or ""),
+        "provider": str(result.get("provider") or ""),
+        "summary": _bounded_text(result.get("summary") or result.get("message") or result.get("content_text"), 240),
+    }
+
+
+def _append_unique_meeting_ref(existing_refs: list[Any], meeting_ref: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = [dict(item or {}) for item in existing_refs if isinstance(item, dict)]
+    key = str(meeting_ref.get("task_id") or meeting_ref.get("meeting_id") or meeting_ref.get("meeting_url") or "")
+    filtered: list[dict[str, Any]] = []
+    for item in refs:
+        item_key = str(item.get("task_id") or item.get("meeting_id") or item.get("meeting_url") or "")
+        if key and item_key == key:
+            continue
+        filtered.append(item)
+    return [meeting_ref, *filtered][:12]

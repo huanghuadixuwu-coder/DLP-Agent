@@ -1113,6 +1113,65 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
         )
         return {"ok": False, "status": "failed", "error": "invalid_meeting_action"}
 
+    worker_actor_context = {
+        "tenant_id": str(task.get("tenant_id") or ""),
+        "user_id": str(task.get("user_id") or ""),
+        "workspace_id": str(task.get("workspace_id") or ""),
+        "session_id": str(task.get("session_id") or ""),
+        "conversation_id": str(task.get("conversation_id") or ""),
+        "roles": ["admin"],
+    }
+    context = OrchestrationContext(
+        session_id=str(task.get("session_id") or ""),
+        conversation_id=str(task.get("conversation_id") or ""),
+        message=str(task.get("message_raw") or ""),
+        safe_message=str(task.get("message_raw") or ""),
+        display_message=str(task.get("request_message") or task.get("message_raw") or ""),
+        actor_context=worker_actor_context,
+    )
+    meeting_context = _meeting_context_from_payload(stored_payload, payload, task, context)
+    missing_meeting_context = _missing_meeting_escalation_context(action, meeting_context)
+    if missing_meeting_context:
+        error = "meeting_escalation_context_required"
+        summary = "Meeting worker rejected a non-global meeting escalation without thread and brief context."
+        task = set_task_status(
+            task_id,
+            "failed",
+            actor="worker",
+            event_type="meeting_context_rejected",
+            event_message=summary,
+            extra_updates={
+                "domain_result": {
+                    "ok": False,
+                    "action": action,
+                    "status": "blocked",
+                    "error": error,
+                    "missing_fields": missing_meeting_context,
+                    "communication_role": "escalation_provider",
+                    "communication_input_kind": "meeting_escalation_candidate",
+                    "communication_closeout_owner": "mail_agent",
+                    "result": {},
+                    "post_confirm_results": [],
+                    "brief_update": {},
+                },
+                "delivery_status": "failed",
+                "delivery_error": error,
+                "final_result": summary,
+                "last_error_category": "invalid_parameters",
+                "manual_handover_required": False,
+                "next_recommended_action": "Select an active communication thread and brief, then request meeting escalation again.",
+            },
+            details={"action": action, "missing_fields": missing_meeting_context},
+        )
+        if task:
+            _publish_snapshot(task, "meeting_context_rejected", summary)
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": error,
+            "missing_fields": missing_meeting_context,
+        }
+
     task = set_task_status(
         task_id,
         "processing",
@@ -1126,27 +1185,17 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "Task vanished during meeting processing"}
     _publish_snapshot(task, "meeting_processing_started", "Worker started Tencent Meeting domain action.")
 
-    context = OrchestrationContext(
-        session_id=str(task.get("session_id") or ""),
-        conversation_id=str(task.get("conversation_id") or ""),
-        message=str(task.get("message_raw") or ""),
-        safe_message=str(task.get("message_raw") or ""),
-        display_message=str(task.get("request_message") or task.get("message_raw") or ""),
-        actor_context={
-            "tenant_id": str(task.get("tenant_id") or ""),
-            "user_id": str(task.get("user_id") or ""),
-            "workspace_id": str(task.get("workspace_id") or ""),
-            "session_id": str(task.get("session_id") or ""),
-            "conversation_id": str(task.get("conversation_id") or ""),
-            "roles": ["admin"],
-        },
-    )
     dispatched = dispatch_tool_call(action, payload, context, {}, allow_side_effects=True)
     result = dict(dispatched.get("result") or {})
     if action.startswith("meeting_"):
         result.setdefault("communication_role", "escalation_provider")
         result.setdefault("communication_input_kind", "meeting_result")
         result.setdefault("communication_closeout_owner", "mail_agent")
+        result["thread_id"] = str(meeting_context.get("thread_id") or "")
+        result["source_brief_id"] = str(meeting_context.get("source_brief_id") or "")
+        result["brief_id"] = str(meeting_context.get("brief_id") or meeting_context.get("source_brief_id") or "")
+        result["idempotency_key"] = str(meeting_context.get("idempotency_key") or "")
+        result["actor_context"] = dict(meeting_context.get("actor_context") or {})
     ok = bool(dispatched.get("ok"))
     post_confirm_results = _run_post_confirm_domain_steps(
         action=action,
@@ -1155,6 +1204,11 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
         tool_result=result,
         context=context,
     ) if ok else []
+    brief_update = _record_meeting_result_brief_state(
+        meeting_context=meeting_context,
+        meeting_result=result,
+        task_id=task_id,
+    ) if ok else {}
     status = "completed" if ok else "failed"
     error = str(dispatched.get("error") or result.get("error") or "")
     summary = str(result.get("summary") or result.get("message") or error or f"{action} completed.")
@@ -1174,6 +1228,7 @@ def process_domain_meeting_task(self, task_id: str) -> dict[str, Any]:
                 "result": result,
                 "error": error,
                 "post_confirm_results": post_confirm_results,
+                "brief_update": brief_update,
             },
             "delivery_status": status,
             "delivery_result": summary if ok else "",
@@ -1194,6 +1249,103 @@ def _domain_tool_payload(stored_payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(stored_payload.get("tool_input"), dict):
         return dict(stored_payload.get("tool_input") or {})
     return {str(key): value for key, value in stored_payload.items() if not str(key).startswith("_")}
+
+
+def _meeting_context_from_payload(
+    stored_payload: dict[str, Any],
+    tool_payload: dict[str, Any],
+    task: dict[str, Any],
+    context: OrchestrationContext,
+) -> dict[str, Any]:
+    server_global_authorized = _server_global_authorized_from_stored_payload(stored_payload)
+    tool_actor = tool_payload.get("actor_context") if isinstance(tool_payload.get("actor_context"), dict) else {}
+    stored_actor = stored_payload.get("actor_context") if isinstance(stored_payload.get("actor_context"), dict) else {}
+    actor_context_source = ""
+    if tool_actor:
+        actor_context = dict(tool_actor)
+        actor_context_source = "tool_payload"
+    elif stored_actor:
+        actor_context = dict(stored_actor)
+        actor_context_source = "stored_payload"
+    else:
+        actor_context = dict(context.actor_context or {})
+    if not actor_context:
+        actor_context = _actor_context_from_task(task)
+    source_brief_id = str(
+        tool_payload.get("source_brief_id")
+        or tool_payload.get("brief_id")
+        or stored_payload.get("source_brief_id")
+        or stored_payload.get("brief_id")
+        or ""
+    ).strip()
+    thread_id = str(tool_payload.get("thread_id") or stored_payload.get("thread_id") or "").strip()
+    return {
+        "thread_id": thread_id,
+        "source_brief_id": source_brief_id,
+        "brief_id": source_brief_id,
+        "idempotency_key": str(tool_payload.get("idempotency_key") or stored_payload.get("idempotency_key") or task.get("idempotency_key") or "").strip(),
+        "actor_context": actor_context,
+        "actor_context_source": actor_context_source,
+        "server_global_authorized": server_global_authorized,
+    }
+
+
+def _server_global_authorized_from_stored_payload(stored_payload: dict[str, Any]) -> bool:
+    return (
+        bool(stored_payload.get("_server_global_authorized"))
+        and str(stored_payload.get("_server_global_authorized_by") or "") == "agent_chat_context"
+    )
+
+
+def _missing_meeting_escalation_context(action: str, meeting_context: dict[str, Any]) -> list[str]:
+    if action != "meeting_create_tencent_meeting":
+        return []
+    server_global_authorized = bool(meeting_context.get("server_global_authorized"))
+    missing: list[str] = []
+    if not server_global_authorized and not str(meeting_context.get("thread_id") or "").strip():
+        missing.append("thread_id")
+    if not server_global_authorized and not str(meeting_context.get("source_brief_id") or "").strip():
+        missing.append("source_brief_id")
+    if not str(meeting_context.get("idempotency_key") or "").strip():
+        missing.append("idempotency_key")
+    actor_context = dict(meeting_context.get("actor_context") or {})
+    actor_context_provided = bool(str(meeting_context.get("actor_context_source") or "").strip())
+    if not actor_context_provided or not all(str(actor_context.get(key) or "").strip() for key in ("tenant_id", "user_id", "workspace_id")):
+        missing.append("actor_context")
+    return missing
+
+
+def _record_meeting_result_brief_state(
+    *,
+    meeting_context: dict[str, Any],
+    meeting_result: dict[str, Any],
+    task_id: str,
+) -> dict[str, Any]:
+    source_brief_id = str(meeting_context.get("source_brief_id") or "").strip()
+    thread_id = str(meeting_context.get("thread_id") or "").strip()
+    if not source_brief_id or not thread_id:
+        return {}
+    try:
+        from app.communication.brief_service import record_meeting_result_on_brief
+
+        stored = record_meeting_result_on_brief(
+            source_brief_id=source_brief_id,
+            thread_id=thread_id,
+            meeting_result=meeting_result,
+            task_id=task_id,
+            actor_context=dict(meeting_context.get("actor_context") or {}),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "thread_id": thread_id, "source_brief_id": source_brief_id}
+    brief_payload = dict((stored or {}).get("brief") or {})
+    return {
+        "ok": bool(stored),
+        "thread_id": str((stored or {}).get("thread_id") or thread_id),
+        "brief_id": str(brief_payload.get("brief_id") or source_brief_id),
+        "version": int((stored or {}).get("version") or 0),
+        "refresh_reason": str((stored or {}).get("refresh_reason") or ""),
+        "recommended_next_action": str(brief_payload.get("recommended_next_action") or ""),
+    }
 
 
 def _run_post_confirm_domain_steps(

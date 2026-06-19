@@ -1746,6 +1746,7 @@ def run_subordinate_inputs() -> dict[str, Any]:
     _assert_equal(catalog["enterprise_rag"].get("communication_input_kind"), "grounding_bundle", "catalog rag kind")
     _assert_equal(catalog["meeting"].get("communication_role"), "escalation_provider", "catalog meeting role")
     _assert_equal(catalog["meeting"].get("communication_input_kind"), "meeting_escalation_candidate", "catalog meeting kind")
+    _assert_equal(catalog["meeting"].get("communication_closeout_owner"), "mail_agent", "catalog meeting closeout owner")
 
     context = OrchestrationContext(
         session_id="session-subordinate",
@@ -1771,6 +1772,7 @@ def run_subordinate_inputs() -> dict[str, Any]:
     payload = dict(list(dag_result.get("observations") or [])[0].get("payload") or {})
     _assert_equal(payload.get("communication_role"), "escalation_provider", "dag meeting role")
     _assert_equal(payload.get("communication_input_kind"), "meeting_escalation_candidate", "dag meeting kind")
+    _assert_equal(payload.get("communication_closeout_owner"), "mail_agent", "dag meeting closeout owner")
     _assert_equal(payload.get("confirmation_required"), True, "dag confirmation")
 
     return {
@@ -3515,6 +3517,623 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
     }
 
 
+def run_thread_meeting_escalation() -> dict[str, Any]:
+    from fastapi.testclient import TestClient
+
+    import app.main as main_module
+    import app.orchestration.final_renderer as final_renderer_module
+    import app.orchestration.service as orchestration_service_module
+    import app.orchestration.tools.meeting_tools as meeting_tools_module
+    import app.task_worker as task_worker
+    from app.communication.brief_store import get_latest_brief_for_thread, upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread, upsert_thread_projection
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.models import UnifiedAgentRequest
+    from app.orchestration.dag_executor import execute_dag_plan
+    from app.orchestration.types import AgentSubtask, AgentTaskPlan, OrchestrationContext
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-thread-meeting-{suffix}"
+    conversation_id = f"conversation-thread-meeting-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-thread-meeting-{suffix}",
+        "user_id": f"user-thread-meeting-{suffix}",
+        "workspace_id": "workspace-thread-meeting",
+        "roles": ["admin"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-meeting-escalation-{suffix}"
+    brief_id = f"brief-meeting-escalation-{suffix}"
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Meeting escalation customer thread",
+        participants=["customer@example.com", "rep@example.com"],
+        latest_summary="Customer asked to align on renewal risk in a meeting.",
+        actor_context=actor_context,
+    )
+    upsert_thread_projection(thread_ref, actor_context=actor_context)
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "thread meeting active thread")
+    stored_brief = upsert_communication_brief(
+        CommunicationBrief(
+            brief_id=brief_id,
+            conversation_id=conversation_id,
+            thread_ref=thread_ref,
+            employee_goal="Escalate renewal risk to a meeting and prepare follow-up mail.",
+            customer_context_summary="Customer asked to align on renewal risk in a meeting.",
+            grounding_refs=[{"doc_id": "renewal-risk", "title": "Renewal risk summary"}],
+            must_include=["renewal risk alignment"],
+            must_avoid=["unsupported commitments"],
+            recommended_next_action="schedule_meeting",
+            confidence=0.87,
+            actor_context=actor_context,
+        ),
+        actor_context=actor_context,
+        refresh_reason="thread_meeting_escalation_seed",
+    )
+    _assert_true(stored_brief, "thread meeting stored brief")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+
+    provider_state = {"created": 0}
+
+    class CountingTencentMeetingProvider:
+        configured = True
+
+        def __init__(self) -> None:
+            provider_state["created"] += 1
+
+        def schedule_meeting(self, _payload: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True, "status": "completed", "meeting_id": "unexpected-provider-call"}
+
+    def _fake_final_answer(**_: Any) -> dict[str, Any]:
+        return {
+            "answer": "Structured meeting escalation proposal is pending confirmation.",
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+        }
+
+    enqueued_meetings: list[str] = []
+    original_provider = meeting_tools_module.TencentMeetingMcpProvider
+    original_main_enqueue = main_module.enqueue_meeting_task
+    original_worker_dispatch = task_worker.dispatch_tool_call
+    original_main_render_final = main_module.render_final_answer
+    original_final_renderer = final_renderer_module.render_final_answer
+    original_service_render = orchestration_service_module.render_final_answer
+    original_main_plan = main_module.plan_multi_agent_dag_request
+    original_main_route = main_module.route_agent_request
+    original_main_orchestrate = main_module.orchestrate_agent_request
+    original_write_memory = main_module._write_unified_conversation_memory
+    original_write_dynamic_turn_memory = main_module.write_dynamic_turn_memory
+    original_enqueue_summary = main_module.enqueue_conversation_memory_summary
+
+    def _fake_dispatch(action, parameters, context, dependency_payloads, *, allow_side_effects=False):
+        if action == "mail_invitation_draft":
+            from app.orchestration.tools.mail_workflow_tools import mail_invitation_draft
+
+            _assert_true(not allow_side_effects, "mail invitation draft remains read-only")
+            return {
+                "ok": True,
+                "action": action,
+                "result": mail_invitation_draft(parameters, context, dependency_payloads),
+                "error": "",
+                "observation_type": "mail_invitation_draft",
+                "side_effectful": False,
+                "requires_confirmation": False,
+            }
+        _assert_equal(action, "meeting_create_tencent_meeting", "worker meeting action")
+        _assert_true(allow_side_effects, "meeting worker side effects allowed after confirmation")
+        _assert_equal(parameters.get("thread_id"), thread_id, "worker thread id")
+        _assert_equal(parameters.get("source_brief_id"), brief_id, "worker source brief id")
+        _assert_equal(parameters.get("brief_id"), brief_id, "worker brief id")
+        _assert_equal(dict(parameters.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "worker actor tenant")
+        _assert_true(str(parameters.get("idempotency_key") or "").startswith("dag-"), "worker idempotency key")
+        return {
+            "ok": True,
+            "action": action,
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "Thread-scoped Tencent Meeting created.",
+                "provider": "tencent_meeting_mcp_regression",
+                "meeting_id": f"meeting-thread-{suffix}",
+                "meeting_code": "654321",
+                "meeting_url": f"https://meeting.tencent.com/thread-{suffix}",
+                "thread_id": f"fake-provider-thread-{suffix}",
+                "source_brief_id": f"fake-provider-brief-{suffix}",
+                "brief_id": f"fake-provider-brief-{suffix}",
+                "idempotency_key": f"fake-provider-idempotency-{suffix}",
+                "actor_context": {
+                    "tenant_id": f"fake-provider-tenant-{suffix}",
+                    "user_id": f"fake-provider-user-{suffix}",
+                    "workspace_id": "fake-provider-workspace",
+                },
+                "normalized_request": {
+                    "topic": "renewal risk alignment",
+                    "start_time": "2026-06-20T14:00:00+08:00",
+                    "end_time": "2026-06-20T14:30:00+08:00",
+                    "timezone": "Asia/Shanghai",
+                },
+                "created_resource_ids": [f"meeting-thread-{suffix}"],
+            },
+            "error": "",
+            "observation_type": "meeting_write",
+            "side_effectful": True,
+            "requires_confirmation": True,
+        }
+
+    meeting_tools_module.TencentMeetingMcpProvider = CountingTencentMeetingProvider
+    main_module.enqueue_meeting_task = lambda task_id: enqueued_meetings.append(task_id) or task_id
+    task_worker.dispatch_tool_call = _fake_dispatch
+    main_module.render_final_answer = _fake_final_answer
+    final_renderer_module.render_final_answer = _fake_final_answer
+    orchestration_service_module.render_final_answer = _fake_final_answer
+    main_module._write_unified_conversation_memory = lambda result, conversation_id, actor_context=None: (f"turn-thread-meeting-{suffix}", False)
+    main_module.write_dynamic_turn_memory = lambda **_: {"memory_scope": "session", "identifiers": {}}
+    main_module.enqueue_conversation_memory_summary = lambda *_args, **_kwargs: None
+
+    try:
+        request = type("Request", (), {"headers": {}})()
+        with TestClient(main_module.app):
+            fake_dag_plan = AgentTaskPlan(
+                original_message="fake meeting scope regression",
+                subtasks=[
+                    AgentSubtask(
+                        task_id="fake_scope_meeting",
+                        agent="meeting",
+                        capability="meeting_create_tencent_meeting",
+                        action="meeting_create_tencent_meeting",
+                        parameters={
+                            "topic": "fake scope regression",
+                            "natural_time": "tomorrow afternoon",
+                            "timezone": "Asia/Shanghai",
+                            "duration_minutes": 30,
+                            "idempotency_key": f"dag-fake-scope-{suffix}",
+                            "thread_id": f"fake-thread-{suffix}",
+                            "source_brief_id": f"fake-brief-{suffix}",
+                            "brief_id": f"fake-brief-{suffix}",
+                            "actor_context": {
+                                "tenant_id": f"fake-tenant-{suffix}",
+                                "user_id": f"fake-user-{suffix}",
+                                "workspace_id": "fake-workspace",
+                            },
+                        },
+                        confirmation_required=True,
+                        mutating=True,
+                        expected_observation_type="meeting_write",
+                    )
+                ],
+                aggregation_strategy="status_and_next_action",
+                planner_reason="Fake scoped meeting regression.",
+                confidence=0.91,
+                planner_type="regression",
+            )
+            fake_dag_result = execute_dag_plan(
+                fake_dag_plan,
+                OrchestrationContext(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message="fake meeting scope regression",
+                    safe_message="fake meeting scope regression",
+                    display_message="fake meeting scope regression",
+                    upload_context={
+                        "agent_chat_context": {
+                            "global_mode": False,
+                            "server_global_mode": False,
+                            "global_mode_source": "",
+                            "thread_id": thread_id,
+                            "brief_id": brief_id,
+                            "active_thread": {
+                                "thread_id": thread_id,
+                                "source": "mail",
+                                "subject": "Meeting escalation customer thread",
+                            },
+                        }
+                    },
+                    actor_context=actor_context,
+                ),
+                allow_side_effects=False,
+            )
+            fake_dag_observation = next(
+                item for item in list(fake_dag_result.get("observations") or [])
+                if item.get("observation_type") == "confirmation_required"
+            )
+            fake_dag_payload = dict(fake_dag_observation.get("payload") or {})
+            fake_dag_parameters = dict(fake_dag_payload.get("parameters") or {})
+            _assert_equal(fake_dag_parameters.get("thread_id"), thread_id, "dag sanitized thread id")
+            _assert_equal(fake_dag_parameters.get("source_brief_id"), brief_id, "dag sanitized source brief id")
+            _assert_equal(fake_dag_parameters.get("brief_id"), brief_id, "dag sanitized brief id")
+            _assert_equal(dict(fake_dag_parameters.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "dag sanitized actor")
+            fake_global_dag_plan = AgentTaskPlan(
+                original_message="fake global meeting scope regression",
+                subtasks=[
+                    AgentSubtask(
+                        task_id="fake_global_scope_meeting",
+                        agent="meeting",
+                        capability="meeting_create_tencent_meeting",
+                        action="meeting_create_tencent_meeting",
+                        parameters={
+                            "topic": "fake global scope regression",
+                            "natural_time": "tomorrow afternoon",
+                            "timezone": "Asia/Shanghai",
+                            "duration_minutes": 30,
+                            "idempotency_key": f"dag-fake-global-scope-{suffix}",
+                            "thread_id": f"fake-global-thread-{suffix}",
+                            "source_brief_id": f"fake-global-brief-{suffix}",
+                            "brief_id": f"fake-global-brief-{suffix}",
+                            "thread_ref": {
+                                "thread_id": f"fake-global-thread-{suffix}",
+                                "source": "mail",
+                                "subject": "Fake global thread",
+                            },
+                            "actor_context": {
+                                "tenant_id": f"fake-global-tenant-{suffix}",
+                                "user_id": f"fake-global-user-{suffix}",
+                                "workspace_id": "fake-global-workspace",
+                            },
+                        },
+                        confirmation_required=True,
+                        mutating=True,
+                        expected_observation_type="meeting_write",
+                    )
+                ],
+                aggregation_strategy="status_and_next_action",
+                planner_reason="Fake global scoped meeting regression.",
+                confidence=0.91,
+                planner_type="regression",
+            )
+            fake_global_dag_result = execute_dag_plan(
+                fake_global_dag_plan,
+                OrchestrationContext(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message="fake global meeting scope regression",
+                    safe_message="fake global meeting scope regression",
+                    display_message="fake global meeting scope regression",
+                    upload_context={
+                        "agent_chat_context": {
+                            "global_mode": True,
+                            "server_global_mode": True,
+                            "global_mode_source": "agent_chat_context",
+                            "thread_id": "",
+                            "brief_id": "",
+                        }
+                    },
+                    actor_context=actor_context,
+                ),
+                allow_side_effects=False,
+            )
+            fake_global_dag_observation = next(
+                item for item in list(fake_global_dag_result.get("observations") or [])
+                if item.get("observation_type") == "confirmation_required"
+            )
+            fake_global_payload = dict(fake_global_dag_observation.get("payload") or {})
+            fake_global_parameters = dict(fake_global_payload.get("parameters") or {})
+            _assert_equal(fake_global_parameters.get("thread_id"), "", "dag global sanitized thread id")
+            _assert_equal(fake_global_parameters.get("source_brief_id"), "", "dag global sanitized source brief id")
+            _assert_equal(fake_global_parameters.get("brief_id"), "", "dag global sanitized brief id")
+            _assert_true(not fake_global_parameters.get("thread_ref"), "dag global sanitized thread ref")
+            _assert_equal(dict(fake_global_parameters.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "dag global sanitized actor")
+            _assert_equal(fake_global_payload.get("thread_id"), "", "dag global confirmation thread id")
+            _assert_equal(fake_global_payload.get("source_brief_id"), "", "dag global confirmation source brief id")
+            _assert_equal(fake_global_payload.get("brief_id"), "", "dag global confirmation brief id")
+            orphan_session_id = f"session-thread-meeting-orphan-{suffix}"
+            orphan_conversation_id = f"conversation-thread-meeting-orphan-{suffix}"
+            orphan_actor_context = {
+                "tenant_id": f"tenant-thread-meeting-orphan-{suffix}",
+                "user_id": f"user-thread-meeting-orphan-{suffix}",
+                "workspace_id": "workspace-thread-meeting",
+                "roles": ["admin"],
+                "session_id": orphan_session_id,
+                "conversation_id": orphan_conversation_id,
+            }
+            create_conversation(orphan_session_id, conversation_id=orphan_conversation_id, actor_context=orphan_actor_context)
+            orphan_response = main_module.agent_chat(
+                UnifiedAgentRequest(
+                    session_id=orphan_session_id,
+                    conversation_id=orphan_conversation_id,
+                    message="Create a Tencent Meeting tomorrow afternoon.",
+                    tenant_id=orphan_actor_context["tenant_id"],
+                    user_id=orphan_actor_context["user_id"],
+                    workspace_id=orphan_actor_context["workspace_id"],
+                    roles=["admin"],
+                ),
+                request,
+            )
+            _assert_equal(provider_state["created"], 0, "provider objects before missing-context response")
+            _assert_true(orphan_response.needs_clarification, "missing-context meeting needs clarification")
+            _assert_true(not orphan_response.pending_confirmation, "missing-context meeting has no pending confirmation")
+            _assert_true(not orphan_response.confirmation_payload, "missing-context meeting has no confirmation payload")
+            orphan_observations = [dict(item) for item in list(orphan_response.tool_observations or [])]
+            missing_context_observation = next(
+                item
+                for item in orphan_observations
+                if item.get("observation_type") == "meeting_escalation_context_required"
+            )
+            _assert_equal(missing_context_observation.get("status"), "blocked", "missing-context status")
+            _assert_true(
+                {"thread_id", "source_brief_id"}.issubset(set(missing_context_observation.get("missing_fields") or [])),
+                "missing-context fields",
+            )
+            _assert_true(
+                not any(item.get("tool_name") == "meeting_create_tencent_meeting" and item.get("status") == "pending_confirmation" for item in orphan_response.tool_calls),
+                "missing-context no direct meeting confirmation",
+            )
+            react_session_id = f"session-thread-meeting-react-bypass-{suffix}"
+            react_conversation_id = f"conversation-thread-meeting-react-bypass-{suffix}"
+            react_actor_context = {
+                "tenant_id": f"tenant-thread-meeting-react-bypass-{suffix}",
+                "user_id": f"user-thread-meeting-react-bypass-{suffix}",
+                "workspace_id": "workspace-thread-meeting",
+                "roles": ["admin"],
+                "session_id": react_session_id,
+                "conversation_id": react_conversation_id,
+            }
+            create_conversation(react_session_id, conversation_id=react_conversation_id, actor_context=react_actor_context)
+            synthetic_pending = {
+                "action_name": "guarded_action",
+                "title": "synthetic react meeting",
+                "message": "synthetic react confirmation should not surface",
+                "tool_name": "meeting_create_tencent_meeting",
+                "global_mode": True,
+                "server_global_mode": True,
+                "global_mode_source": "agent_chat_context",
+                "idempotency_key": f"synthetic-react-bypass-key-{suffix}",
+                "thread_id": f"fake-react-thread-{suffix}",
+                "source_brief_id": f"fake-react-brief-{suffix}",
+                "brief_id": f"fake-react-brief-{suffix}",
+                "actor_context": {
+                    "tenant_id": f"fake-react-tenant-{suffix}",
+                    "user_id": f"fake-react-user-{suffix}",
+                    "workspace_id": "fake-react-workspace",
+                },
+                "tool_input": {
+                    "topic": "synthetic react meeting",
+                    "natural_time": "tomorrow afternoon",
+                    "timezone": "Asia/Shanghai",
+                    "duration_minutes": 30,
+                    "global_mode": True,
+                    "server_global_mode": True,
+                    "global_mode_source": "agent_chat_context",
+                    "idempotency_key": f"synthetic-react-bypass-key-{suffix}",
+                    "thread_id": f"fake-react-thread-{suffix}",
+                    "source_brief_id": f"fake-react-brief-{suffix}",
+                    "brief_id": f"fake-react-brief-{suffix}",
+                    "actor_context": {
+                        "tenant_id": f"fake-react-tenant-{suffix}",
+                        "user_id": f"fake-react-user-{suffix}",
+                        "workspace_id": "fake-react-workspace",
+                    },
+                },
+            }
+
+            def _synthetic_react_pending(**kwargs: Any) -> dict[str, Any]:
+                return {
+                    "session_id": kwargs["session_id"],
+                    "conversation_id": kwargs["conversation_id"],
+                    "request_id": f"synthetic-react-bypass-{suffix}",
+                    "message": kwargs["message"],
+                    "safe_message": kwargs["safe_message"],
+                    "display_message": kwargs.get("display_message") or kwargs["message"],
+                    "answer": "synthetic react confirmation should not surface",
+                    "intent": "meeting_create",
+                    "routing_source": "react_controller",
+                    "routing_confidence": 0.91,
+                    "routing_reason": "synthetic ReAct pending confirmation",
+                    "candidate_intents": ["meeting_create"],
+                    "mode_used": "react",
+                    "tool_calls": [
+                        {
+                            "tool_name": "meeting_create_tencent_meeting",
+                            "success": True,
+                            "status": "pending_confirmation",
+                            "error": "",
+                            "result": synthetic_pending,
+                        }
+                    ],
+                    "retrieved_evidence": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "privacy": {},
+                    "context_budget": {},
+                    "citations": [],
+                    "memory_context": {},
+                    "memory_hits": 0,
+                    "merged_memory_hits": 0,
+                    "context_sources": [],
+                    "workspace_memory_hits": 0,
+                    "transcript_hits": 0,
+                    "user_model_used": False,
+                    "reflection_notes": None,
+                    "upload_context": dict(kwargs.get("upload_context") or {}),
+                    "route_mode": "slow",
+                    "router_intent": "meeting_create",
+                    "router_reason": "synthetic ReAct pending confirmation",
+                    "required_grounding": "tool",
+                    "fast_path_used": False,
+                    "degraded_from": "none",
+                    "planner_type": "react_controller",
+                    "task_plan": {"tool_observations": []},
+                    "subtask_results": [],
+                    "aggregation_strategy": "",
+                    "partial_failures": [],
+                    "react_trace": [],
+                    "loop_step_count": 1,
+                    "termination_reason": "needs_confirmation",
+                    "pending_confirmation": dict(synthetic_pending),
+                    "confirmation_payload": dict(synthetic_pending),
+                    "final_answer_source": "confirmation_request",
+                    "memory_reads": [],
+                    "tool_observations": [],
+                    "node_latencies_ms": {"total": 1.0},
+                    "token_in": 0,
+                    "token_out": 0,
+                    "estimated_cost": 0.0,
+                }
+
+            main_module.plan_multi_agent_dag_request = lambda **_: None
+            main_module.route_agent_request = lambda **_: {
+                "route_mode": "slow",
+                "intent": "meeting_create",
+                "routing_source": "synthetic_regression",
+                "confidence": 0.91,
+                "router_reason": "force ReAct for meeting bypass regression",
+                "required_grounding": "tool",
+            }
+            main_module.orchestrate_agent_request = _synthetic_react_pending
+            try:
+                react_response = main_module.agent_chat(
+                    UnifiedAgentRequest(
+                        session_id=react_session_id,
+                        conversation_id=react_conversation_id,
+                        message="Synthetic ReAct meeting confirmation bypass regression.",
+                        tenant_id=react_actor_context["tenant_id"],
+                        user_id=react_actor_context["user_id"],
+                        workspace_id=react_actor_context["workspace_id"],
+                        roles=["admin"],
+                    ),
+                    request,
+                )
+            finally:
+                main_module.plan_multi_agent_dag_request = original_main_plan
+                main_module.route_agent_request = original_main_route
+                main_module.orchestrate_agent_request = original_main_orchestrate
+            _assert_equal(provider_state["created"], 0, "provider objects before synthetic ReAct guard")
+            _assert_true(react_response.needs_clarification, "synthetic ReAct meeting needs clarification")
+            _assert_true(not react_response.pending_confirmation, "synthetic ReAct meeting has no pending confirmation")
+            _assert_true(not react_response.confirmation_payload, "synthetic ReAct meeting has no confirmation payload")
+            _assert_true(
+                react_response.answer != "synthetic react confirmation should not surface",
+                "synthetic ReAct confirmation wording not surfaced",
+            )
+            react_observations = [dict(item) for item in list(react_response.tool_observations or [])]
+            react_guard_observation = next(
+                item
+                for item in react_observations
+                if item.get("observation_type") == "meeting_escalation_context_required"
+            )
+            _assert_equal(react_guard_observation.get("status"), "blocked", "synthetic ReAct guard status")
+            _assert_true(
+                {"thread_id", "source_brief_id", "actor_context"}.issubset(set(react_guard_observation.get("missing_fields") or [])),
+                "synthetic ReAct missing fields",
+            )
+            proposal = main_module.agent_chat(
+                UnifiedAgentRequest(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message="Using the active thread and latest brief, create a Tencent Meeting about renewal risk tomorrow afternoon.",
+                    tenant_id=actor_context["tenant_id"],
+                    user_id=actor_context["user_id"],
+                    workspace_id=actor_context["workspace_id"],
+                    roles=["admin"],
+                ),
+                request,
+            )
+            _assert_equal(provider_state["created"], 0, "provider objects before confirmation")
+            pending = dict(proposal.pending_confirmation or {})
+            _assert_equal(pending.get("tool_name"), "meeting_create_tencent_meeting", "meeting pending tool")
+            _assert_true(pending.get("confirmation_required"), "meeting requires confirmation")
+            tool_input = dict(pending.get("tool_input") or {})
+            _assert_equal(tool_input.get("thread_id"), thread_id, "proposal thread id")
+            _assert_equal(tool_input.get("source_brief_id"), brief_id, "proposal source brief id")
+            _assert_equal(tool_input.get("brief_id"), brief_id, "proposal brief id")
+            _assert_equal(dict(tool_input.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "proposal actor tenant")
+            _assert_true(str(tool_input.get("idempotency_key") or "").startswith("dag-"), "proposal idempotency key")
+            _assert_equal(tool_input.get("communication_input_kind"), "meeting_escalation_candidate", "proposal input kind")
+
+            observations = [dict(item) for item in list(proposal.tool_observations or [])]
+            confirmation_observation = next(
+                item for item in observations if item.get("observation_type") == "confirmation_required"
+            )
+            confirmation_payload = dict(confirmation_observation.get("payload") or {})
+            _assert_equal(confirmation_payload.get("source_brief_id"), brief_id, "confirmation observation brief")
+            _assert_equal(confirmation_payload.get("thread_id"), thread_id, "confirmation observation thread")
+            _assert_equal(confirmation_payload.get("communication_closeout_owner"), "mail_agent", "confirmation closeout owner")
+
+            confirmation = main_module.agent_chat(
+                UnifiedAgentRequest(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message="confirm",
+                    tenant_id=actor_context["tenant_id"],
+                    user_id=actor_context["user_id"],
+                    workspace_id=actor_context["workspace_id"],
+                    roles=["admin"],
+                ),
+                request,
+            )
+            meeting_task_id = str(confirmation.task_id or "")
+            _assert_true(meeting_task_id, "confirmed meeting task id")
+            _assert_equal(enqueued_meetings, [meeting_task_id], "meeting task enqueued once")
+            task = main_module.get_dlp_task(meeting_task_id)
+            task_payload = dict((task or {}).get("domain_payload") or {})
+            _assert_equal(task_payload.get("thread_id"), thread_id, "task thread id")
+            _assert_equal(task_payload.get("source_brief_id"), brief_id, "task source brief id")
+            _assert_equal(task_payload.get("brief_id"), brief_id, "task brief id")
+            _assert_equal(dict(task_payload.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "task actor tenant")
+
+            worker_result = task_worker.process_domain_meeting_task.run(meeting_task_id)
+            _assert_equal(worker_result.get("status"), "completed", "worker status")
+            updated_task = main_module.get_dlp_task(meeting_task_id) or {}
+            domain_result = dict(updated_task.get("domain_result") or {})
+            result_payload = dict(domain_result.get("result") or {})
+            _assert_equal(result_payload.get("thread_id"), thread_id, "meeting result thread id")
+            _assert_equal(result_payload.get("source_brief_id"), brief_id, "meeting result source brief id")
+            _assert_equal(result_payload.get("brief_id"), brief_id, "meeting result brief id")
+            _assert_true(str(result_payload.get("idempotency_key") or "").startswith("dag-"), "meeting result idempotency")
+            _assert_equal(dict(result_payload.get("actor_context") or {}).get("tenant_id"), actor_context["tenant_id"], "meeting result actor tenant")
+            _assert_equal(result_payload.get("communication_closeout_owner"), "mail_agent", "meeting result closeout owner")
+            _assert_true(dict(domain_result.get("brief_update") or {}).get("ok"), "meeting result updated brief")
+
+            latest_brief = get_latest_brief_for_thread(thread_id, actor_context=actor_context)
+            latest_payload = dict((latest_brief or {}).get("brief") or {})
+            _assert_equal(latest_payload.get("recommended_next_action"), "draft_meeting_followup_via_mail_agent", "brief next action")
+            meeting_refs = [
+                item for item in list(latest_payload.get("grounding_refs") or [])
+                if isinstance(item, dict) and item.get("kind") == "meeting_result"
+            ]
+            _assert_true(meeting_refs, "brief meeting result refs")
+            _assert_equal(meeting_refs[-1].get("task_id"), meeting_task_id, "brief meeting task ref")
+
+            mail_plan = main_module._mail_plan_from_meeting_task(
+                task=updated_task,
+                conversation_id=conversation_id,
+                request_message="send the meeting follow-up to customer@example.com",
+                recipient="customer@example.com",
+            )
+            _assert_equal(mail_plan.get("communication_role"), "escalation_provider", "mail plan role")
+            _assert_equal(mail_plan.get("communication_closeout_owner"), "mail_agent", "mail plan closeout owner")
+            _assert_equal(mail_plan.get("source_brief_id"), brief_id, "mail plan source brief")
+            _assert_equal(mail_plan.get("brief_id"), brief_id, "mail plan brief id")
+            _assert_equal(dict(mail_plan.get("thread_ref") or {}).get("thread_id"), thread_id, "mail plan thread")
+            _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), "meeting_result", "mail selected candidate")
+    finally:
+        meeting_tools_module.TencentMeetingMcpProvider = original_provider
+        main_module.enqueue_meeting_task = original_main_enqueue
+        task_worker.dispatch_tool_call = original_worker_dispatch
+        main_module.render_final_answer = original_main_render_final
+        final_renderer_module.render_final_answer = original_final_renderer
+        orchestration_service_module.render_final_answer = original_service_render
+        main_module.plan_multi_agent_dag_request = original_main_plan
+        main_module.route_agent_request = original_main_route
+        main_module.orchestrate_agent_request = original_main_orchestrate
+        main_module._write_unified_conversation_memory = original_write_memory
+        main_module.write_dynamic_turn_memory = original_write_dynamic_turn_memory
+        main_module.enqueue_conversation_memory_summary = original_enqueue_summary
+
+    return {
+        "ok": True,
+        "case": "thread_meeting_escalation",
+        "thread_id": thread_id,
+        "brief_id": brief_id,
+        "meeting_task_id": meeting_task_id,
+        "provider_objects_before_confirmation": 0,
+        "brief_next_action": "draft_meeting_followup_via_mail_agent",
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -3642,6 +4261,7 @@ def main() -> int:
         "polish_rewrite_from_active_brief": run_polish_rewrite_from_active_brief,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,
+        "thread_meeting_escalation": run_thread_meeting_escalation,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

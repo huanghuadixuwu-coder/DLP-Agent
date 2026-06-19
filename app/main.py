@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from redis import Redis
 
-from app.actor_context import ActorContext, build_actor_context, permission_observation, require_permission
+from app.actor_context import ActorContext, actor_from_mapping, build_actor_context, permission_observation, require_permission
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.communication.brief_service import assemble_communication_brief_observation
@@ -915,10 +915,23 @@ def _collect_outbound_candidates(
             )
 
     if actor_context:
+        active_thread_id_for_meeting = ""
+        active_brief_id_for_meeting = ""
+        with suppress(Exception):
+            active_thread_for_meeting = get_active_communication_thread(actor_context=actor_context)
+            active_thread_id_for_meeting = str(dict(active_thread_for_meeting or {}).get("thread_id") or "").strip()
+            latest_brief_for_meeting = (
+                get_latest_brief_for_thread(active_thread_id_for_meeting, actor_context=actor_context)
+                if active_thread_id_for_meeting
+                else None
+            )
+            active_brief_id_for_meeting = str(dict(dict(latest_brief_for_meeting or {}).get("brief") or {}).get("brief_id") or "").strip()
         completed_meeting_task = _latest_completed_meeting_task(
             session_id=payload.session_id,
             conversation_id=conversation_id,
             actor_context=actor_context,
+            thread_id=active_thread_id_for_meeting,
+            brief_id=active_brief_id_for_meeting,
         )
         if completed_meeting_task:
             details = _meeting_result_details(completed_meeting_task)
@@ -926,7 +939,11 @@ def _collect_outbound_candidates(
                 {
                     "communication_role": "escalation_provider",
                     "communication_input_kind": "meeting_result",
+                    "communication_closeout_owner": "mail_agent",
                     "task_id": str(completed_meeting_task.get("task_id") or ""),
+                    "thread_id": details.get("thread_id") or "",
+                    "source_brief_id": details.get("source_brief_id") or "",
+                    "brief_id": details.get("brief_id") or "",
                     "subject": details.get("subject") or "",
                     "meeting_id": details.get("meeting_id") or "",
                     "meeting_code": details.get("meeting_code") or "",
@@ -1083,6 +1100,157 @@ def _looks_like_contextual_communication_request(message: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _plan_contains_meeting_creation(plan: Any) -> bool:
+    subtasks = list(getattr(plan, "subtasks", []) or [])
+    for subtask in subtasks:
+        action = str(getattr(subtask, "action", "") or "").strip()
+        capability = str(getattr(subtask, "capability", "") or "").strip()
+        if action == "meeting_create_tencent_meeting" or capability == "meeting_create_tencent_meeting":
+            return True
+    return False
+
+
+def _missing_meeting_escalation_plan_context(
+    plan: Any,
+    agent_chat_context: dict[str, Any] | None,
+) -> list[str]:
+    if not plan or not _plan_contains_meeting_creation(plan):
+        return []
+    context = dict(agent_chat_context or {})
+    if _server_global_mode_from_agent_chat_context(context):
+        return []
+    missing: list[str] = []
+    if not str(context.get("thread_id") or "").strip():
+        missing.append("thread_id")
+    if not str(context.get("brief_id") or context.get("source_brief_id") or "").strip():
+        missing.append("source_brief_id")
+    return missing
+
+
+def _server_global_mode_from_agent_chat_context(agent_chat_context: dict[str, Any] | None) -> bool:
+    context = dict(agent_chat_context or {})
+    return (
+        bool(context.get("global_mode"))
+        and bool(context.get("server_global_mode"))
+        and str(context.get("global_mode_source") or "") == "agent_chat_context"
+    )
+
+
+def _stamp_meeting_confirmation_server_context(
+    confirmation_payload: dict[str, Any] | None,
+    *,
+    server_global_mode: bool,
+    agent_chat_context: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    confirmation = dict(confirmation_payload or {})
+    if not confirmation:
+        return {}
+    tool_input = dict(confirmation.get("tool_input") or {})
+    action = str(confirmation.get("tool_name") or confirmation.get("action_name") or "").strip()
+    if action != "meeting_create_tencent_meeting":
+        return confirmation
+    server_value = bool(server_global_mode)
+    source = "agent_chat_context" if server_value else ""
+    tool_input["global_mode"] = server_value
+    tool_input["server_global_mode"] = server_value
+    tool_input["global_mode_source"] = source
+    confirmation["tool_input"] = tool_input
+    confirmation["global_mode"] = server_value
+    confirmation["server_global_mode"] = server_value
+    confirmation["global_mode_source"] = source
+    for scoped_key in ("thread_id", "source_brief_id", "brief_id", "thread_ref", "actor_context"):
+        tool_input.pop(scoped_key, None)
+        confirmation.pop(scoped_key, None)
+    context = dict(agent_chat_context or {})
+    thread_id = str(context.get("thread_id") or "").strip()
+    brief_id = str(context.get("brief_id") or context.get("source_brief_id") or "").strip()
+    server_actor_context = dict(actor_context or {})
+    if not server_value and thread_id and brief_id:
+        tool_input["thread_id"] = thread_id
+        tool_input["source_brief_id"] = brief_id
+        tool_input["brief_id"] = brief_id
+        confirmation["thread_id"] = thread_id
+        confirmation["source_brief_id"] = brief_id
+        confirmation["brief_id"] = brief_id
+        active_thread = context.get("active_thread")
+        if isinstance(active_thread, dict):
+            tool_input["thread_ref"] = dict(active_thread)
+            confirmation["thread_ref"] = dict(active_thread)
+        if server_actor_context:
+            tool_input["actor_context"] = server_actor_context
+            confirmation["actor_context"] = server_actor_context
+    elif server_value and server_actor_context:
+        tool_input["actor_context"] = server_actor_context
+        confirmation["actor_context"] = server_actor_context
+    confirmation["tool_input"] = tool_input
+    return confirmation
+
+
+def _stamp_result_meeting_confirmation_server_context(
+    result: dict[str, Any],
+    *,
+    server_global_mode: bool,
+    agent_chat_context: dict[str, Any] | None = None,
+    actor_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(result or {})
+    confirmation = dict(payload.get("confirmation_payload") or payload.get("pending_confirmation") or {})
+    stamped = _stamp_meeting_confirmation_server_context(
+        confirmation,
+        server_global_mode=server_global_mode,
+        agent_chat_context=agent_chat_context,
+        actor_context=actor_context,
+    )
+    if not stamped or stamped == confirmation:
+        return payload
+    if payload.get("confirmation_payload"):
+        payload["confirmation_payload"] = stamped
+    if payload.get("pending_confirmation"):
+        payload["pending_confirmation"] = stamped
+    return payload
+
+
+def _missing_meeting_confirmation_context(
+    confirmation_payload: dict[str, Any] | None,
+    *,
+    server_global_mode: bool,
+) -> list[str]:
+    confirmation = dict(confirmation_payload or {})
+    tool_input = dict(confirmation.get("tool_input") or {})
+    action = str(confirmation.get("tool_name") or confirmation.get("action_name") or "").strip()
+    if action != "meeting_create_tencent_meeting":
+        return []
+    if server_global_mode:
+        return []
+    missing: list[str] = []
+    thread_id = str(tool_input.get("thread_id") or confirmation.get("thread_id") or "").strip()
+    source_brief_id = str(
+        tool_input.get("source_brief_id")
+        or tool_input.get("brief_id")
+        or confirmation.get("source_brief_id")
+        or confirmation.get("brief_id")
+        or ""
+    ).strip()
+    actor_context = (
+        dict(tool_input.get("actor_context"))
+        if isinstance(tool_input.get("actor_context"), dict)
+        else dict(confirmation.get("actor_context"))
+        if isinstance(confirmation.get("actor_context"), dict)
+        else {}
+    )
+    idempotency_key = str(confirmation.get("idempotency_key") or tool_input.get("idempotency_key") or "").strip()
+    if not thread_id:
+        missing.append("thread_id")
+    if not source_brief_id:
+        missing.append("source_brief_id")
+    if not actor_context or not all(str(actor_context.get(key) or "").strip() for key in ("tenant_id", "user_id", "workspace_id")):
+        missing.append("actor_context")
+    if not idempotency_key:
+        missing.append("idempotency_key")
+    return missing
+
+
 def _communication_thread_payload(thread: dict[str, Any]) -> dict[str, Any]:
     return {
         "thread_id": str(thread.get("thread_id") or ""),
@@ -1203,7 +1371,13 @@ def _resolve_agent_chat_context(
             source="agent_chat_context_resolver",
             grounding_kind="state",
             summary="The request explicitly entered global ask mode.",
-            payload={"global_mode": True, "thread_id": "", "brief_id": ""},
+            payload={
+                "global_mode": True,
+                "server_global_mode": True,
+                "global_mode_source": "agent_chat_context",
+                "thread_id": "",
+                "brief_id": "",
+            },
             provenance={**provenance_base, "source": "request_payload"},
             confidence=1.0,
             actor_context=actor_context,
@@ -1213,7 +1387,13 @@ def _resolve_agent_chat_context(
             "thread": {},
             "brief": {},
             "observations": [observation],
-            "context": {"global_mode": True, "thread_id": "", "brief_id": ""},
+            "context": {
+                "global_mode": True,
+                "server_global_mode": True,
+                "global_mode_source": "agent_chat_context",
+                "thread_id": "",
+                "brief_id": "",
+            },
         }
 
     thread: dict[str, Any] | None = None
@@ -1227,7 +1407,7 @@ def _resolve_agent_chat_context(
         thread = get_active_communication_thread(actor_context=actor_context)
 
     observations: list[dict[str, Any]] = []
-    context: dict[str, Any] = {"global_mode": False}
+    context: dict[str, Any] = {"global_mode": False, "server_global_mode": False, "global_mode_source": ""}
     if thread:
         thread_payload = _communication_thread_payload(dict(thread))
         context["thread_id"] = thread_payload["thread_id"]
@@ -1322,6 +1502,88 @@ def _prepend_observations_once(
         seen.add(key)
         prefix.append(item)
     return [*prefix, *result]
+
+
+def _build_meeting_escalation_context_required_response(
+    *,
+    session_id: str,
+    conversation_id: str,
+    message: str,
+    display_message: str,
+    missing_fields: list[str],
+    agent_chat_context: dict[str, Any] | None,
+    actor_context: dict[str, Any] | None = None,
+) -> UnifiedAgentResponse:
+    context = dict(agent_chat_context or {})
+    missing = [str(item) for item in list(missing_fields or []) if str(item or "").strip()]
+    observation_payload = {
+        "action": "meeting_create_tencent_meeting",
+        "status": "blocked",
+        "error": "meeting_escalation_context_required",
+        "missing_fields": missing,
+        "global_mode": bool(context.get("global_mode")),
+        "thread_id": str(context.get("thread_id") or ""),
+        "source_brief_id": str(context.get("source_brief_id") or context.get("brief_id") or ""),
+        "brief_id": str(context.get("brief_id") or context.get("source_brief_id") or ""),
+        "confirmation_required": False,
+        "communication_role": "escalation_provider",
+        "communication_input_kind": "meeting_escalation_candidate",
+        "communication_closeout_owner": "mail_agent",
+    }
+    observation = make_typed_observation(
+        observation_type="meeting_escalation_context_required",
+        source="agent_chat_planner_guard",
+        status="blocked",
+        grounding_kind="state",
+        summary="Non-global meeting escalation requires an active communication thread and brief before confirmation.",
+        payload=observation_payload,
+        provenance={"source": "agent_chat_context", "conversation_id": conversation_id},
+        confidence=1.0,
+        missing_fields=missing,
+        side_effects=[
+            {
+                "kind": "meeting_create_tencent_meeting",
+                "allowed": False,
+                "reason": "requires_thread_brief_context",
+            }
+        ],
+        actor_context=actor_context,
+        success=False,
+    )
+    route_decision = {
+        "intent": "meeting_escalation_context_required",
+        "routing_source": "agent_chat_planner_guard",
+        "confidence": 1.0,
+        "router_reason": "Blocked non-global meeting creation without communication thread/brief context.",
+        "recommended_tool": "meeting_create_tencent_meeting",
+        "required_grounding": "state",
+    }
+    tool_call = {
+        "tool_name": "meeting_create_tencent_meeting",
+        "success": False,
+        "status": "blocked",
+        "error": "meeting_escalation_context_required",
+        "result": observation_payload,
+    }
+    return _build_fast_path_response(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message=message,
+        display_message=display_message,
+        route_decision=route_decision,
+        result={
+            "intent": "meeting_escalation_context_required",
+            "answer": "",
+            "needs_clarification": True,
+            "tool_calls": [tool_call],
+            "tool_observations": [observation],
+            "observations": [observation],
+            "termination_reason": "meeting_escalation_context_required",
+            "conservative": True,
+        },
+        latency_ms=0.0,
+        actor_context=actor_context,
+    )
 
 
 
@@ -1706,7 +1968,7 @@ def _should_apply_recoverable_supplement(task: dict[str, Any] | None, payload: U
 def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[str, Any] | None = None) -> dict:
     actor = build_actor_context(payload=payload, session_id=payload.session_id, conversation_id=payload.conversation_id)
     if actor_context:
-        actor = ActorContext(**{**actor.to_dict(), **dict(actor_context or {})})
+        actor = actor_from_mapping(actor_context, session_id=payload.session_id, conversation_id=payload.conversation_id, fallback=actor)
     combined_message = (payload.review_content or "").strip() or (payload.resolved_outbound_content or "").strip() or _task_message(
         payload.message,
         payload.uploaded_text,
@@ -2640,12 +2902,48 @@ def _create_domain_task_from_confirmation(
     request_message: str,
     confirmation_payload: dict[str, Any],
     actor_context: dict[str, Any],
+    server_global_mode: bool = False,
 ) -> dict[str, Any]:
     action = str(confirmation_payload.get("tool_name") or confirmation_payload.get("action_name") or "").strip()
     tool_input = dict(confirmation_payload.get("tool_input") or {})
     idempotency_key = str(confirmation_payload.get("idempotency_key") or tool_input.get("idempotency_key") or "").strip()
     if not action.startswith("meeting_"):
         raise HTTPException(status_code=400, detail={"error": "unsupported_domain_confirmation", "action": action})
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail={"error": "missing_idempotency_key", "action": action})
+    thread_id = str(tool_input.get("thread_id") or confirmation_payload.get("thread_id") or "").strip()
+    source_brief_id = str(
+        tool_input.get("source_brief_id")
+        or tool_input.get("brief_id")
+        or confirmation_payload.get("source_brief_id")
+        or confirmation_payload.get("brief_id")
+        or ""
+    ).strip()
+    tool_actor_context = dict(tool_input.get("actor_context") or confirmation_payload.get("actor_context") or actor_context or {})
+    explicit_global_mode = bool(server_global_mode)
+    if explicit_global_mode:
+        thread_id = ""
+        source_brief_id = ""
+        tool_actor_context = dict(actor_context or {})
+    if not explicit_global_mode and action == "meeting_create_tencent_meeting":
+        missing = [
+            field
+            for field, value in (
+                ("thread_id", thread_id),
+                ("source_brief_id", source_brief_id),
+                ("actor_context", tool_actor_context),
+            )
+            if not value
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "meeting_escalation_context_required",
+                    "action": action,
+                    "missing_fields": missing,
+                },
+            )
     if idempotency_key:
         for existing in list_dlp_tasks(
             session_id=session_id,
@@ -2661,8 +2959,19 @@ def _create_domain_task_from_confirmation(
                 return existing
     domain_payload = {
         **tool_input,
+        "idempotency_key": idempotency_key,
+        "thread_id": thread_id,
+        "source_brief_id": source_brief_id,
+        "brief_id": source_brief_id,
+        "actor_context": tool_actor_context,
+        "global_mode": explicit_global_mode,
+        "server_global_mode": explicit_global_mode,
+        "global_mode_source": "agent_chat_context" if explicit_global_mode else "",
+        "_server_global_authorized": explicit_global_mode,
+        "_server_global_authorized_by": "agent_chat_context" if explicit_global_mode else "",
         "communication_role": "escalation_provider",
         "communication_input_kind": "meeting_escalation_candidate",
+        "communication_closeout_owner": "mail_agent",
         "_confirmed_action": action,
         "_dag_plan": dict(confirmation_payload.get("dag_plan") or {}),
         "_confirmation_payload": {
@@ -2682,6 +2991,7 @@ def _create_domain_task_from_confirmation(
         status="queued",
         domain_action=action,
         domain_payload=domain_payload,
+        idempotency_key=idempotency_key,
         tenant_id=str(actor_context.get("tenant_id") or ""),
         user_id=str(actor_context.get("user_id") or ""),
         workspace_id=str(actor_context.get("workspace_id") or ""),
@@ -2726,7 +3036,11 @@ def _latest_completed_meeting_task(
     session_id: str,
     conversation_id: str,
     actor_context: dict[str, Any],
+    thread_id: str = "",
+    brief_id: str = "",
 ) -> dict[str, Any]:
+    requested_thread_id = str(thread_id or "").strip()
+    requested_brief_id = str(brief_id or "").strip()
     for task in list_dlp_tasks(
         session_id=session_id,
         tenant_id=str(actor_context.get("tenant_id") or ""),
@@ -2739,16 +3053,51 @@ def _latest_completed_meeting_task(
             continue
         if str(task.get("domain_action") or "") != "meeting_create_tencent_meeting":
             continue
+        task_context = _meeting_task_context(task)
+        if requested_thread_id and str(task_context.get("thread_id") or "") != requested_thread_id:
+            continue
+        if requested_brief_id and str(task_context.get("source_brief_id") or task_context.get("brief_id") or "") != requested_brief_id:
+            continue
         return task
     return {}
+
+
+def _meeting_task_context(task: dict[str, Any]) -> dict[str, Any]:
+    domain_payload = dict(task.get("domain_payload") or {})
+    tool_payload = dict(domain_payload.get("tool_input") or domain_payload)
+    domain_result = dict(task.get("domain_result") or {})
+    result = dict(domain_result.get("result") or {})
+    source_brief_id = str(
+        result.get("source_brief_id")
+        or result.get("brief_id")
+        or tool_payload.get("source_brief_id")
+        or tool_payload.get("brief_id")
+        or ""
+    ).strip()
+    thread_id = str(result.get("thread_id") or tool_payload.get("thread_id") or "").strip()
+    actor_payload = dict(result.get("actor_context") or tool_payload.get("actor_context") or {})
+    return {
+        "thread_id": thread_id,
+        "source_brief_id": source_brief_id,
+        "brief_id": source_brief_id,
+        "actor_context": actor_payload,
+        "thread_ref": dict(tool_payload.get("thread_ref") or {}),
+        "idempotency_key": str(result.get("idempotency_key") or tool_payload.get("idempotency_key") or task.get("idempotency_key") or ""),
+    }
 
 
 def _meeting_result_details(task: dict[str, Any]) -> dict[str, Any]:
     domain_result = dict(task.get("domain_result") or {})
     result = dict(domain_result.get("result") or {})
+    task_context = _meeting_task_context(task)
     details = {
         "communication_role": str(result.get("communication_role") or "escalation_provider"),
         "communication_input_kind": str(result.get("communication_input_kind") or "meeting_result"),
+        "communication_closeout_owner": str(result.get("communication_closeout_owner") or "mail_agent"),
+        "thread_id": str(task_context.get("thread_id") or ""),
+        "source_brief_id": str(task_context.get("source_brief_id") or ""),
+        "brief_id": str(task_context.get("brief_id") or ""),
+        "idempotency_key": str(task_context.get("idempotency_key") or ""),
         "meeting_id": str(result.get("meeting_id") or ""),
         "meeting_code": str(result.get("meeting_code") or ""),
         "meeting_url": str(result.get("meeting_url") or result.get("join_url") or ""),
@@ -2820,6 +3169,7 @@ def _mail_plan_from_meeting_task(
     recipient: str = "",
 ) -> dict[str, Any]:
     details = _meeting_result_details(task)
+    task_context = _meeting_task_context(task)
     draft_result = _meeting_invitation_draft_result(task)
     draft_state = dict(draft_result.get("draft_state") or {})
     meeting = dict(draft_state.get("meeting") or {})
@@ -2833,6 +3183,10 @@ def _mail_plan_from_meeting_task(
         {
             "communication_role": "escalation_provider",
             "communication_input_kind": "meeting_result",
+            "communication_closeout_owner": "mail_agent",
+            "thread_id": task_context.get("thread_id") or details.get("thread_id") or "",
+            "source_brief_id": task_context.get("source_brief_id") or details.get("source_brief_id") or "",
+            "brief_id": task_context.get("brief_id") or details.get("brief_id") or "",
             "topic": meeting.get("topic") or meeting.get("subject") or details.get("subject") or "",
             "meeting_id": meeting.get("meeting_id") or details.get("meeting_id") or "",
             "meeting_code": meeting.get("meeting_code") or details.get("meeting_code") or "",
@@ -2856,6 +3210,9 @@ def _mail_plan_from_meeting_task(
         "communication_role": "escalation_provider",
         "communication_input_kind": "meeting_result",
         "communication_closeout_owner": "mail_agent",
+        "thread_ref": dict(task_context.get("thread_ref") or {"thread_id": task_context.get("thread_id") or details.get("thread_id") or ""}),
+        "source_brief_id": str(task_context.get("source_brief_id") or details.get("source_brief_id") or ""),
+        "brief_id": str(task_context.get("brief_id") or details.get("brief_id") or ""),
         "resolved_recipients": recipients,
         "resolved_subject": subject,
         "resolved_body": "",
@@ -2871,6 +3228,7 @@ def _mail_plan_from_meeting_task(
             "kind": "meeting_result",
             "communication_role": "escalation_provider",
             "communication_input_kind": "meeting_result",
+            "communication_closeout_owner": "mail_agent",
             "candidate_id": f"meeting-task:{task.get('task_id')}",
             "label": subject,
             "filename": "",
@@ -2890,8 +3248,11 @@ def _mail_plan_from_meeting_task(
                 "role": "meeting_invitation_details",
                 "communication_role": "escalation_provider",
                 "communication_input_kind": "meeting_result",
+                "communication_closeout_owner": "mail_agent",
                 "policy": "recipient_ready_summary",
                 "task_id": str(task.get("task_id") or ""),
+                "thread_id": str(task_context.get("thread_id") or details.get("thread_id") or ""),
+                "source_brief_id": str(task_context.get("source_brief_id") or details.get("source_brief_id") or ""),
             }
         ],
         "compose_mode": "recipient_ready_summary",
@@ -2902,6 +3263,7 @@ def _mail_plan_from_meeting_task(
                 "role": "meeting_result",
                 "communication_role": "escalation_provider",
                 "communication_input_kind": "meeting_result",
+                "communication_closeout_owner": "mail_agent",
                 "policy": "recipient_ready_summary",
                 "content": meeting_text,
             }
@@ -2912,6 +3274,7 @@ def _mail_plan_from_meeting_task(
                 "kind": "meeting_result",
                 "communication_role": "escalation_provider",
                 "communication_input_kind": "meeting_result",
+                "communication_closeout_owner": "mail_agent",
                 "candidate_id": f"meeting-task:{task.get('task_id')}",
                 "source_turn_id": "",
                 "filename": "",
@@ -2923,6 +3286,7 @@ def _mail_plan_from_meeting_task(
                 "kind": "meeting_result",
                 "communication_role": "escalation_provider",
                 "communication_input_kind": "meeting_result",
+                "communication_closeout_owner": "mail_agent",
                 "candidate_id": f"meeting-task:{task.get('task_id')}",
                 "source_turn_id": "",
                 "filename": "",
@@ -3312,6 +3676,9 @@ def _build_meeting_result_response(
             "task_id": str(task.get("task_id") or ""),
             "task_status": str(task.get("status") or ""),
             "domain_action": str(task.get("domain_action") or ""),
+            "thread_id": details.get("thread_id") or "",
+            "source_brief_id": details.get("source_brief_id") or "",
+            "brief_id": details.get("brief_id") or "",
             "meeting": details,
             "pending_mail_draft": pending_mail_draft,
             "next_actions": ["show_meeting_result", "patch_invitation_recipients", "send_invitation_after_dlp"],
@@ -3345,6 +3712,9 @@ def _build_meeting_result_response(
                     "communication_role": "escalation_provider",
                     "communication_input_kind": "meeting_result",
                     "communication_closeout_owner": "mail_agent",
+                    "thread_id": details.get("thread_id") or "",
+                    "source_brief_id": details.get("source_brief_id") or "",
+                    "brief_id": details.get("brief_id") or "",
                     "meeting": details,
                     "pending_mail_draft": pending_mail_draft,
                 },
@@ -5543,7 +5913,7 @@ def _ensure_conversation(
     conversation_id: str | None,
     actor_context: dict[str, Any] | None = None,
 ) -> tuple[dict, bool]:
-    actor = ActorContext(**dict(actor_context or {})) if actor_context else ActorContext(session_id=session_id)
+    actor = actor_from_mapping(actor_context, session_id=session_id, conversation_id=conversation_id or "") if actor_context else ActorContext(session_id=session_id)
     if conversation_id:
         existing = get_conversation(conversation_id)
         if existing:
@@ -5715,11 +6085,12 @@ def _primary_communication_work_object(
             "status": str(mail_plan.get("status") or ""),
         }
     if pending_confirmation:
+        tool_input = dict(pending_confirmation.get("tool_input") or {})
         return {
             "kind": str(pending_confirmation.get("tool_name") or pending_confirmation.get("action_name") or "pending_confirmation"),
             "id": str(pending_confirmation.get("idempotency_key") or pending_confirmation.get("task_id") or ""),
-            "thread_id": "",
-            "subject": str(pending_confirmation.get("title") or ""),
+            "thread_id": str(tool_input.get("thread_id") or pending_confirmation.get("thread_id") or ""),
+            "subject": str(tool_input.get("topic") or pending_confirmation.get("title") or ""),
             "status": "pending_confirmation",
         }
     return {
@@ -7067,6 +7438,18 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     agent_chat_context_observations: list[dict[str, Any]] = []
 
     def finalize(response: UnifiedAgentResponse, *, task_mode: str = "sync") -> UnifiedAgentResponse:
+        if response.confirmation_payload or response.pending_confirmation:
+            stamped_confirmation = _stamp_meeting_confirmation_server_context(
+                dict(response.confirmation_payload or response.pending_confirmation or {}),
+                server_global_mode=_server_global_mode_from_agent_chat_context(agent_chat_context_snapshot),
+                agent_chat_context=agent_chat_context_snapshot,
+                actor_context=actor_context,
+            )
+            if stamped_confirmation:
+                if response.confirmation_payload:
+                    response.confirmation_payload = stamped_confirmation
+                if response.pending_confirmation:
+                    response.pending_confirmation = stamped_confirmation
         if agent_chat_context_observations:
             response.tool_observations = _prepend_observations_once(
                 list(response.tool_observations or []),
@@ -7128,7 +7511,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             **dict(upload_context or {}),
             "agent_chat_context": dict(agent_chat_context_snapshot),
         }
-    explicit_global_mode = bool(agent_chat_context_snapshot.get("global_mode"))
+    explicit_global_mode = _server_global_mode_from_agent_chat_context(agent_chat_context_snapshot)
     if recalled_upload and upload_context.get("filename"):
         display_message = _build_display_message(
             payload.message,
@@ -7139,6 +7522,8 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
         session_id=payload.session_id,
         conversation_id=conversation_id,
         actor_context=actor_context,
+        thread_id=str(agent_chat_context_snapshot.get("thread_id") or ""),
+        brief_id=str(agent_chat_context_snapshot.get("brief_id") or ""),
     )
     if (
         not explicit_global_mode
@@ -7312,12 +7697,19 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             action = str(pending_domain_confirmation.get("tool_name") or pending_domain_confirmation.get("action_name") or "")
             permission_action = "meeting.write" if action.startswith("meeting_") else "calendar.write"
             _ensure_permission(actor, permission_action, action)
+            pending_domain_confirmation = _stamp_meeting_confirmation_server_context(
+                pending_domain_confirmation,
+                server_global_mode=_server_global_mode_from_agent_chat_context(agent_chat_context_snapshot),
+                agent_chat_context=agent_chat_context_snapshot,
+                actor_context=actor_context,
+            )
             task = _create_domain_task_from_confirmation(
                 session_id=payload.session_id,
                 conversation_id=conversation_id,
                 request_message=payload.message,
                 confirmation_payload=pending_domain_confirmation,
                 actor_context=actor_context,
+                server_global_mode=_server_global_mode_from_agent_chat_context(agent_chat_context_snapshot),
             )
             consume_pending_object(pending_object.object_id, actor_context=actor_context)
             return finalize(_build_task_agent_response(
@@ -7480,6 +7872,20 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
                     actor_context=actor_context,
                 ))
     multi_agent_dag_plan = plan_multi_agent_dag_request(message=payload.message, actor_context=actor_context)
+    missing_meeting_plan_context = _missing_meeting_escalation_plan_context(
+        multi_agent_dag_plan,
+        agent_chat_context_snapshot,
+    )
+    if missing_meeting_plan_context:
+        return finalize(_build_meeting_escalation_context_required_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            missing_fields=missing_meeting_plan_context,
+            agent_chat_context=agent_chat_context_snapshot,
+            actor_context=actor_context,
+        ))
     if _agent_chat_requests_inbound_mail_access(payload.message, multi_agent_plan=multi_agent_dag_plan):
         actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
@@ -7689,6 +8095,26 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     result["permission_decision"] = permission_decision
     result["rate_limit_decision"] = rate_limit_decision
     result["queue_status"] = queue_status
+    result = _stamp_result_meeting_confirmation_server_context(
+        result,
+        server_global_mode=_server_global_mode_from_agent_chat_context(agent_chat_context_snapshot),
+        agent_chat_context=agent_chat_context_snapshot,
+        actor_context=actor_context,
+    )
+    missing_meeting_confirmation_context = _missing_meeting_confirmation_context(
+        dict(result.get("confirmation_payload") or result.get("pending_confirmation") or {}),
+        server_global_mode=_server_global_mode_from_agent_chat_context(agent_chat_context_snapshot),
+    )
+    if missing_meeting_confirmation_context:
+        return finalize(_build_meeting_escalation_context_required_response(
+            session_id=payload.session_id,
+            conversation_id=conversation_id,
+            message=payload.message,
+            display_message=display_message,
+            missing_fields=missing_meeting_confirmation_context,
+            agent_chat_context=agent_chat_context_snapshot,
+            actor_context=actor_context,
+        ))
     _refresh_result_communication_workspace(result, conversation_id)
     _persist_confirmation_object(
         session_id=payload.session_id,
