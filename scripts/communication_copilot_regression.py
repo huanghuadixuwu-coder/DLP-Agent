@@ -2465,6 +2465,191 @@ def run_contextual_chat() -> dict[str, Any]:
     }
 
 
+def run_workspace_thread_inbox() -> dict[str, Any]:
+    from fastapi.testclient import TestClient
+
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.mail.draft_store import upsert_mail_draft
+    from app.task_store import create_dlp_task
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-workspace-inbox-{suffix}"
+    conversation_id = f"conversation-workspace-inbox-{suffix}"
+    actor_context = {
+        "tenant_id": "local-dev",
+        "user_id": "local-user",
+        "workspace_id": "workspace-thread-inbox",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    headers = {
+        "X-Tenant-Id": actor_context["tenant_id"],
+        "X-User-Id": actor_context["user_id"],
+        "X-Workspace-Id": actor_context["workspace_id"],
+        "X-Roles": ",".join(actor_context["roles"]),
+    }
+    thread_id = f"thread-workspace-inbox-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-workspace-inbox-1-{suffix}",
+        uid=f"uid-workspace-inbox-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Thread inbox workspace renewal",
+        received_at="2026-06-18T10:00:00+00:00",
+        summary="Customer asks for a renewal reply and expects EU failover details.",
+        risk_hint="medium",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "workspace active thread")
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Thread inbox workspace renewal",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-18T10:00:00+00:00",
+        status="open",
+        latest_summary="Customer asks for a renewal reply and expects EU failover details.",
+        risk_hint="medium",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-workspace-inbox-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Prepare a grounded renewal reply.",
+        customer_context_summary="Customer needs renewal and EU failover details.",
+        grounding_refs=[{"doc_id": "enterprise-eu-failover", "title": "Enterprise EU failover"}],
+        must_include=["EU failover"],
+        must_avoid=["unapproved commitments"],
+        open_questions=["Confirm renewal date"],
+        recommended_next_action="draft_reply",
+        source_observation_ids=["obs-workspace-inbox"],
+        confidence=0.89,
+        actor_context=actor_context,
+    )
+    stored_brief = upsert_communication_brief(
+        brief,
+        actor_context=actor_context,
+        refresh_reason="workspace_thread_inbox_regression",
+    )
+    _assert_true(stored_brief, "workspace persisted brief")
+    stored_draft = upsert_mail_draft(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan={
+            "draft_id": f"draft-workspace-inbox-{suffix}",
+            "mail_action_type": "send_reply",
+            "status": "draft_ready",
+            "resolved_recipients": ["customer@example.com"],
+            "resolved_subject": "Re: Thread inbox workspace renewal",
+            "resolved_body": "Draft preview body scoped to the selected thread.",
+            "thread_ref": thread_ref.to_dict(),
+            "source_brief_id": brief.brief_id,
+        },
+        actor_context=actor_context,
+        status="draft_ready",
+    )
+    _assert_true(stored_draft, "workspace draft preview")
+    created_task = create_dlp_task(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message_raw="Draft preview body scoped to the selected thread.",
+        request_message="Send the selected thread reply.",
+        delivery_subject="Re: Thread inbox workspace renewal",
+        delivery_body="Draft preview body scoped to the selected thread.",
+        destination_email="customer@example.com",
+        status="pending_approval",
+        domain_action="mail_send",
+        domain_payload={"thread_id": thread_id, "brief_id": brief.brief_id},
+        mail_draft_id=str(stored_draft["draft_id"]),
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+    )
+    _assert_true(created_task, "workspace task progress")
+
+    client = TestClient(main_module.app)
+    response = client.get(
+        "/internal/communication/workspace",
+        params={
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "refresh": "false",
+        },
+        headers=headers,
+    )
+    _assert_equal(response.status_code, 200, "workspace API status")
+    workspace = response.json()
+    _assert_true(workspace.get("ok"), "workspace ok")
+    thread_ids = [item.get("thread_id") for item in workspace.get("threads") or []]
+    _assert_true(thread_id in thread_ids, "workspace thread list includes selected thread")
+    _assert_equal(
+        (workspace.get("selected_thread") or {}).get("thread_id"),
+        thread_id,
+        "workspace selected thread detail",
+    )
+    _assert_equal(
+        (workspace.get("active_thread") or {}).get("thread_id"),
+        thread_id,
+        "workspace active thread",
+    )
+    _assert_equal(
+        (workspace.get("latest_brief") or {}).get("brief", {}).get("brief_id"),
+        brief.brief_id,
+        "workspace active brief",
+    )
+    _assert_equal(
+        (workspace.get("copilot_context") or {}).get("thread_id"),
+        thread_id,
+        "workspace Copilot thread context",
+    )
+    _assert_equal(
+        (workspace.get("copilot_context") or {}).get("brief_id"),
+        brief.brief_id,
+        "workspace Copilot brief context",
+    )
+    _assert_equal(
+        (workspace.get("draft_preview") or {}).get("draft_id"),
+        stored_draft["draft_id"],
+        "workspace draft preview state",
+    )
+    task_ids = [item.get("task_id") for item in workspace.get("task_progress") or []]
+    _assert_true(created_task["task_id"] in task_ids, "workspace task progress state")
+    _assert_equal(
+        (workspace.get("governance_boundary") or {}).get("high_risk_approval_surface"),
+        "8512_governance_console",
+        "workspace governance boundary",
+    )
+
+    refreshed = client.get(
+        "/internal/communication/workspace",
+        params={"session_id": session_id, "conversation_id": conversation_id, "refresh": "false"},
+        headers=headers,
+    )
+    _assert_equal(refreshed.status_code, 200, "workspace refresh API status")
+    _assert_equal(
+        (refreshed.json().get("selected_thread") or {}).get("thread_id"),
+        thread_id,
+        "workspace selected thread survives refresh via active store",
+    )
+
+    return {
+        "ok": True,
+        "case": "workspace_thread_inbox",
+        "thread_id": thread_id,
+        "brief_id": brief.brief_id,
+        "draft_id": stored_draft["draft_id"],
+        "task_id": created_task["task_id"],
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -2584,6 +2769,7 @@ def main() -> int:
         "retirement": run_retirement,
         "runtime_brief_closeout": run_runtime_brief_closeout,
         "contextual_chat": run_contextual_chat,
+        "workspace_thread_inbox": run_workspace_thread_inbox,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

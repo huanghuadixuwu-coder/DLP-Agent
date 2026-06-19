@@ -23,7 +23,7 @@ from app.actor_context import ActorContext, build_actor_context, permission_obse
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.communication.brief_service import assemble_communication_brief_observation
-from app.communication.brief_store import get_latest_brief_for_thread, init_communication_brief_store
+from app.communication.brief_store import get_latest_brief_for_thread, init_communication_brief_store, refresh_brief_for_thread
 from app.communication.thread_store import (
     get_active_communication_thread,
     get_communication_thread,
@@ -1096,6 +1096,84 @@ def _communication_thread_payload(thread: dict[str, Any]) -> dict[str, Any]:
         "risk_hint": str(thread.get("risk_hint") or ""),
         "updated_at": str(thread.get("updated_at") or ""),
     }
+
+
+def _communication_brief_record_payload(record: dict[str, Any] | None) -> dict[str, Any]:
+    if not record:
+        return {}
+    item = dict(record)
+    brief_payload = dict(item.get("brief") or {})
+    if brief_payload:
+        brief_payload.setdefault("brief_persistence_source", str(item.get("persistence_source") or "communication_briefs"))
+        brief_payload.setdefault("brief_version", int(item.get("version") or 1))
+        brief_payload.setdefault("refresh_reason", str(item.get("refresh_reason") or ""))
+    item["brief"] = brief_payload
+    return item
+
+
+def _mail_draft_preview_payload(draft: dict[str, Any] | None) -> dict[str, Any]:
+    if not draft:
+        return {}
+    plan = dict(draft.get("mail_plan") or {})
+    return {
+        "draft_id": str(draft.get("draft_id") or plan.get("draft_id") or ""),
+        "status": str(draft.get("status") or plan.get("status") or ""),
+        "version": int(draft.get("version") or 1),
+        "conversation_id": str(draft.get("conversation_id") or plan.get("conversation_id") or ""),
+        "recipients": list(plan.get("resolved_recipients") or []),
+        "subject": str(plan.get("resolved_subject") or ""),
+        "body_preview": compact_text(str(plan.get("resolved_body") or ""), 800),
+        "mail_action_type": str(plan.get("mail_action_type") or ""),
+        "source_brief_id": str(plan.get("source_brief_id") or plan.get("brief_id") or ""),
+        "thread_ref": dict(plan.get("thread_ref") or {}),
+        "dlp_task_id": str(draft.get("dlp_task_id") or ""),
+        "updated_at": str(draft.get("updated_at") or ""),
+    }
+
+
+def _task_progress_payload(task: dict[str, Any]) -> dict[str, Any]:
+    domain_payload = dict(task.get("domain_payload") or {})
+    return {
+        "task_id": str(task.get("task_id") or ""),
+        "conversation_id": str(task.get("conversation_id") or ""),
+        "status": str(task.get("status") or ""),
+        "risk_level": str(task.get("risk_level") or ""),
+        "approval_required": bool(task.get("approval_required")),
+        "delivery_status": str(task.get("delivery_status") or "not_sent"),
+        "destination_email": str(task.get("destination_email") or ""),
+        "mail_draft_id": str(task.get("mail_draft_id") or ""),
+        "thread_id": str(domain_payload.get("thread_id") or ""),
+        "brief_id": str(domain_payload.get("brief_id") or ""),
+        "updated_at": str(task.get("updated_at") or ""),
+    }
+
+
+def _workspace_task_progress(
+    *,
+    actor: ActorContext,
+    session_id: str,
+    conversation_id: str,
+    thread_id: str,
+    brief_id: str,
+    draft_id: str,
+) -> list[dict[str, Any]]:
+    workspace_task_reader = bool({"admin", "approver"}.intersection({str(role).lower() for role in actor.roles}))
+    tasks = list_dlp_tasks(
+        session_id=session_id or None,
+        tenant_id=None if actor.is_local_dev else actor.tenant_id,
+        user_id=None if actor.is_local_dev or workspace_task_reader else actor.user_id,
+        workspace_id=None if actor.is_local_dev else actor.workspace_id,
+    )
+    selected: list[dict[str, Any]] = []
+    for task in tasks:
+        payload = dict(task.get("domain_payload") or {})
+        matches_thread = bool(thread_id) and str(payload.get("thread_id") or "") == thread_id
+        matches_brief = bool(brief_id) and str(payload.get("brief_id") or "") == brief_id
+        matches_draft = bool(draft_id) and str(task.get("mail_draft_id") or "") == draft_id
+        matches_conversation = bool(conversation_id) and str(task.get("conversation_id") or "") == conversation_id
+        if matches_thread or matches_brief or matches_draft or matches_conversation:
+            selected.append(_task_progress_payload(task))
+    return selected[:20]
 
 
 def _resolve_agent_chat_context(
@@ -6581,6 +6659,87 @@ def internal_active_communication_thread_api(request: Request) -> dict[str, Any]
     }
 
 
+@app.get("/internal/communication/workspace")
+def internal_communication_workspace_api(
+    request: Request,
+    session_id: str = "",
+    conversation_id: str = "",
+    thread_id: str = "",
+    limit: int = 20,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    actor = build_actor_context(
+        request=request,
+        session_id=session_id or "",
+        conversation_id=conversation_id or "",
+    )
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
+    permission_decision = _ensure_permission(actor, "mail.read", "communication_workspace")
+    actor_context = actor.to_dict()
+    threads = list_communication_threads(
+        actor_context=actor_context,
+        limit=max(1, min(int(limit or 20), 100)),
+        refresh=refresh,
+    )
+
+    requested_thread_id = str(thread_id or "").strip()
+    selected_thread: dict[str, Any] | None = None
+    if requested_thread_id:
+        selected_thread = set_active_communication_thread(requested_thread_id, actor_context=actor_context)
+        if not selected_thread:
+            selected_thread = get_communication_thread(requested_thread_id, actor_context=actor_context, refresh=refresh)
+    if not selected_thread:
+        selected_thread = get_active_communication_thread(actor_context=actor_context)
+    if not selected_thread and threads:
+        selected_thread = set_active_communication_thread(str(threads[0].get("thread_id") or ""), actor_context=actor_context)
+    selected_thread = dict(selected_thread or {})
+    selected_thread_id = str(selected_thread.get("thread_id") or "")
+    active_thread = get_active_communication_thread(actor_context=actor_context) if selected_thread_id else None
+    latest_brief = _communication_brief_record_payload(
+        get_latest_brief_for_thread(selected_thread_id, actor_context=actor_context) if selected_thread_id else None
+    )
+    brief_payload = dict(latest_brief.get("brief") or {})
+    brief_id = str(brief_payload.get("brief_id") or "")
+    draft = get_latest_active_mail_draft(conversation_id, actor_context=actor_context) if conversation_id else None
+    draft_preview = _mail_draft_preview_payload(draft)
+    task_progress = _workspace_task_progress(
+        actor=actor,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        thread_id=selected_thread_id,
+        brief_id=brief_id,
+        draft_id=str(draft_preview.get("draft_id") or ""),
+    )
+
+    return {
+        "ok": True,
+        "actor_context": actor_context,
+        "access_decision": access_decision,
+        "permission_decision": permission_decision,
+        "workspace_kind": "communication_thread_inbox",
+        "threads": threads,
+        "selected_thread": selected_thread,
+        "active_thread": dict(active_thread or {}),
+        "latest_brief": latest_brief,
+        "draft_preview": draft_preview,
+        "task_progress": task_progress,
+        "copilot_context": {
+            "surface_role": "thread_inbox_copilot_side_panel",
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "thread_id": selected_thread_id,
+            "brief_id": brief_id,
+            "global_mode": False,
+            "context_source": "communication_workspace_state",
+        },
+        "governance_boundary": {
+            "sender_progress_surface": "8511_user_workspace",
+            "high_risk_approval_surface": "8512_governance_console",
+            "raw_diagnostics_surface": "8512_governance_console",
+        },
+    }
+
+
 @app.post("/internal/communication/threads/{thread_id}/active")
 def internal_set_active_communication_thread_api(thread_id: str, request: Request) -> dict[str, Any]:
     actor = build_actor_context(request=request)
@@ -6595,6 +6754,52 @@ def internal_set_active_communication_thread_api(thread_id: str, request: Reques
         "access_decision": access_decision,
         "permission_decision": permission_decision,
         "active_thread": thread,
+    }
+
+
+@app.post("/internal/communication/threads/{thread_id}/brief/refresh")
+def internal_refresh_communication_brief_api(
+    thread_id: str,
+    request: Request,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = dict(payload or {})
+    actor = build_actor_context(
+        request=request,
+        session_id=str(body.get("session_id") or ""),
+        conversation_id=str(body.get("conversation_id") or ""),
+    )
+    access_decision = _ensure_internal_communication_thread_access(request, actor)
+    permission_decision = _ensure_permission(actor, "mail.read", f"communication_thread:{thread_id}")
+    thread = get_communication_thread(thread_id, actor_context=actor.to_dict(), refresh=True)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Unknown communication thread")
+    latest = get_latest_brief_for_thread(str(thread.get("thread_id") or thread_id), actor_context=actor.to_dict())
+    latest_brief = dict(dict(latest or {}).get("brief") or {})
+    employee_goal = compact_text(
+        str(
+            body.get("employee_goal")
+            or latest_brief.get("employee_goal")
+            or thread.get("latest_summary")
+            or thread.get("subject")
+            or "Prepare the next customer communication action."
+        ),
+        600,
+    )
+    refreshed = refresh_brief_for_thread(
+        str(thread.get("thread_id") or thread_id),
+        actor_context=actor.to_dict(),
+        employee_goal=employee_goal,
+        conversation_id=str(body.get("conversation_id") or latest_brief.get("conversation_id") or ""),
+        refresh_reason=str(body.get("refresh_reason") or "workspace_manual_refresh"),
+    )
+    return {
+        "ok": True,
+        "actor_context": actor.to_dict(),
+        "access_decision": access_decision,
+        "permission_decision": permission_decision,
+        "thread": thread,
+        "latest_brief": _communication_brief_record_payload(refreshed),
     }
 
 

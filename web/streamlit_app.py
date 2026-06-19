@@ -157,6 +157,45 @@ def load_inbound_mail_messages(limit: int = 5) -> list[dict]:
     return api_get("/mail/inbound/messages", params={"limit": limit}, timeout=30.0)
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def load_communication_workspace(
+    session_id: str,
+    conversation_id: str | None,
+    thread_id: str | None,
+    refresh: bool = True,
+) -> dict:
+    try:
+        return api_get(
+            "/internal/communication/workspace",
+            params={
+                "session_id": session_id,
+                "conversation_id": conversation_id or "",
+                "thread_id": thread_id or "",
+                "refresh": refresh,
+            },
+            timeout=30.0,
+        )
+    except Exception:
+        return {}
+
+
+def select_communication_thread(thread_id: str) -> dict:
+    return api_post(f"/internal/communication/threads/{thread_id}/active", {}, timeout=30.0)
+
+
+def refresh_communication_brief(thread_id: str, session_id: str, conversation_id: str | None, employee_goal: str = "") -> dict:
+    return api_post(
+        f"/internal/communication/threads/{thread_id}/brief/refresh",
+        {
+            "session_id": session_id,
+            "conversation_id": conversation_id or "",
+            "employee_goal": employee_goal,
+            "refresh_reason": "streamlit_workspace_refresh",
+        },
+        timeout=60.0,
+    )
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def load_notification_outbox(limit: int = 5) -> list[dict]:
     return api_get("/notifications/outbox", params={"limit": limit}, timeout=30.0)
@@ -174,6 +213,7 @@ def run_unified_agent(
     uploaded_file_base64: str = "",
     source_parse_status: str = "not_provided",
     source_parse_error: str = "",
+    thread_id: str = "",
 ) -> dict:
     return api_post(
         "/agent/chat",
@@ -190,6 +230,7 @@ def run_unified_agent(
             "uploaded_file_base64": uploaded_file_base64,
             "source_parse_status": source_parse_status,
             "source_parse_error": source_parse_error,
+            "thread_id": thread_id,
         },
     )
 
@@ -201,12 +242,16 @@ def get_query_param(name: str) -> str | None:
     return value
 
 
-def sync_url_state(session_id: str, conversation_id: str | None = None) -> None:
+def sync_url_state(session_id: str, conversation_id: str | None = None, thread_id: str | None = None) -> None:
     st.query_params["session_id"] = session_id
     if conversation_id:
         st.query_params["conversation_id"] = conversation_id
     elif "conversation_id" in st.query_params:
         del st.query_params["conversation_id"]
+    if thread_id:
+        st.query_params["thread_id"] = thread_id
+    elif "thread_id" in st.query_params:
+        del st.query_params["thread_id"]
 
 
 def should_collapse(text: str) -> bool:
@@ -824,6 +869,8 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = get_query_param("session_id") or str(uuid.uuid4())
 if "current_conversation_id" not in st.session_state:
     st.session_state.current_conversation_id = get_query_param("conversation_id")
+if "active_communication_thread_id" not in st.session_state:
+    st.session_state.active_communication_thread_id = get_query_param("thread_id") or ""
 if "last_debug" not in st.session_state:
     st.session_state.last_debug = None
 if "auto_collapse_answers" not in st.session_state:
@@ -859,7 +906,25 @@ reverse_conversation_options = {value: key for key, value in conversation_option
 valid_conversation_ids = set(conversation_options.values())
 if conversations and st.session_state.current_conversation_id not in valid_conversation_ids:
     st.session_state.current_conversation_id = conversations[0]["conversation_id"]
-sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
+sync_url_state(
+    st.session_state.session_id,
+    st.session_state.current_conversation_id,
+    st.session_state.active_communication_thread_id,
+)
+communication_workspace = load_communication_workspace(
+    st.session_state.session_id,
+    st.session_state.current_conversation_id,
+    st.session_state.active_communication_thread_id,
+)
+workspace_selected_thread = communication_workspace.get("selected_thread") or {}
+workspace_thread_id = str(workspace_selected_thread.get("thread_id") or "")
+if workspace_thread_id and workspace_thread_id != st.session_state.active_communication_thread_id:
+    st.session_state.active_communication_thread_id = workspace_thread_id
+    sync_url_state(
+        st.session_state.session_id,
+        st.session_state.current_conversation_id,
+        st.session_state.active_communication_thread_id,
+    )
 
 
 with st.sidebar:
@@ -876,7 +941,11 @@ with st.sidebar:
             st.session_state.visible_turn_limit = 30
             st.session_state.last_debug = None
             st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
-            sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
+            sync_url_state(
+                st.session_state.session_id,
+                st.session_state.current_conversation_id,
+                st.session_state.active_communication_thread_id,
+            )
             st.rerun()
     with delete_col:
         if st.session_state.current_conversation_id and st.button("删除线程", type="secondary"):
@@ -892,7 +961,11 @@ with st.sidebar:
                     created = create_conversation(st.session_state.session_id)
                     st.session_state.current_conversation_id = created["conversation_id"]
                 st.session_state.visible_turn_limit = 30
-                sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
+                sync_url_state(
+                    st.session_state.session_id,
+                    st.session_state.current_conversation_id,
+                    st.session_state.active_communication_thread_id,
+                )
                 st.success("沟通线程已删除")
                 st.rerun()
             except Exception as exc:
@@ -911,7 +984,11 @@ with st.sidebar:
             st.session_state.current_conversation_id = selected_conversation_id
             st.session_state.visible_turn_limit = 30
             st.session_state.last_debug_conversation_id = selected_conversation_id
-            sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
+            sync_url_state(
+                st.session_state.session_id,
+                st.session_state.current_conversation_id,
+                st.session_state.active_communication_thread_id,
+            )
         st.caption("当前 conversation_id")
         st.code(st.session_state.current_conversation_id, language=None)
 
@@ -929,7 +1006,11 @@ with st.sidebar:
             st.session_state.visible_turn_limit = 30
             st.session_state.last_debug = {"merge_result": result}
             st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
-            sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
+            sync_url_state(
+                st.session_state.session_id,
+                st.session_state.current_conversation_id,
+                st.session_state.active_communication_thread_id,
+            )
             st.success("合并完成")
             st.rerun()
         except Exception as exc:
@@ -991,85 +1072,119 @@ with st.sidebar:
 
 
 left, right = st.columns([2, 1])
+threads = communication_workspace.get("threads") or []
+selected_thread = communication_workspace.get("selected_thread") or {}
+latest_brief_record = communication_workspace.get("latest_brief") or {}
+latest_brief = latest_brief_record.get("brief") or {}
+draft_preview = communication_workspace.get("draft_preview") or {}
+copilot_context = communication_workspace.get("copilot_context") or {}
+workspace_tasks = communication_workspace.get("task_progress") or []
 
 with left:
-    st.subheader("沟通上下文")
-    turns = load_turns(st.session_state.current_conversation_id)
-    current_turn_debug = latest_debug_from_turns(turns)
-    if current_turn_debug and (
-        not st.session_state.last_debug
-        or st.session_state.last_debug_conversation_id != st.session_state.current_conversation_id
-    ):
-        st.session_state.last_debug = current_turn_debug
-        st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
-    if not turns:
-        st.caption("这个沟通线程还没有消息。")
-    hidden_turn_count = max(0, len(turns) - st.session_state.visible_turn_limit)
-    if hidden_turn_count:
-        info_col, action_col = st.columns([3, 1])
-        with info_col:
-            st.caption(f"当前仅渲染最近 {st.session_state.visible_turn_limit} 条消息，已隐藏更早的 {hidden_turn_count} 条，以保证页面流畅。")
-        with action_col:
-            if st.button("加载更早消息", key=f"load_more_{st.session_state.current_conversation_id}"):
-                st.session_state.visible_turn_limit += 20
+    st.subheader("客户线程收件箱")
+    if not communication_workspace:
+        st.info("线程工作区暂不可用。请确认 API 服务可访问后刷新。")
+    elif not threads:
+        st.caption("暂无可选择的客户线程。同步收件箱后会在这里显示线程。")
+    else:
+        thread_options = {
+            f"{item.get('subject') or '(no subject)'} · {item.get('thread_id')}": item.get("thread_id")
+            for item in threads
+        }
+        thread_labels = list(thread_options.keys())
+        current_thread_id = st.session_state.active_communication_thread_id or str(selected_thread.get("thread_id") or "")
+        current_index = 0
+        for index, label in enumerate(thread_labels):
+            if thread_options[label] == current_thread_id:
+                current_index = index
+                break
+        selected_label = st.selectbox("选择客户线程", thread_labels, index=current_index)
+        selected_thread_id = str(thread_options[selected_label] or "")
+        if selected_thread_id and selected_thread_id != st.session_state.active_communication_thread_id:
+            try:
+                select_communication_thread(selected_thread_id)
+                st.cache_data.clear()
+                st.session_state.active_communication_thread_id = selected_thread_id
+                sync_url_state(
+                    st.session_state.session_id,
+                    st.session_state.current_conversation_id,
+                    st.session_state.active_communication_thread_id,
+                )
                 st.rerun()
-    visible_turns = turns[-st.session_state.visible_turn_limit :]
-    for turn in visible_turns:
-        render_message(turn, st.session_state.auto_collapse_answers)
+            except Exception as exc:
+                st.error(f"选择线程失败: {exc}")
 
-    st.markdown(
-        "<span class='small-muted'>可选：把日志、JSON、CSV 或 Markdown 上传给 Copilot 作为本轮沟通上下文。</span>",
-        unsafe_allow_html=True,
-    )
-    chat_uploaded = st.file_uploader(
-        "上传给本轮沟通上下文的文件",
-        key=f"chat_upload_{st.session_state.current_conversation_id}_{st.session_state.chat_upload_nonce}",
-    )
-    chat_uploaded_text, chat_source_parse_status, chat_upload_error, chat_uploaded_base64 = decode_uploaded_file(chat_uploaded)
-    chat_source_parse_error = chat_upload_error
-    if chat_upload_error:
-        st.warning(chat_upload_error)
-    elif chat_uploaded:
-        st.caption(f"已准备文件: {chat_uploaded.name}，发送下一条消息时会一起提交。")
+    st.subheader("线程详情")
+    if selected_thread:
+        st.markdown(f"**{selected_thread.get('subject') or '(no subject)'}**")
+        st.caption(f"thread_id: {selected_thread.get('thread_id', '')}")
+        st.caption(f"最近消息: {selected_thread.get('last_message_at') or selected_thread.get('updated_at') or '-'}")
+        st.caption(f"状态: {selected_thread.get('status') or '-'} / 风险提示: {selected_thread.get('risk_hint') or '-'}")
+        participants = selected_thread.get("participants") or []
+        if participants:
+            st.write("参与方")
+            st.write(", ".join(participants))
+        if selected_thread.get("latest_summary"):
+            st.write("线程摘要")
+            st.write(selected_thread.get("latest_summary"))
+    else:
+        st.caption("请选择一个客户线程查看详情。")
 
-    prompt = st.chat_input("输入沟通任务，例如：基于这条线程帮我准备给客户的回复")
-    if prompt:
-        with st.chat_message("user"):
-            st.markdown(prompt)
-            if chat_uploaded:
-                st.caption(f"附件: {chat_uploaded.name}")
-        with st.chat_message("assistant"):
-            with st.spinner("Copilot 正在处理沟通上下文；如涉及外发，会进入 DLP 检测与治理链路..."):
-                try:
-                    result = run_unified_agent(
-                        st.session_state.session_id,
-                        st.session_state.current_conversation_id,
-                        prompt,
-                        mode,
-                        show_steps,
-                        chat_uploaded.name if chat_uploaded else "",
-                        chat_uploaded.type if chat_uploaded else "",
-                        chat_uploaded_text,
-                        chat_uploaded_base64,
-                        chat_source_parse_status,
-                        chat_source_parse_error,
-                    )
-                    st.cache_data.clear()
-                    st.session_state.current_conversation_id = result["conversation_id"]
-                    st.session_state.visible_turn_limit = 30
-                    st.session_state.last_debug = result
-                    st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
-                    if result.get("task_id"):
-                        set_task_panel_focus(result.get("task_id"), result.get("task_status"))
-                    st.session_state.chat_upload_nonce += 1
-                    sync_url_state(st.session_state.session_id, st.session_state.current_conversation_id)
-                    render_answer(result["answer"], st.session_state.auto_collapse_answers)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"请求失败: {exc}")
+    st.subheader("Active Brief")
+    if latest_brief:
+        brief_cols = st.columns(3)
+        brief_cols[0].metric("Brief", latest_brief.get("brief_id", "-"))
+        brief_cols[1].metric("Version", latest_brief_record.get("version", latest_brief.get("brief_version", 1)))
+        brief_cols[2].metric("Confidence", f"{float(latest_brief.get('confidence') or 0):.2f}")
+        if latest_brief.get("employee_goal"):
+            st.write("目标")
+            st.write(latest_brief.get("employee_goal"))
+        if latest_brief.get("customer_context_summary"):
+            st.write("客户上下文")
+            st.write(latest_brief.get("customer_context_summary"))
+        if latest_brief.get("recommended_next_action"):
+            st.caption(f"建议下一步: {latest_brief.get('recommended_next_action')}")
+        if latest_brief.get("must_include"):
+            st.write("必须包含")
+            st.write(", ".join(latest_brief.get("must_include") or []))
+    else:
+        st.caption("当前线程还没有可用 brief。可以刷新生成工作区 brief。")
+    refresh_disabled = not bool(selected_thread.get("thread_id"))
+    if st.button("刷新 Brief", disabled=refresh_disabled):
+        try:
+            refresh_communication_brief(
+                str(selected_thread.get("thread_id") or ""),
+                st.session_state.session_id,
+                st.session_state.current_conversation_id,
+                str(latest_brief.get("employee_goal") or selected_thread.get("latest_summary") or ""),
+            )
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as exc:
+            st.error(f"刷新 Brief 失败: {exc}")
 
-with right:
-    st.subheader("用户沟通工作台")
+    with st.expander("草稿预览 / 任务进度", expanded=False):
+        if draft_preview:
+            st.write("当前草稿")
+            st.caption(f"draft_id: {draft_preview.get('draft_id')} / status: {draft_preview.get('status')}")
+            if draft_preview.get("recipients"):
+                st.caption(f"to: {', '.join(draft_preview.get('recipients') or [])}")
+            if draft_preview.get("subject"):
+                st.write(draft_preview.get("subject"))
+            if draft_preview.get("body_preview"):
+                st.write(draft_preview.get("body_preview"))
+        else:
+            st.caption("当前线程暂无活动草稿。")
+        if workspace_tasks:
+            st.write("本线程任务进度")
+            for task in workspace_tasks[:5]:
+                st.markdown(
+                    f"- `{task.get('task_id')}` {task.get('status')} / "
+                    f"{task.get('delivery_status')} / risk: {task.get('risk_level') or '-'}"
+                )
+        else:
+            st.caption("当前线程暂无外发任务。")
+
     with st.expander("邮件早报 / 收件状态", expanded=False):
         st.caption("只读企业邮箱 IMAP 收件能力。同步和早报生成属于用户工作台动作，不包含治理审批。")
         mail_cols = st.columns(2)
@@ -1077,6 +1192,7 @@ with right:
             if st.button("同步收件箱", use_container_width=True):
                 try:
                     sync_result = sync_inbound_mailbox()
+                    st.cache_data.clear()
                     if sync_result.get("enabled") is False:
                         st.info(sync_result.get("state", {}).get("last_error") or "IMAP 未启用。")
                     else:
@@ -1120,6 +1236,95 @@ with right:
                         st.markdown(f"- `{item.get('event_type')}` {item.get('title')} ({item.get('status')})")
         except Exception as exc:
             st.info(f"邮件状态暂不可用: {exc}")
+
+with right:
+    st.subheader("Copilot 动作面板")
+    if copilot_context.get("thread_id"):
+        st.caption(
+            "当前 Copilot 上下文: "
+            f"thread_id={copilot_context.get('thread_id')} / "
+            f"brief_id={copilot_context.get('brief_id') or '-'}"
+        )
+    else:
+        st.caption("请选择客户线程后，Copilot 会带入线程与 brief 上下文。")
+    turns = load_turns(st.session_state.current_conversation_id)
+    current_turn_debug = latest_debug_from_turns(turns)
+    if current_turn_debug and (
+        not st.session_state.last_debug
+        or st.session_state.last_debug_conversation_id != st.session_state.current_conversation_id
+    ):
+        st.session_state.last_debug = current_turn_debug
+        st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
+    if not turns:
+        st.caption("这个沟通线程还没有 Copilot 消息。")
+    hidden_turn_count = max(0, len(turns) - st.session_state.visible_turn_limit)
+    if hidden_turn_count:
+        info_col, action_col = st.columns([3, 1])
+        with info_col:
+            st.caption(f"当前仅渲染最近 {st.session_state.visible_turn_limit} 条消息，已隐藏更早的 {hidden_turn_count} 条，以保证页面流畅。")
+        with action_col:
+            if st.button("加载更早消息", key=f"load_more_{st.session_state.current_conversation_id}"):
+                st.session_state.visible_turn_limit += 20
+                st.rerun()
+    visible_turns = turns[-st.session_state.visible_turn_limit :]
+    for turn in visible_turns:
+        render_message(turn, st.session_state.auto_collapse_answers)
+
+    st.markdown(
+        "<span class='small-muted'>可选：把日志、JSON、CSV 或 Markdown 上传给 Copilot 作为本轮沟通上下文。</span>",
+        unsafe_allow_html=True,
+    )
+    chat_uploaded = st.file_uploader(
+        "上传给本轮沟通上下文的文件",
+        key=f"chat_upload_{st.session_state.current_conversation_id}_{st.session_state.chat_upload_nonce}",
+    )
+    chat_uploaded_text, chat_source_parse_status, chat_upload_error, chat_uploaded_base64 = decode_uploaded_file(chat_uploaded)
+    chat_source_parse_error = chat_upload_error
+    if chat_upload_error:
+        st.warning(chat_upload_error)
+    elif chat_uploaded:
+        st.caption(f"已准备文件: {chat_uploaded.name}，发送下一条消息时会一起提交。")
+
+    prompt = st.chat_input("输入 Copilot 动作，例如：基于当前客户线程帮我准备回复")
+    if prompt:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            if chat_uploaded:
+                st.caption(f"附件: {chat_uploaded.name}")
+        with st.chat_message("assistant"):
+            with st.spinner("Copilot 正在处理当前线程上下文；如涉及外发，会进入 DLP 检测与治理链路..."):
+                try:
+                    result = run_unified_agent(
+                        st.session_state.session_id,
+                        st.session_state.current_conversation_id,
+                        prompt,
+                        mode,
+                        show_steps,
+                        chat_uploaded.name if chat_uploaded else "",
+                        chat_uploaded.type if chat_uploaded else "",
+                        chat_uploaded_text,
+                        chat_uploaded_base64,
+                        chat_source_parse_status,
+                        chat_source_parse_error,
+                        st.session_state.active_communication_thread_id,
+                    )
+                    st.cache_data.clear()
+                    st.session_state.current_conversation_id = result["conversation_id"]
+                    st.session_state.visible_turn_limit = 30
+                    st.session_state.last_debug = result
+                    st.session_state.last_debug_conversation_id = st.session_state.current_conversation_id
+                    if result.get("task_id"):
+                        set_task_panel_focus(result.get("task_id"), result.get("task_status"))
+                    st.session_state.chat_upload_nonce += 1
+                    sync_url_state(
+                        st.session_state.session_id,
+                        st.session_state.current_conversation_id,
+                        st.session_state.active_communication_thread_id,
+                    )
+                    render_answer(result["answer"], st.session_state.auto_collapse_answers)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"请求失败: {exc}")
 
     st.subheader("本轮状态")
     debug = st.session_state.last_debug or {}
