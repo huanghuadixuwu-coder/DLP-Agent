@@ -70,10 +70,16 @@ def run_react_agent_request(
     router_reason: str = "",
     degraded_from: str = "none",
     actor_context: dict[str, Any] | None = None,
+    initial_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     registry = build_tool_registry()
     executors = build_tool_executor_map()
+    context_observations = [
+        dict(item)
+        for item in list(initial_observations or [])
+        if isinstance(item, dict)
+    ]
     context = OrchestrationContext(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -108,7 +114,7 @@ def run_react_agent_request(
         "max_same_tool_retries": int(getattr(settings, "react_max_same_tool_retries", 1)),
         "current_goal": "",
         "working_memory": [],
-        "observations": [],
+        "observations": list(context_observations),
         "react_trace": [],
         "tool_calls": [],
         "partial_failures": [],
@@ -133,7 +139,7 @@ def run_react_agent_request(
         "routing_reason": "",
         "candidate_intents": [],
         "memory_reads": [],
-        "tool_observations": [],
+        "tool_observations": list(context_observations),
         "token_in": 0,
         "token_out": 0,
         "estimated_cost": 0.0,

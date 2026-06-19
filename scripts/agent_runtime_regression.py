@@ -130,11 +130,61 @@ def main() -> None:
         and item.get("actor_context") == actor
         for item in context_observations
     )
+    import app.orchestration.react_controller as react_controller
+
+    react_initial_observation = make_typed_observation(
+        observation_type="active_communication_thread",
+        source="agent_runtime_regression",
+        grounding_kind="state",
+        summary="Initial contextual thread must be present before ReAct planning.",
+        payload={"thread_id": "thread-runtime-live-state", "brief_id": ""},
+        provenance={"source": "agent_runtime_regression"},
+        confidence=1.0,
+        actor_context=actor,
+    )
+    captured_react_state: dict[str, list[dict[str, object]]] = {}
+    original_think_next_step = react_controller._think_next_step
+
+    def _capture_initial_state(state: dict[str, object], _registry: dict[str, object]) -> dict[str, object]:
+        captured_react_state["observations"] = list(state.get("observations") or [])
+        captured_react_state["tool_observations"] = list(state.get("tool_observations") or [])
+        return {
+            "current_goal": "contextual_qa",
+            "thought_summary": "Initial observations were available before planning.",
+            "confidence": 0.99,
+            "action_type": "direct_answer",
+            "response_text": "Context was available before planning.",
+            "tool_input": {},
+        }
+
+    try:
+        react_controller._think_next_step = _capture_initial_state
+        react_result = react_controller.run_react_agent_request(
+            session_id="session-runtime-live-state",
+            conversation_id="conversation-runtime-live-state",
+            message="Use the active communication thread.",
+            safe_message="Use the active communication thread.",
+            display_message="Use the active communication thread.",
+            router_intent="enterprise_fact",
+            required_grounding="tool",
+            recommended_tool="enterprise_rag_query",
+            actor_context=actor,
+            initial_observations=[react_initial_observation],
+        )
+    finally:
+        react_controller._think_next_step = original_think_next_step
+
+    react_initial_state_ok = (
+        captured_react_state.get("observations", [{}])[0].get("observation_type") == "active_communication_thread"
+        and captured_react_state.get("tool_observations", [{}])[0].get("observation_type") == "active_communication_thread"
+        and (react_result.get("tool_observations") or [{}])[0].get("observation_type") == "active_communication_thread"
+    )
     metrics_text = render_metrics().decode("utf-8", errors="ignore")
 
     result = {
         "ok": not missing_keys
         and context_contract_ok
+        and react_initial_state_ok
         and memory_verdict.get("needs_rewrite")
         and confirmation_verdict.get("needs_rewrite")
         and not trace_evaluation.get("ok")
@@ -143,6 +193,7 @@ def main() -> None:
         "checks": {
             "typed_observation_contract": not missing_keys,
             "agent_chat_context_observation_contract": context_contract_ok,
+            "react_initial_observations_live_before_planning": react_initial_state_ok,
             "memory_boundary_guard": memory_verdict.get("needs_rewrite"),
             "confirmation_guard": confirmation_verdict.get("needs_rewrite"),
             "trace_evaluator_flags_bad_trace": not trace_evaluation.get("ok"),
@@ -155,6 +206,9 @@ def main() -> None:
         "trace_evaluation": trace_evaluation,
         "failure_observation": failure_observation,
         "context_observation_types": [item.get("observation_type") for item in context_observations],
+        "react_captured_initial_types": [
+            item.get("observation_type") for item in captured_react_state.get("observations", [])
+        ],
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:

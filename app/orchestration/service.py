@@ -13,6 +13,31 @@ from app.resilience import make_failure_observation
 logger = logging.getLogger(__name__)
 
 
+def _observation_identity(item: dict[str, Any]) -> tuple[str, str, str]:
+    payload = dict(item.get("payload") or {})
+    return (
+        str(item.get("observation_type") or ""),
+        str(payload.get("thread_id") or ""),
+        str(payload.get("brief_id") or ""),
+    )
+
+
+def _prepend_unique_observations(
+    existing: list[Any],
+    additions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    existing_items = [dict(item) for item in existing if isinstance(item, dict)]
+    seen = {_observation_identity(item) for item in existing_items}
+    prefix: list[dict[str, Any]] = []
+    for item in additions:
+        identity = _observation_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        prefix.append(item)
+    return [*prefix, *existing_items]
+
+
 def _prepend_initial_observations(
     result: dict[str, Any],
     initial_observations: list[dict[str, Any]] | None,
@@ -22,10 +47,10 @@ def _prepend_initial_observations(
         return result
     payload = dict(result or {})
     existing = list(payload.get("tool_observations") or payload.get("observations") or [])
-    payload["tool_observations"] = [*observations, *existing]
+    payload["tool_observations"] = _prepend_unique_observations(existing, observations)
     task_plan = dict(payload.get("task_plan") or {})
     task_plan_observations = list(task_plan.get("tool_observations") or [])
-    task_plan["tool_observations"] = [*observations, *task_plan_observations]
+    task_plan["tool_observations"] = _prepend_unique_observations(task_plan_observations, observations)
     task_plan["agent_chat_context"] = {
         "observation_types": [str(item.get("observation_type") or "") for item in observations],
     }
@@ -82,6 +107,7 @@ def orchestrate_agent_request(
             router_reason=router_reason,
             degraded_from=degraded_from,
             actor_context=actor_context,
+            initial_observations=context_observations,
         )
         return _prepend_initial_observations(result, context_observations)
     except Exception as exc:

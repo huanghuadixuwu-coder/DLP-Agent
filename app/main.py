@@ -33,6 +33,7 @@ from app.communication.thread_store import (
 )
 from app.config import get_settings
 from app.continuation_state import (
+    ContinuationDecision,
     PendingObject,
     pending_object_from_confirmation,
     pending_object_from_mail_clarification,
@@ -6892,6 +6893,7 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             **dict(upload_context or {}),
             "agent_chat_context": dict(agent_chat_context_snapshot),
         }
+    explicit_global_mode = bool(agent_chat_context_snapshot.get("global_mode"))
     if recalled_upload and upload_context.get("filename"):
         display_message = _build_display_message(
             payload.message,
@@ -6903,7 +6905,11 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
         conversation_id=conversation_id,
         actor_context=actor_context,
     )
-    if completed_meeting_task and _looks_like_meeting_result_followup(payload.message):
+    if (
+        not explicit_global_mode
+        and completed_meeting_task
+        and _looks_like_meeting_result_followup(payload.message)
+    ):
         return finalize(_build_meeting_result_response(
             session_id=payload.session_id,
             conversation_id=conversation_id,
@@ -6912,7 +6918,11 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             task=completed_meeting_task,
             actor_context=actor_context,
         ))
-    if completed_meeting_task and _looks_like_meeting_invitation_continuation(payload.message):
+    if (
+        not explicit_global_mode
+        and completed_meeting_task
+        and _looks_like_meeting_invitation_continuation(payload.message)
+    ):
         recipient = _extract_email_from_message(payload.message)
         meeting_mail_plan = _mail_plan_from_meeting_task(
             task=completed_meeting_task,
@@ -6964,26 +6974,40 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
             candidates=[],
             actor_context=actor_context,
         ))
-    latest_confirmation = _get_latest_pending_confirmation(conversation_id, actor_context)
-    pending_object = pending_object_from_confirmation(latest_confirmation)
-    latest_source_clarification = _get_latest_pending_source_clarification(conversation_id, actor_context)
-    source_pending_object = pending_object_from_source_clarification(
-        dict(latest_source_clarification.get("payload") or {})
-    )
-    latest_field_clarification = _get_latest_pending_mail_field_clarification(conversation_id, actor_context)
-    field_pending_object = pending_object_from_mail_clarification(
-        dict(latest_field_clarification.get("payload") or {})
-    )
-    registry_objects = _active_registry_objects(conversation_id, actor_context)
-    pending_objects_by_key = {
-        (item.object_type, item.object_id): item
-        for item in registry_objects
-    }
-    for item in (pending_object, source_pending_object, field_pending_object):
-        if item is not None:
-            pending_objects_by_key[(item.object_type, item.object_id)] = item
-    pending_objects = list(pending_objects_by_key.values())
-    continuation_decision = resolve_continuation(payload.message, pending_objects)
+    if explicit_global_mode:
+        latest_confirmation: dict[str, Any] = {}
+        pending_object = None
+        latest_source_clarification: dict[str, Any] = {}
+        source_pending_object = None
+        latest_field_clarification: dict[str, Any] = {}
+        field_pending_object = None
+        pending_objects: list[PendingObject] = []
+        continuation_decision = ContinuationDecision(
+            mode="new_task",
+            reason="Explicit global_mode bypassed pending-object continuation.",
+            source="agent_chat_context_resolver",
+        )
+    else:
+        latest_confirmation = _get_latest_pending_confirmation(conversation_id, actor_context)
+        pending_object = pending_object_from_confirmation(latest_confirmation)
+        latest_source_clarification = _get_latest_pending_source_clarification(conversation_id, actor_context)
+        source_pending_object = pending_object_from_source_clarification(
+            dict(latest_source_clarification.get("payload") or {})
+        )
+        latest_field_clarification = _get_latest_pending_mail_field_clarification(conversation_id, actor_context)
+        field_pending_object = pending_object_from_mail_clarification(
+            dict(latest_field_clarification.get("payload") or {})
+        )
+        registry_objects = _active_registry_objects(conversation_id, actor_context)
+        pending_objects_by_key = {
+            (item.object_type, item.object_id): item
+            for item in registry_objects
+        }
+        for item in (pending_object, source_pending_object, field_pending_object):
+            if item is not None:
+                pending_objects_by_key[(item.object_type, item.object_id)] = item
+        pending_objects = list(pending_objects_by_key.values())
+        continuation_decision = resolve_continuation(payload.message, pending_objects)
     continuation_state_snapshot.update(
         {
             "decision": continuation_decision.to_dict(),
@@ -7224,7 +7248,11 @@ def agent_chat(payload: UnifiedAgentRequest, request: Request) -> UnifiedAgentRe
     if _agent_chat_requests_inbound_mail_access(payload.message, multi_agent_plan=multi_agent_dag_plan):
         actor_context = _ensure_agent_chat_inbound_mail_access(request, actor, actor_context)
     recoverable_task = get_latest_recoverable_task(payload.session_id, conversation_id)
-    if multi_agent_dag_plan is None and _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id):
+    if (
+        not explicit_global_mode
+        and multi_agent_dag_plan is None
+        and _should_apply_recoverable_supplement(recoverable_task, payload, conversation_id)
+    ):
         supplemented = _supplement_dlp_task(
             recoverable_task,
             DlpTaskSupplementRequest(

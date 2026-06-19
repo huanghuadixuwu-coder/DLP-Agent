@@ -2220,6 +2220,26 @@ def run_contextual_chat() -> dict[str, Any]:
     )
     _assert_true(stored_brief, "contextual stored brief")
     create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    pending_confirmation_payload = {
+        "confirmation_id": f"pending-confirmation-{suffix}",
+        "mail_plan": {
+            "draft_id": f"draft-pending-{suffix}",
+            "mail_action_type": "send_reply",
+            "status": "pending_confirmation",
+            "request_message": "Send the stale pending draft.",
+            "resolved_recipients": ["customer@example.com"],
+            "resolved_subject": "Stale pending draft",
+            "resolved_body": "This stale draft must not hijack explicit global mode.",
+        },
+    }
+    original_persist_confirmation_for_seed = main_module._persist_confirmation_object
+    seeded_pending = original_persist_confirmation_for_seed(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        confirmation_payload=pending_confirmation_payload,
+        actor_context=actor_context,
+    )
+    _assert_true(seeded_pending, "seeded pending confirmation")
 
     request = SimpleNamespace(headers={})
     planner_calls: list[dict[str, Any]] = []
@@ -2339,12 +2359,25 @@ def run_contextual_chat() -> dict[str, Any]:
             UnifiedAgentRequest(
                 session_id=session_id,
                 conversation_id=conversation_id,
-                message="Globally, what is our general Enterprise positioning?",
+                message="confirm",
                 tenant_id=actor_context["tenant_id"],
                 user_id=actor_context["user_id"],
                 workspace_id=actor_context["workspace_id"],
                 roles=["admin"],
                 global_mode=True,
+            ),
+            request,
+        )
+        missing_thread_response = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message="Using the requested customer thread, answer the latest question.",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin"],
+                thread_id=f"missing-thread-{suffix}",
             ),
             request,
         )
@@ -2389,8 +2422,10 @@ def run_contextual_chat() -> dict[str, Any]:
     _assert_true("global_entry" in global_types, "global entry observation")
     _assert_true("active_communication_thread" not in global_types, "global mode does not bind active thread")
     global_planner_call = next(
-        item for item in planner_calls if str(item.get("message") or "").startswith("Globally,")
+        item for item in planner_calls if str(item.get("message") or "") == "confirm"
     )
+    _assert_equal(global_response.intent, "enterprise_fact", "global mode reaches generic planner")
+    _assert_equal(global_response.task_id, None, "global mode does not create stale pending task")
     _assert_equal(
         dict(global_planner_call.get("upload_context") or {}).get("agent_chat_context", {}).get("global_mode"),
         True,
@@ -2401,6 +2436,22 @@ def run_contextual_chat() -> dict[str, Any]:
         "",
         "planner global mode thread id",
     )
+    missing_thread_observations = list(missing_thread_response.tool_observations or [])
+    missing_thread_types = [str(item.get("observation_type") or "") for item in missing_thread_observations]
+    _assert_true("active_object_resolution_failed" in missing_thread_types, "missing thread resolution failure observation")
+    failed_observation = next(
+        item for item in missing_thread_observations if item.get("observation_type") == "active_object_resolution_failed"
+    )
+    _assert_equal(
+        dict(failed_observation.get("payload") or {}).get("requested_thread_id"),
+        f"missing-thread-{suffix}",
+        "missing thread requested id",
+    )
+    _assert_equal(
+        dict(failed_observation.get("payload") or {}).get("reason"),
+        "requested_thread_not_found",
+        "missing thread failure reason",
+    )
 
     return {
         "ok": True,
@@ -2410,6 +2461,7 @@ def run_contextual_chat() -> dict[str, Any]:
         "contextual_observation_types": contextual_types,
         "draft_observation_types": draft_types,
         "global_observation_types": global_types,
+        "missing_thread_observation_types": missing_thread_types,
     }
 
 
