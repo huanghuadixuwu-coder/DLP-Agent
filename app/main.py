@@ -90,6 +90,7 @@ from app.mail.draft_store import (
     build_persisted_confirmation_payload,
     cancel_mail_draft,
     get_latest_active_mail_draft,
+    get_latest_active_mail_draft_for_thread,
     init_mail_draft_store,
     upsert_mail_draft,
 )
@@ -1165,12 +1166,17 @@ def _workspace_task_progress(
         workspace_id=None if actor.is_local_dev else actor.workspace_id,
     )
     selected: list[dict[str, Any]] = []
+    has_selected_scope = bool(thread_id or brief_id or draft_id)
     for task in tasks:
         payload = dict(task.get("domain_payload") or {})
         matches_thread = bool(thread_id) and str(payload.get("thread_id") or "") == thread_id
         matches_brief = bool(brief_id) and str(payload.get("brief_id") or "") == brief_id
         matches_draft = bool(draft_id) and str(task.get("mail_draft_id") or "") == draft_id
-        matches_conversation = bool(conversation_id) and str(task.get("conversation_id") or "") == conversation_id
+        matches_conversation = (
+            not has_selected_scope
+            and bool(conversation_id)
+            and str(task.get("conversation_id") or "") == conversation_id
+        )
         if matches_thread or matches_brief or matches_draft or matches_conversation:
             selected.append(_task_progress_payload(task))
     return selected[:20]
@@ -6700,7 +6706,16 @@ def internal_communication_workspace_api(
     )
     brief_payload = dict(latest_brief.get("brief") or {})
     brief_id = str(brief_payload.get("brief_id") or "")
-    draft = get_latest_active_mail_draft(conversation_id, actor_context=actor_context) if conversation_id else None
+    draft = (
+        get_latest_active_mail_draft_for_thread(
+            conversation_id,
+            actor_context=actor_context,
+            thread_id=selected_thread_id,
+            brief_id=brief_id,
+        )
+        if conversation_id
+        else None
+    )
     draft_preview = _mail_draft_preview_payload(draft)
     task_progress = _workspace_task_progress(
         actor=actor,

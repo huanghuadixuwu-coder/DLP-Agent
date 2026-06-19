@@ -2467,11 +2467,13 @@ def run_contextual_chat() -> dict[str, Any]:
 
 def run_workspace_thread_inbox() -> dict[str, Any]:
     from fastapi.testclient import TestClient
+    import psycopg
 
     import app.main as main_module
     from app.communication.brief_store import upsert_communication_brief
     from app.communication.thread_store import set_active_communication_thread
     from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.config import get_settings
     from app.mail.draft_store import upsert_mail_draft
     from app.task_store import create_dlp_task
 
@@ -2573,6 +2575,99 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         workspace_id=actor_context["workspace_id"],
     )
     _assert_true(created_task, "workspace task progress")
+    other_thread_id = f"thread-workspace-other-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-workspace-other-1-{suffix}",
+        uid=f"uid-workspace-other-1-{suffix}",
+        thread_id=other_thread_id,
+        provider_thread_id=f"provider-{other_thread_id}",
+        sender="other-customer@example.com",
+        recipients="rep@example.com",
+        subject="Other thread in same conversation",
+        received_at="2026-06-18T10:05:00+00:00",
+        summary="Other customer thread must not contaminate the selected workspace.",
+        risk_hint="low",
+    )
+    other_thread_ref = CommunicationThreadRef(
+        thread_id=other_thread_id,
+        source="mail",
+        subject="Other thread in same conversation",
+        participants=["other-customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-18T10:05:00+00:00",
+        status="open",
+        latest_summary="Other customer thread must not contaminate the selected workspace.",
+        risk_hint="low",
+        actor_context=actor_context,
+    )
+    other_brief = CommunicationBrief(
+        brief_id=f"brief-workspace-other-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=other_thread_ref,
+        employee_goal="Prepare an unrelated reply.",
+        customer_context_summary="This brief belongs to the other thread.",
+        recommended_next_action="draft_reply",
+        source_observation_ids=["obs-workspace-other"],
+        confidence=0.75,
+        actor_context=actor_context,
+    )
+    upsert_communication_brief(
+        other_brief,
+        actor_context=actor_context,
+        refresh_reason="workspace_thread_inbox_contamination_regression",
+    )
+    other_draft = upsert_mail_draft(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        mail_plan={
+            "draft_id": f"draft-workspace-other-{suffix}",
+            "mail_action_type": "send_reply",
+            "status": "draft_ready",
+            "resolved_recipients": ["other-customer@example.com"],
+            "resolved_subject": "Re: Other thread in same conversation",
+            "resolved_body": "This other draft must not appear for the selected thread.",
+            "thread_ref": other_thread_ref.to_dict(),
+            "source_brief_id": other_brief.brief_id,
+        },
+        actor_context=actor_context,
+        status="draft_ready",
+    )
+    _assert_true(other_draft, "other workspace draft")
+    with psycopg.connect(get_settings().postgres_dsn) as conn:
+        conn.execute(
+            """
+            UPDATE mail_drafts
+            SET status = 'draft_ready', updated_at = %s
+            WHERE draft_id = %s
+            """,
+            ("2026-06-18T10:06:00+00:00", stored_draft["draft_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE mail_drafts
+            SET status = 'draft_ready', updated_at = %s
+            WHERE draft_id = %s
+            """,
+            ("2026-06-18T10:07:00+00:00", other_draft["draft_id"]),
+        )
+        conn.commit()
+    other_task = create_dlp_task(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message_raw="This other draft must not appear for the selected thread.",
+        request_message="Send the other thread reply.",
+        delivery_subject="Re: Other thread in same conversation",
+        delivery_body="This other draft must not appear for the selected thread.",
+        destination_email="other-customer@example.com",
+        status="pending_approval",
+        domain_action="mail_send",
+        domain_payload={"thread_id": other_thread_id, "brief_id": other_brief.brief_id},
+        mail_draft_id=str(other_draft["draft_id"]),
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+    )
+    _assert_true(other_task, "other workspace task")
 
     client = TestClient(main_module.app)
     response = client.get(
@@ -2620,8 +2715,13 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
         stored_draft["draft_id"],
         "workspace draft preview state",
     )
+    _assert_true(
+        (workspace.get("draft_preview") or {}).get("draft_id") != other_draft["draft_id"],
+        "workspace excludes other thread draft preview",
+    )
     task_ids = [item.get("task_id") for item in workspace.get("task_progress") or []]
     _assert_true(created_task["task_id"] in task_ids, "workspace task progress state")
+    _assert_true(other_task["task_id"] not in task_ids, "workspace excludes other thread task progress")
     _assert_equal(
         (workspace.get("governance_boundary") or {}).get("high_risk_approval_surface"),
         "8512_governance_console",

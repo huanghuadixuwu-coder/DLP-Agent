@@ -228,6 +228,54 @@ def get_latest_active_mail_draft(
     return _decode_row(row)
 
 
+def get_latest_active_mail_draft_for_thread(
+    conversation_id: str,
+    *,
+    actor_context: dict[str, Any] | None = None,
+    thread_id: str = "",
+    brief_id: str = "",
+    pending_confirmation_only: bool = False,
+) -> dict[str, Any] | None:
+    selected_thread_id = str(thread_id or "").strip()
+    selected_brief_id = str(brief_id or "").strip()
+    if not selected_thread_id and not selected_brief_id:
+        return get_latest_active_mail_draft(
+            conversation_id,
+            actor_context=actor_context,
+            pending_confirmation_only=pending_confirmation_only,
+        )
+
+    init_mail_draft_store()
+    actor = actor_from_mapping(actor_context or {}, conversation_id=conversation_id)
+    statuses = ["pending_confirmation", "queued_dlp"] if pending_confirmation_only else sorted(ACTIVE_DRAFT_STATUSES)
+    placeholders = ", ".join(["%s"] * len(statuses))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM mail_drafts
+            WHERE tenant_id = %s
+              AND workspace_id = %s
+              AND user_id = %s
+              AND conversation_id = %s
+              AND status IN ({placeholders})
+            ORDER BY updated_at DESC
+            """,
+            [actor.tenant_id, actor.workspace_id, actor.user_id, conversation_id, *statuses],
+        ).fetchall()
+    for row in rows:
+        draft = _decode_row(row) or {}
+        plan = dict(draft.get("mail_plan") or {})
+        plan_thread_ref = dict(plan.get("thread_ref") or {})
+        plan_thread_id = str(plan_thread_ref.get("thread_id") or plan.get("thread_id") or "").strip()
+        plan_brief_id = str(plan.get("source_brief_id") or plan.get("brief_id") or "").strip()
+        if selected_brief_id and plan_brief_id == selected_brief_id:
+            return draft
+        if selected_thread_id and plan_thread_id == selected_thread_id:
+            return draft
+    return None
+
+
 def bind_mail_draft_task(
     draft_id: str,
     *,
