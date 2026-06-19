@@ -46,6 +46,11 @@ def assert_ui_contract() -> None:
     v2_block = user_workspace[v2_start:v2_end]
     assert_true("def render_realtime_task_panel(" not in user_workspace, "8511 must not retain the legacy realtime task panel")
     assert_true("def render_legacy_task_inspector" not in user_workspace, "8511 must not retain the legacy debug inspector")
+    assert_true("sender_review_required" in v2_block, "8511 task panel must expose sender safety review state")
+    assert_true("sender-safety-confirm" in v2_block, "8511 task panel must allow sender safety confirmation")
+    assert_true("data-action=\"sender-confirm\"" in v2_block, "8511 sender safety action must be explicit")
+    assert_true("/tasks/${encodeURIComponent(taskId)}/approve" not in v2_block, "8511 must not call high-risk approval endpoint")
+    assert_true("/tasks/${encodeURIComponent(taskId)}/reject" not in v2_block, "8511 must not call high-risk rejection endpoint")
     assert_true("治理台审核" in v2_block, "8511 task panel must show waiting-for-governance-review")
     assert_true("批准并真实发送" not in v2_block, "8511 v2 task panel must not expose high-risk approve button")
     assert_true("驳回并终止" not in v2_block, "8511 v2 task panel must not expose high-risk reject button")

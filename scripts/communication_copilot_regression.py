@@ -4134,6 +4134,380 @@ def run_thread_meeting_escalation() -> dict[str, Any]:
     }
 
 
+def run_thread_governance_recovery() -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    import app.main as main_module
+    import app.task_worker as task_worker
+    from fastapi.testclient import TestClient
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread, upsert_thread_projection
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.models import DlpTaskCreateRequest, UnifiedAgentRequest
+    from app.task_store import create_dlp_task, get_dlp_task, get_task_events, update_task
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-thread-governance-{suffix}"
+    conversation_id = f"conversation-thread-governance-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-thread-governance-{suffix}",
+        "user_id": f"user-thread-governance-{suffix}",
+        "workspace_id": "workspace-thread-governance",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    actor_headers = {
+        "X-Tenant-Id": actor_context["tenant_id"],
+        "X-User-Id": actor_context["user_id"],
+        "X-Workspace-Id": actor_context["workspace_id"],
+        "X-Roles": "admin,mail_sender,user,viewer",
+    }
+    thread_id = f"thread-governance-{suffix}"
+    brief_id = f"brief-governance-{suffix}"
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Governance recovery customer thread",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-17T12:00:00+00:00",
+        latest_summary="Customer asked for a renewal follow-up that includes a contact phone number.",
+        risk_hint="medium",
+        actor_context=actor_context,
+    )
+    upsert_thread_projection(thread_ref, actor_context=actor_context)
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-thread-governance-{suffix}",
+        uid=f"uid-thread-governance-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Governance recovery customer thread",
+        received_at="2026-06-17T12:00:00+00:00",
+        summary="Customer asked for a renewal follow-up that includes a contact phone number.",
+        risk_hint="medium",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "thread governance active thread")
+    brief = CommunicationBrief(
+        brief_id=brief_id,
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Draft and safely send a renewal follow-up.",
+        customer_context_summary="Customer wants renewal follow-up and contact details.",
+        grounding_refs=[{"doc_id": "renewal-governance", "title": "Renewal contact policy"}],
+        must_include=["renewal timing"],
+        must_avoid=["unsupported discount"],
+        recommended_next_action="draft_reply",
+        source_observation_ids=["obs-thread-governance"],
+        confidence=0.86,
+        actor_context=actor_context,
+    )
+    _assert_true(
+        upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="thread_governance_recovery_seed"),
+        "thread governance stored brief",
+    )
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+
+    def _mail_plan(label: str, body: str) -> dict[str, Any]:
+        return {
+            "draft_id": f"draft-{label}-{suffix}",
+            "idempotency_key": f"idempotency-{label}-{suffix}",
+            "mail_action_type": "send_reply",
+            "status": "pending_confirmation",
+            "requires_confirmation": True,
+            "request_message": "Send the active thread reply after sender confirmation.",
+            "resolved_recipients": ["customer@example.com"],
+            "resolved_subject": f"Re: Governance recovery {label}",
+            "resolved_body": body,
+            "review_content": body,
+            "thread_ref": thread_ref.to_dict(),
+            "source_brief_id": brief_id,
+            "brief_id": brief_id,
+            "communication_role": "thread_reply",
+            "communication_closeout_owner": "mail_agent",
+            "body_constraints": {"send_requires_dlp": True},
+        }
+
+    def _domain_payload(label: str) -> dict[str, Any]:
+        return main_module._mail_plan_domain_payload(_mail_plan(label, "Thread-governed recovery body."))
+
+    def _assert_task_provenance(task: dict[str, Any], label: str) -> None:
+        domain_payload = dict(task.get("domain_payload") or {})
+        context = dict(domain_payload.get("communication_context") or {})
+        _assert_equal(domain_payload.get("thread_id"), thread_id, f"{label} task thread id")
+        _assert_equal(domain_payload.get("brief_id"), brief_id, f"{label} task brief id")
+        _assert_equal(context.get("thread_id"), thread_id, f"{label} communication context thread")
+        _assert_equal(context.get("brief_id"), brief_id, f"{label} communication context brief")
+
+    def _assert_audit_provenance(task_id: str, label: str) -> None:
+        events = get_task_events(task_id)
+        if not any(
+            dict(event.get("details_json") or {}).get("thread_id") == thread_id
+            and dict(event.get("details_json") or {}).get("brief_id") == brief_id
+            for event in events
+        ):
+            raise AssertionError(f"{label} audit events do not reference thread/brief: {events}")
+
+    def _assert_observation_provenance(observation: dict[str, Any], label: str) -> dict[str, Any]:
+        _assert_true(observation, f"{label} observation")
+        payload = dict(observation.get("payload") or {})
+        provenance = dict(observation.get("provenance") or {})
+        actor = dict(observation.get("actor_context") or {})
+        _assert_equal(payload.get("thread_id"), thread_id, f"{label} recovery payload thread")
+        _assert_equal(payload.get("brief_id"), brief_id, f"{label} recovery payload brief")
+        _assert_equal(provenance.get("thread_id"), thread_id, f"{label} recovery provenance thread")
+        _assert_equal(provenance.get("brief_id"), brief_id, f"{label} recovery provenance brief")
+        _assert_equal(actor.get("thread_id"), thread_id, f"{label} recovery actor thread")
+        _assert_equal(actor.get("brief_id"), brief_id, f"{label} recovery actor brief")
+        return observation
+
+    def _assert_sender_safety_provenance(task: dict[str, Any], label: str) -> dict[str, Any]:
+        observation = dict(dict(task.get("domain_result") or {}).get("sender_safety_observation") or {})
+        _assert_equal(observation.get("observation_type"), "sender_safety_confirmation", f"{label} observation type")
+        _assert_observation_provenance(observation, label)
+        _assert_audit_provenance(str(task["task_id"]), label)
+        return observation
+
+    def _assert_recovery_provenance(task: dict[str, Any], label: str) -> dict[str, Any]:
+        recovery = dict(dict(task.get("domain_result") or {}).get("recovery_observation") or {})
+        _assert_observation_provenance(recovery, label)
+        _assert_audit_provenance(str(task["task_id"]), label)
+        return recovery
+
+    enqueued_dlp: list[str] = []
+    enqueued_email: list[str] = []
+    original_enqueue_dlp = main_module.enqueue_dlp_risk_task
+    original_main_enqueue_email = main_module.enqueue_email_send_task
+    original_worker_enqueue_email = task_worker.enqueue_email_send_task
+    main_module.enqueue_dlp_risk_task = lambda task_id: enqueued_dlp.append(str(task_id)) or str(task_id)
+    main_module.enqueue_email_send_task = lambda task_id: enqueued_email.append(str(task_id)) or str(task_id)
+    task_worker.enqueue_email_send_task = lambda task_id: str(task_id)
+    try:
+        confirmation_payload = {
+            "confirmation_id": f"confirmation-thread-governance-{suffix}",
+            "mail_plan": _mail_plan(
+                "medium",
+                "Renewal timing is ready. Customer phone 13800000000 should be confirmed before sharing.",
+            ),
+        }
+        pending = main_module._persist_confirmation_object(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            confirmation_payload=confirmation_payload,
+            actor_context=actor_context,
+        )
+        _assert_true(pending, "thread governance pending confirmation")
+        confirmation = main_module.agent_chat(
+            UnifiedAgentRequest(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message="confirm",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin", "mail_sender"],
+            ),
+            SimpleNamespace(headers={}),
+        )
+        medium_task_id = str(confirmation.task_id or "")
+        _assert_true(medium_task_id, "sender confirmation created task")
+        _assert_equal(enqueued_dlp, [medium_task_id], "sender confirmation enqueued DLP once")
+        medium_task = get_dlp_task(medium_task_id) or {}
+        _assert_task_provenance(medium_task, "medium confirmation")
+        update_task(medium_task_id, fault_injection={"force_rule_only_mode": True})
+        medium_result = task_worker.process_dlp_outbound_task.run(medium_task_id)
+        _assert_equal(medium_result.get("status"), "sender_review_required", "medium DLP status")
+        medium_task = get_dlp_task(medium_task_id) or {}
+        _assert_equal(medium_task.get("risk_level"), "medium", "medium DLP risk")
+        _assert_equal(medium_task.get("approval_required"), False, "medium does not require governance approval")
+        _assert_sender_safety_provenance(medium_task, "medium sender safety")
+        client = TestClient(main_module.app)
+        cross_tenant_confirm = client.post(
+            f"/tasks/{medium_task_id}/sender-safety-confirm",
+            json={
+                "actor": "thread_governance_regression_sender",
+                "tenant_id": f"other-tenant-{suffix}",
+                "user_id": actor_context["user_id"],
+                "workspace_id": actor_context["workspace_id"],
+                "roles": ["admin", "mail_sender"],
+            },
+        )
+        _assert_equal(cross_tenant_confirm.status_code, 403, "cross-tenant sender safety confirmation forbidden")
+        _assert_equal(enqueued_email, [], "cross-tenant sender confirmation did not enqueue email")
+        sender_confirmed = client.post(
+            f"/tasks/{medium_task_id}/sender-safety-confirm",
+            json={
+                "actor": "thread_governance_regression_sender",
+                "tenant_id": actor_context["tenant_id"],
+                "user_id": actor_context["user_id"],
+                "workspace_id": actor_context["workspace_id"],
+                "roles": ["admin", "mail_sender"],
+            },
+        )
+        _assert_equal(sender_confirmed.status_code, 200, "sender safety confirmation status code")
+        medium_task = get_dlp_task(medium_task_id) or {}
+        _assert_equal(medium_task.get("status"), "queued_for_send", "medium sender confirmed status")
+        _assert_equal(medium_task.get("delivery_status"), "queued_for_send", "medium sender confirmed delivery")
+        _assert_equal(enqueued_email, [medium_task_id], "medium sender confirmation enqueued email once")
+        _assert_audit_provenance(medium_task_id, "medium sender confirmed")
+
+        high_task = create_dlp_task(
+            session_id=session_id,
+            conversation_id=f"{conversation_id}-high",
+            message_raw="Send API_KEY=sk-prod-thread-secret to customer@example.com.",
+            request_message="Send high-risk active-thread content.",
+            delivery_subject="Sensitive recovery check",
+            delivery_body="API_KEY=sk-prod-thread-secret",
+            destination_email="customer@example.com",
+            requested_action="send_reply",
+            status="queued",
+            fault_injection={"force_rule_only_mode": True},
+            domain_payload=_domain_payload("high"),
+            tenant_id=actor_context["tenant_id"],
+            user_id=actor_context["user_id"],
+            workspace_id=actor_context["workspace_id"],
+        )
+        high_result = task_worker.process_dlp_outbound_task.run(str(high_task["task_id"]))
+        _assert_equal(high_result.get("status"), "pending_approval", "high risk status")
+        high_task = get_dlp_task(str(high_task["task_id"])) or {}
+        _assert_equal(high_task.get("risk_level"), "high", "high risk level")
+        _assert_recovery_provenance(high_task, "high governance")
+        high_sender_confirm = client.post(
+            f"/tasks/{high_task['task_id']}/sender-safety-confirm",
+            json={
+                "actor": "thread_governance_regression_sender",
+                "tenant_id": actor_context["tenant_id"],
+                "user_id": actor_context["user_id"],
+                "workspace_id": actor_context["workspace_id"],
+                "roles": ["admin", "mail_sender"],
+            },
+        )
+        _assert_equal(high_sender_confirm.status_code, 409, "high-risk sender confirmation rejected")
+        _assert_equal(
+            dict(high_sender_confirm.json().get("detail") or {}).get("error"),
+            "sender_safety_confirmation_not_available",
+            "high-risk sender confirmation structured error",
+        )
+
+        provider_task = create_dlp_task(
+            session_id=session_id,
+            conversation_id=f"{conversation_id}-provider",
+            message_raw="Thread provider failure recovery check.",
+            request_message="Send provider failure check.",
+            delivery_subject="Provider failure recovery",
+            delivery_body="Provider failure recovery body.",
+            destination_email="customer@example.com",
+            requested_action="send_reply",
+            status="queued_for_send",
+            domain_payload=_domain_payload("provider"),
+            tenant_id=actor_context["tenant_id"],
+            user_id=actor_context["user_id"],
+            workspace_id=actor_context["workspace_id"],
+        )
+        original_call_mcp_tool = task_worker.call_mcp_tool
+        task_worker.call_mcp_tool = lambda *_args, **_kwargs: {
+            "ok": False,
+            "result": {"ok": False, "error": "550 mailbox unavailable", "provider": "smtp"},
+        }
+        try:
+            provider_result = task_worker.send_dlp_email_task.run(str(provider_task["task_id"]))
+        finally:
+            task_worker.call_mcp_tool = original_call_mcp_tool
+        _assert_equal(provider_result.get("status"), "send_failed", "provider failure status")
+        provider_task = get_dlp_task(str(provider_task["task_id"])) or {}
+        _assert_equal(provider_task.get("status"), "dead_letter", "provider failure dead letter")
+        _assert_recovery_provenance(provider_task, "provider failure")
+        dlq_entry = dict(dict(provider_task.get("domain_result") or {}).get("dlq_entry") or {})
+        dlq_snapshot = dict(dlq_entry.get("payload_snapshot") or {})
+        _assert_equal(dlq_snapshot.get("thread_id"), thread_id, "provider DLQ thread")
+        _assert_equal(dlq_snapshot.get("brief_id"), brief_id, "provider DLQ brief")
+        sender_progress = client.get(
+            "/tasks/sender-progress",
+            params={"session_id": session_id},
+            headers=actor_headers,
+        )
+        _assert_equal(sender_progress.status_code, 200, "sender progress list status")
+        progress_items = list(sender_progress.json() or [])
+        provider_progress = next(
+            item for item in progress_items if item.get("task_id") == provider_task["task_id"]
+        )
+        progress_text = json.dumps(provider_progress, ensure_ascii=False)
+        _assert_true("domain_result" not in provider_progress, "sender progress omits domain_result")
+        _assert_true("recovery_observation" not in progress_text, "sender progress omits recovery detail")
+        _assert_true("dlq_entry" not in progress_text and "payload_snapshot" not in progress_text, "sender progress omits DLQ detail")
+        sender_progress_detail = client.get(
+            f"/tasks/{provider_task['task_id']}/sender-progress",
+            headers=actor_headers,
+        )
+        _assert_equal(sender_progress_detail.status_code, 200, "sender progress detail status")
+        detail_payload = dict(sender_progress_detail.json() or {})
+        detail_text = json.dumps(detail_payload, ensure_ascii=False)
+        _assert_true("domain_result" not in detail_payload, "sender progress detail omits domain_result")
+        _assert_true("recovery_observation" not in detail_text, "sender progress detail omits recovery detail")
+        _assert_true("dlq_entry" not in detail_text and "payload_snapshot" not in detail_text, "sender progress detail omits DLQ detail")
+
+        smtp_task = create_dlp_task(
+            session_id=session_id,
+            conversation_id=f"{conversation_id}-smtp",
+            message_raw="Thread SMTP failure recovery check.",
+            request_message="Send SMTP failure check.",
+            delivery_subject="SMTP failure recovery",
+            delivery_body="SMTP failure recovery body.",
+            destination_email="customer@example.com",
+            requested_action="send_reply",
+            status="queued_for_send",
+            fault_injection={"force_smtp_fail": True},
+            domain_payload=_domain_payload("smtp"),
+            tenant_id=actor_context["tenant_id"],
+            user_id=actor_context["user_id"],
+            workspace_id=actor_context["workspace_id"],
+        )
+        smtp_result = task_worker.send_dlp_email_task.run(str(smtp_task["task_id"]))
+        _assert_equal(smtp_result.get("status"), "send_failed", "SMTP failure status")
+        smtp_task = get_dlp_task(str(smtp_task["task_id"])) or {}
+        _assert_recovery_provenance(smtp_task, "SMTP failure")
+
+        main_module.enqueue_dlp_risk_task = lambda task_id: (_ for _ in ()).throw(RuntimeError("Injected Celery broker unavailable."))
+        worker_unavailable = main_module._create_async_dlp_task(
+            DlpTaskCreateRequest(
+                session_id=session_id,
+                conversation_id=f"{conversation_id}-worker",
+                message="Send worker unavailable recovery check.",
+                request_message="Send worker unavailable recovery check.",
+                review_content="Worker unavailable recovery body.",
+                resolved_outbound_content="Worker unavailable recovery body.",
+                delivery_subject="Worker unavailable recovery",
+                delivery_body="Worker unavailable recovery body.",
+                destination_email="customer@example.com",
+                requested_action="send_reply",
+                tenant_id=actor_context["tenant_id"],
+                user_id=actor_context["user_id"],
+                workspace_id=actor_context["workspace_id"],
+                roles=["admin", "mail_sender"],
+                domain_payload=_domain_payload("worker"),
+            ),
+            actor_context=actor_context,
+        )
+        _assert_equal(worker_unavailable.get("status"), "failed", "worker unavailable status")
+        _assert_recovery_provenance(worker_unavailable, "worker unavailable")
+    finally:
+        main_module.enqueue_dlp_risk_task = original_enqueue_dlp
+        main_module.enqueue_email_send_task = original_main_enqueue_email
+        task_worker.enqueue_email_send_task = original_worker_enqueue_email
+
+    return {
+        "ok": True,
+        "case": "thread_governance_recovery",
+        "thread_id": thread_id,
+        "brief_id": brief_id,
+        "medium_task_id": medium_task_id,
+        "recovery_checks": ["medium_sender_safety", "high_governance", "provider_failure", "smtp_failure", "worker_unavailable"],
+    }
+
+
 def run_retirement() -> dict[str, Any]:
     retired_tokens = [
         "legacy_orchestration",
@@ -4262,6 +4636,7 @@ def main() -> int:
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,
         "thread_meeting_escalation": run_thread_meeting_escalation,
+        "thread_governance_recovery": run_thread_governance_recovery,
     }
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)

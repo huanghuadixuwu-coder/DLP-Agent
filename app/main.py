@@ -19,7 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from redis import Redis
 
-from app.actor_context import ActorContext, actor_from_mapping, build_actor_context, permission_observation, require_permission
+from app.actor_context import (
+    DEFAULT_TENANT_ID,
+    DEFAULT_USER_ID,
+    DEFAULT_WORKSPACE_ID,
+    ActorContext,
+    actor_from_mapping,
+    build_actor_context,
+    permission_observation,
+    require_permission,
+)
 from app.auth_store import create_login_code, init_auth_store, mask_email, resolve_session_token, revoke_session_token, verify_login_code
 from app.backpressure import check_rate_limit
 from app.communication.brief_service import assemble_communication_brief_observation
@@ -220,6 +229,8 @@ from app.task_store import (
     mark_mail_dlq_replay,
     replay_mail_dlq_entry,
     reject_task,
+    set_task_status,
+    task_communication_provenance,
     update_task,
 )
 from app.upload_analysis import build_upload_context, classify_upload_request, infer_upload_task_type, refers_to_recent_upload
@@ -379,6 +390,26 @@ def _refresh_queue_metrics() -> dict[str, Any]:
     return health
 
 
+def _with_task_communication_provenance(observation: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    provenance = task_communication_provenance(task)
+    if not provenance:
+        return observation
+    enriched = dict(observation or {})
+    payload = dict(enriched.get("payload") or {})
+    payload.update(provenance)
+    enriched["payload"] = payload
+    observation_provenance = dict(enriched.get("provenance") or {})
+    observation_provenance.update(provenance)
+    enriched["provenance"] = observation_provenance
+    actor_context = dict(enriched.get("actor_context") or {})
+    if provenance.get("thread_id"):
+        actor_context["thread_id"] = str(provenance["thread_id"])
+    if provenance.get("brief_id"):
+        actor_context["brief_id"] = str(provenance["brief_id"])
+    enriched["actor_context"] = actor_context
+    return enriched
+
+
 def _mark_task_enqueue_failed(
     task: dict[str, Any],
     *,
@@ -396,6 +427,7 @@ def _mark_task_enqueue_failed(
         actor_context=actor_context,
         severity="high",
     )
+    observation = _with_task_communication_provenance(observation, task)
     task_id = str(task.get("task_id") or "")
     updated = update_task(
         task_id,
@@ -417,7 +449,12 @@ def _mark_task_enqueue_failed(
         task_id,
         "enqueue_failed",
         "api",
-        {"message": "Task enqueue failed; returning recovery observation.", "error": error, "operation": operation},
+        {
+            "message": "Task enqueue failed; returning recovery observation.",
+            "error": error,
+            "operation": operation,
+            **task_communication_provenance(updated),
+        },
     )
     publish_task_event(
         build_task_event(
@@ -427,6 +464,9 @@ def _mark_task_enqueue_failed(
             message="Task enqueue failed; worker did not receive the job.",
             delivery_status="failed",
             delivery_error=error,
+            thread_id=str(task_communication_provenance(updated).get("thread_id") or ""),
+            brief_id=str(task_communication_provenance(updated).get("brief_id") or ""),
+            communication_context=dict(task_communication_provenance(updated).get("communication_context") or {}),
         )
     )
     return updated
@@ -1301,6 +1341,7 @@ def _mail_draft_preview_payload(draft: dict[str, Any] | None) -> dict[str, Any]:
 
 def _task_progress_payload(task: dict[str, Any]) -> dict[str, Any]:
     domain_payload = dict(task.get("domain_payload") or {})
+    communication_context = dict(domain_payload.get("communication_context") or {})
     return {
         "task_id": str(task.get("task_id") or ""),
         "conversation_id": str(task.get("conversation_id") or ""),
@@ -1312,8 +1353,82 @@ def _task_progress_payload(task: dict[str, Any]) -> dict[str, Any]:
         "mail_draft_id": str(task.get("mail_draft_id") or ""),
         "thread_id": str(domain_payload.get("thread_id") or ""),
         "brief_id": str(domain_payload.get("brief_id") or ""),
+        "communication_context": communication_context,
         "updated_at": str(task.get("updated_at") or ""),
     }
+
+
+def _local_dev_owned_task(task: dict[str, Any]) -> bool:
+    return (
+        str(task.get("tenant_id") or "") == DEFAULT_TENANT_ID
+        and str(task.get("user_id") or "") == DEFAULT_USER_ID
+        and str(task.get("workspace_id") or "") == DEFAULT_WORKSPACE_ID
+    )
+
+
+def _task_owned_by_actor(task: dict[str, Any], actor: ActorContext) -> bool:
+    if actor.is_local_dev:
+        return _local_dev_owned_task(task)
+    return (
+        str(task.get("tenant_id") or "") == actor.tenant_id
+        and str(task.get("workspace_id") or "") == actor.workspace_id
+        and str(task.get("user_id") or "") == actor.user_id
+    )
+
+
+def _ensure_sender_task_access(task: dict[str, Any], actor: ActorContext) -> None:
+    if not _task_owned_by_actor(task, actor):
+        raise HTTPException(status_code=403, detail={"error": "task_id does not belong to this actor context"})
+
+
+def _sanitize_task_event_for_sender(event: dict[str, Any]) -> dict[str, Any]:
+    details = dict(event.get("details_json") or {})
+    allowed_detail_keys = {
+        "message",
+        "status",
+        "thread_id",
+        "brief_id",
+        "communication_context",
+        "destination_email",
+        "missing_fields",
+        "risk_reasons",
+    }
+    return {
+        "event_id": str(event.get("event_id") or ""),
+        "task_id": str(event.get("task_id") or ""),
+        "event_type": str(event.get("event_type") or ""),
+        "actor": str(event.get("actor") or ""),
+        "details_json": {key: value for key, value in details.items() if key in allowed_detail_keys},
+        "created_at": str(event.get("created_at") or ""),
+    }
+
+
+def _sender_task_progress_payload(task: dict[str, Any]) -> dict[str, Any]:
+    progress = _task_progress_payload(task)
+    progress.update(
+        {
+            "source_filename": str(task.get("source_filename") or ""),
+            "message_redacted": str(task.get("message_redacted") or ""),
+            "message_raw": str(task.get("message_redacted") or task.get("message_raw") or ""),
+            "draft_summary": str(task.get("draft_summary") or ""),
+            "delivery_result": str(task.get("delivery_result") or ""),
+            "delivery_error": str(task.get("delivery_error") or ""),
+            "clarification_question": str(task.get("clarification_question") or ""),
+            "next_recommended_action": str(task.get("next_recommended_action") or ""),
+            "risk_reasons": list(task.get("risk_reasons") or []),
+            "domain_payload": {
+                "thread_id": progress.get("thread_id") or "",
+                "brief_id": progress.get("brief_id") or "",
+                "source_brief_id": str(dict(task.get("domain_payload") or {}).get("source_brief_id") or progress.get("brief_id") or ""),
+                "communication_context": progress.get("communication_context") or {},
+            },
+            "audit_events": [
+                _sanitize_task_event_for_sender(event)
+                for event in get_task_events(str(task.get("task_id") or ""))
+            ],
+        }
+    )
+    return progress
 
 
 def _workspace_task_progress(
@@ -1729,6 +1844,7 @@ def _build_mail_task_created_observation(
     actor_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "")
+    provenance = task_communication_provenance(task)
     summary = (
         f"已基于当前确认的邮件内容创建治理任务 `{task_id}`，系统正在执行 DLP 风险判断。"
         if task_id
@@ -1745,6 +1861,9 @@ def _build_mail_task_created_observation(
             "task_status": str(task.get("status") or ""),
             "risk_level": str(task.get("risk_level") or ""),
             "delivery_status": str(task.get("delivery_status") or ""),
+            "thread_id": str(provenance.get("thread_id") or ""),
+            "brief_id": str(provenance.get("brief_id") or ""),
+            "communication_context": dict(provenance.get("communication_context") or {}),
             "next_actions": ["wait_for_dlp", "check_task_progress", "revise_if_blocked"],
         },
         actor_context=actor_context,
@@ -2072,6 +2191,7 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[st
     if status == "queued":
         try:
             enqueue_dlp_risk_task(str(task["task_id"]))
+            provenance = task_communication_provenance(task)
             publish_task_event(
                 build_task_event(
                     task_id=str(task["task_id"]),
@@ -2079,6 +2199,9 @@ def _create_async_dlp_task(payload: DlpTaskCreateRequest, actor_context: dict[st
                     event_type="queued",
                     message="Task queued for asynchronous DLP processing.",
                     delivery_status=str(task.get("delivery_status", "not_sent")),
+                    thread_id=str(provenance.get("thread_id") or ""),
+                    brief_id=str(provenance.get("brief_id") or ""),
+                    communication_context=dict(provenance.get("communication_context") or {}),
                 )
             )
         except Exception as exc:
@@ -5811,10 +5934,22 @@ def _handle_async_outbound_agent_request(
 def _mail_plan_domain_payload(mail_plan: dict[str, Any]) -> dict[str, Any]:
     plan = dict(mail_plan or {})
     thread_ref = dict(plan.get("thread_ref") or {})
+    thread_id = str(thread_ref.get("thread_id") or plan.get("thread_id") or "")
+    brief_id = str(plan.get("source_brief_id") or plan.get("brief_id") or "")
+    communication_context = {
+        "thread_id": thread_id,
+        "brief_id": brief_id,
+        "thread_ref": thread_ref,
+        "communication_role": str(plan.get("communication_role") or plan.get("mail_action_type") or ""),
+        "communication_closeout_owner": str(plan.get("communication_closeout_owner") or "mail_agent"),
+        "communication_context_source": "mail_plan",
+    }
     payload = {
-        "thread_id": str(thread_ref.get("thread_id") or plan.get("thread_id") or ""),
-        "brief_id": str(plan.get("source_brief_id") or plan.get("brief_id") or ""),
+        "thread_id": thread_id,
+        "source_brief_id": brief_id,
+        "brief_id": brief_id,
         "draft_id": str(plan.get("draft_id") or ""),
+        "communication_context": {key: value for key, value in communication_context.items() if value},
         "communication_context_source": "mail_plan",
     }
     return {key: value for key, value in payload.items() if value}
@@ -6783,6 +6918,39 @@ def list_dlp_tasks_api(
     ]
 
 
+@app.get("/tasks/sender-progress")
+def list_sender_task_progress_api(
+    request: Request,
+    session_id: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+) -> list[dict[str, Any]]:
+    actor = build_actor_context(request=request, session_id=session_id or "")
+    _ensure_permission(actor, "task.read", "sender_task_progress")
+    return [
+        _sender_task_progress_payload(item)
+        for item in list_dlp_tasks(
+            session_id=session_id,
+            status=status,
+            risk_level=risk_level,
+            tenant_id=DEFAULT_TENANT_ID if actor.is_local_dev else actor.tenant_id,
+            user_id=DEFAULT_USER_ID if actor.is_local_dev else actor.user_id,
+            workspace_id=DEFAULT_WORKSPACE_ID if actor.is_local_dev else actor.workspace_id,
+        )
+    ]
+
+
+@app.get("/tasks/{task_id}/sender-progress")
+def get_sender_task_progress_api(task_id: str, request: Request) -> dict[str, Any]:
+    actor = build_actor_context(request=request)
+    _ensure_permission(actor, "task.read", f"sender_task_progress:{task_id}")
+    task = get_dlp_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    _ensure_sender_task_access(task, actor)
+    return _sender_task_progress_payload(task)
+
+
 @app.post("/mail/inbound/sync", response_model=InboundMailSyncResponse)
 def sync_inbound_mail_api(request: Request, payload: InboundMailSyncRequest | None = None) -> InboundMailSyncResponse:
     actor = build_actor_context(request=request)
@@ -7335,6 +7503,7 @@ def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request:
     if not task:
         raise HTTPException(status_code=404, detail="Unknown task_id")
     if str(task["status"]) == "approved":
+        provenance = task_communication_provenance(task)
         publish_task_event(
             build_task_event(
                 task_id=task_id,
@@ -7343,6 +7512,9 @@ def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request:
                 message="Task approved and queued for outbound email sending.",
                 risk_level=str(task.get("risk_level", "")),
                 delivery_status=str(task.get("delivery_status", "not_sent")),
+                thread_id=str(provenance.get("thread_id") or ""),
+                brief_id=str(provenance.get("brief_id") or ""),
+                communication_context=dict(provenance.get("communication_context") or {}),
             )
         )
         try:
@@ -7355,6 +7527,78 @@ def approve_dlp_task_api(task_id: str, payload: DlpTaskApprovalRequest, request:
                 error=str(exc),
                 actor_context=actor.to_dict(),
             )
+    return _task_response(task)
+
+
+@app.post("/tasks/{task_id}/sender-safety-confirm", response_model=DlpTaskResponse)
+def confirm_sender_safety_task_api(task_id: str, payload: DlpTaskApprovalRequest, request: Request) -> DlpTaskResponse:
+    actor = build_actor_context(request=request, payload=payload)
+    _ensure_permission(actor, "mail.send", task_id)
+    existing_task = get_dlp_task(task_id)
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    _ensure_sender_task_access(existing_task, actor)
+    if str(existing_task.get("status") or "") != "sender_review_required":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "sender_safety_confirmation_not_available",
+                "status": str(existing_task.get("status") or ""),
+                "required_status": "sender_review_required",
+            },
+        )
+    if str(existing_task.get("risk_level") or "") != "medium" or bool(existing_task.get("approval_required")):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "sender_safety_confirmation_invariant_failed",
+                "status": str(existing_task.get("status") or ""),
+                "risk_level": str(existing_task.get("risk_level") or ""),
+                "approval_required": bool(existing_task.get("approval_required")),
+                "required": {"risk_level": "medium", "approval_required": False},
+            },
+        )
+    task = set_task_status(
+        task_id,
+        "queued_for_send",
+        actor=payload.actor,
+        event_type="sender_safety_confirmed",
+        event_message="Sender confirmed medium-risk safety review and queued delivery.",
+        extra_updates={
+            "delivery_status": "queued_for_send",
+            "delivery_error": "",
+            "next_recommended_action": "",
+            "domain_result": {
+                **dict(existing_task.get("domain_result") or {}),
+                "ok": True,
+                "sender_safety_confirmed": True,
+            },
+        },
+    ) or existing_task
+    provenance = task_communication_provenance(task)
+    publish_task_event(
+        build_task_event(
+            task_id=task_id,
+            status=str(task.get("status") or ""),
+            event_type="sender_safety_confirmed",
+            message="Sender confirmed medium-risk safety review and queued delivery.",
+            risk_level=str(task.get("risk_level") or ""),
+            delivery_status=str(task.get("delivery_status") or ""),
+            thread_id=str(provenance.get("thread_id") or ""),
+            brief_id=str(provenance.get("brief_id") or ""),
+            communication_context=dict(provenance.get("communication_context") or {}),
+        )
+    )
+    try:
+        enqueue_email_send_task(task_id)
+    except Exception as exc:
+        task = _mark_task_enqueue_failed(
+            task,
+            service="celery",
+            operation="enqueue_email_send_task",
+            error=str(exc),
+            actor_context=actor.to_dict(),
+        )
     return _task_response(task)
 
 

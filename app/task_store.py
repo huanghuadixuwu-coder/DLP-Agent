@@ -129,6 +129,46 @@ def _decode_dlq(row: dict[str, Any] | None) -> dict[str, Any] | None:
     return item
 
 
+def communication_provenance_from_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    data = dict(payload or {})
+    nested_context = data.get("communication_context") if isinstance(data.get("communication_context"), dict) else {}
+    thread_ref = data.get("thread_ref") if isinstance(data.get("thread_ref"), dict) else {}
+    thread_id = str(data.get("thread_id") or nested_context.get("thread_id") or thread_ref.get("thread_id") or "").strip()
+    brief_id = str(
+        data.get("brief_id")
+        or data.get("source_brief_id")
+        or nested_context.get("brief_id")
+        or nested_context.get("source_brief_id")
+        or ""
+    ).strip()
+    communication_context = dict(nested_context or {})
+    if thread_id and not communication_context.get("thread_id"):
+        communication_context["thread_id"] = thread_id
+    if brief_id and not communication_context.get("brief_id"):
+        communication_context["brief_id"] = brief_id
+    if thread_ref and not communication_context.get("thread_ref"):
+        communication_context["thread_ref"] = thread_ref
+    result: dict[str, Any] = {}
+    if thread_id:
+        result["thread_id"] = thread_id
+    if brief_id:
+        result["brief_id"] = brief_id
+    if communication_context:
+        result["communication_context"] = communication_context
+    return result
+
+
+def task_communication_provenance(task: dict[str, Any] | None) -> dict[str, Any]:
+    if not task:
+        return {}
+    domain_payload = task.get("domain_payload")
+    if isinstance(domain_payload, dict):
+        provenance = communication_provenance_from_payload(domain_payload)
+        if provenance:
+            return provenance
+    return communication_provenance_from_payload(task)
+
+
 def init_task_store() -> None:
     global _TASK_STORE_INITIALIZED
     if _TASK_STORE_INITIALIZED:
@@ -377,6 +417,7 @@ def create_dlp_task(
         existing = get_dlp_task_by_idempotency_key(idempotency_key)
         if existing and str(existing.get("task_id") or "") != task_id:
             return existing
+    communication_provenance = communication_provenance_from_payload(domain_payload or {})
     add_task_event(
         task_id,
         status,
@@ -411,6 +452,7 @@ def create_dlp_task(
             "lab_run": lab_run,
             "entry_issue_type": entry_issue_type,
             "missing_fields": missing_fields or [],
+            **communication_provenance,
         },
     )
     return get_dlp_task(task_id) or {}
@@ -563,6 +605,7 @@ def create_mail_dlq_entry(
             ),
         )
         conn.commit()
+    communication_provenance = communication_provenance_from_payload(payload_snapshot or {})
     add_task_event(
         task_id,
         "dead_letter_created",
@@ -573,6 +616,7 @@ def create_mail_dlq_entry(
             "safe_replay_allowed": bool(safe_replay_allowed),
             "recovery_hint": recovery_hint,
             "last_error": last_error,
+            **communication_provenance,
         },
     )
     return get_mail_dlq_entry(dlq_id) or {}
@@ -762,11 +806,12 @@ def set_task_status(
     if extra_updates:
         updates.update(extra_updates)
     task = update_task(task_id, **updates)
+    communication_provenance = task_communication_provenance(task)
     add_task_event(
         task_id,
         event_type,
         actor,
-        {"status": status, "message": event_message, **(details or {})},
+        {"status": status, "message": event_message, **communication_provenance, **(details or {})},
     )
     return task
 

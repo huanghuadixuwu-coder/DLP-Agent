@@ -134,11 +134,17 @@ with left:
         st.info("当前没有匹配任务。")
     for task in tasks[:30]:
         risk = str(task.get("risk_level") or "")
+        domain_payload = task.get("domain_payload") if isinstance(task.get("domain_payload"), dict) else {}
+        communication_context = domain_payload.get("communication_context") if isinstance(domain_payload.get("communication_context"), dict) else {}
+        thread_id = str(domain_payload.get("thread_id") or communication_context.get("thread_id") or "")
+        brief_id = str(domain_payload.get("brief_id") or domain_payload.get("source_brief_id") or communication_context.get("brief_id") or "")
+        recovery_observation = (task.get("domain_result") or {}).get("recovery_observation") if isinstance(task.get("domain_result"), dict) else {}
         title = f"{task.get('task_id')} · {task_status_label(str(task.get('status') or ''))} · {task.get('destination_email') or 'no recipient'}"
         with st.expander(title, expanded=str(task.get("status")) == "pending_approval"):
             st.markdown(
                 f"risk: {risk_html(risk)}  \n"
                 f"delivery: `{task.get('delivery_status') or 'not_sent'}`  \n"
+                f"thread/brief: `{thread_id or '-'}` / `{brief_id or '-'}`  \n"
                 f"tenant/user/workspace: `{task.get('tenant_id') or '-'}` / `{task.get('user_id') or '-'}` / `{task.get('workspace_id') or '-'}`",
                 unsafe_allow_html=True,
             )
@@ -147,6 +153,9 @@ with left:
                 st.error(str(task.get("delivery_error")))
             if task.get("next_recommended_action"):
                 st.info(str(task.get("next_recommended_action")))
+            if recovery_observation:
+                with st.expander("Recovery observation", expanded=str(task.get("status")) in {"send_failed", "delivery_deferred", "dead_letter"}):
+                    st.json(recovery_observation)
             action_cols = st.columns(2)
             if str(task.get("status")) == "pending_approval":
                 with action_cols[0]:

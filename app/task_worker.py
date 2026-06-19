@@ -18,7 +18,7 @@ from app.privacy_lab import scan_sensitive_message
 from app.resilience import make_failure_observation
 from app.task_events import build_task_event, publish_task_event
 from app.task_queue import celery_app, enqueue_email_send_task
-from app.task_store import add_task_event, create_mail_dlq_entry, get_dlp_task, set_task_status, update_task
+from app.task_store import add_task_event, create_mail_dlq_entry, get_dlp_task, set_task_status, task_communication_provenance, update_task
 from app.upload_blob_store import load_upload_blob
 from app.orchestration.tool_discovery import dispatch_tool_call
 from app.orchestration.types import OrchestrationContext
@@ -29,13 +29,39 @@ PERMANENT_PROVIDER_TOKENS = ("auth", "credential", "password", "invalid recipien
 
 
 def _actor_context_from_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {
+    actor_context = {
         "tenant_id": str(task.get("tenant_id") or ""),
         "user_id": str(task.get("user_id") or ""),
         "workspace_id": str(task.get("workspace_id") or ""),
         "session_id": str(task.get("session_id") or ""),
         "conversation_id": str(task.get("conversation_id") or ""),
     }
+    provenance = task_communication_provenance(task)
+    if provenance.get("thread_id"):
+        actor_context["thread_id"] = str(provenance["thread_id"])
+    if provenance.get("brief_id"):
+        actor_context["brief_id"] = str(provenance["brief_id"])
+    return actor_context
+
+
+def _with_task_communication_provenance(observation: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    provenance = task_communication_provenance(task)
+    if not provenance:
+        return observation
+    enriched = dict(observation or {})
+    enriched_payload = dict(enriched.get("payload") or {})
+    enriched_payload.update(provenance)
+    enriched["payload"] = enriched_payload
+    enriched_provenance = dict(enriched.get("provenance") or {})
+    enriched_provenance.update({key: value for key, value in provenance.items() if key in {"thread_id", "brief_id", "communication_context"}})
+    enriched["provenance"] = enriched_provenance
+    enriched_actor = dict(enriched.get("actor_context") or {})
+    if provenance.get("thread_id"):
+        enriched_actor["thread_id"] = str(provenance["thread_id"])
+    if provenance.get("brief_id"):
+        enriched_actor["brief_id"] = str(provenance["brief_id"])
+    enriched["actor_context"] = enriched_actor
+    return enriched
 
 
 def _payload_digest_for_task(task: dict[str, Any], *, operation: str) -> str:
@@ -60,6 +86,7 @@ def _create_mail_dlq_for_task(
     safe_replay_allowed: bool,
     recovery_hint: str,
 ) -> dict[str, Any]:
+    provenance = task_communication_provenance(task)
     entry = create_mail_dlq_entry(
         task_id=str(task["task_id"]),
         operation=operation,
@@ -76,6 +103,7 @@ def _create_mail_dlq_for_task(
             "destination_email": str(task.get("destination_email") or ""),
             "mail_draft_id": str(task.get("mail_draft_id") or ""),
             "idempotency_key": str(task.get("idempotency_key") or ""),
+            **provenance,
         },
     )
     record_mail_dlq_created(operation, safe_replay_allowed)
@@ -136,6 +164,7 @@ def _is_template_summary(summary: str, redacted_text: str) -> bool:
 
 
 def _publish_snapshot(task: dict[str, Any], event_type: str, message: str) -> None:
+    provenance = task_communication_provenance(task)
     publish_task_event(
         build_task_event(
             task_id=str(task["task_id"]),
@@ -145,6 +174,9 @@ def _publish_snapshot(task: dict[str, Any], event_type: str, message: str) -> No
             risk_level=str(task.get("risk_level", "")),
             delivery_error=str(task.get("delivery_error", "")),
             delivery_status=str(task.get("delivery_status", "")),
+            thread_id=str(provenance.get("thread_id") or ""),
+            brief_id=str(provenance.get("brief_id") or ""),
+            communication_context=dict(provenance.get("communication_context") or {}),
         )
     )
 
@@ -442,10 +474,13 @@ def _run_rule_retrieval_model_pipeline(task: dict[str, Any], fault_injection: di
         record_task_degradation("rule_only")
 
     risk_reasons = _dedupe_reasons(risk_reasons)
-    approval_required = final_risk_level in {"medium", "high", "critical"}
+    approval_required = final_risk_level in {"high", "critical"}
+    sender_review_required = final_risk_level == "medium"
     final_result = (
-        "Sensitive outbound content detected. Waiting for human approval."
+        "High-risk outbound content detected. Waiting for governance approval."
         if approval_required
+        else "Medium-risk outbound content detected. Waiting for sender safety confirmation."
+        if sender_review_required
         else "Low-risk task passed DLP review and is queued for outbound delivery."
     )
 
@@ -508,8 +543,49 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
     if not task:
         return {"ok": False, "error": "Task vanished after risk analysis"}
 
+    if str(task.get("risk_level") or "") == "medium":
+        sender_observation = _with_task_communication_provenance(make_typed_observation(
+            observation_type="sender_safety_confirmation",
+            source="dlp_worker",
+            status="blocked",
+            grounding_kind="guardrail",
+            summary="Medium-risk outbound content is waiting for sender safety confirmation.",
+            payload={
+                "task_id": task_id,
+                "risk_level": "medium",
+                "confirmation_required": True,
+                "confirmation_surface": "8511_sender_workspace",
+                "risk_reasons": list(task.get("risk_reasons") or []),
+                "next_recommended_action": "Sender should review the redacted content before confirming delivery.",
+            },
+            provenance={"source": "dlp_worker"},
+            confidence=0.98,
+            actor_context=_actor_context_from_task(task),
+            success=True,
+        ), task)
+        task = set_task_status(
+            task_id,
+            "sender_review_required",
+            actor="worker",
+            event_type="sender_review_required",
+            event_message="Medium-risk outbound content detected. Waiting for sender safety confirmation.",
+            extra_updates={
+                "delivery_status": "sender_review_required",
+                "domain_result": {
+                    "ok": False,
+                    "blocked_by": "sender_safety_confirmation",
+                    "sender_safety_observation": sender_observation,
+                },
+                "next_recommended_action": "Review the redacted content in the sender workspace before confirming delivery.",
+            },
+            details={"risk_reasons": task.get("risk_reasons", []), "sender_safety_observation": sender_observation},
+        )
+        if task:
+            _publish_snapshot(task, "sender_review_required", "Medium-risk outbound content is waiting for sender safety confirmation.")
+        return {"ok": True, "status": "sender_review_required"}
+
     if bool(task.get("approval_required", False)):
-        recovery_observation = make_typed_observation(
+        recovery_observation = _with_task_communication_provenance(make_typed_observation(
             observation_type="governance_recovery",
             source="dlp_worker",
             status="blocked",
@@ -517,7 +593,7 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
             summary="High-risk outbound content is blocked pending human approval.",
             payload={
                 "task_id": task_id,
-                "risk_level": str(task.get("risk_level") or final_risk_level),
+                "risk_level": str(task.get("risk_level") or ""),
                 "approval_required": True,
                 "recovery_strategy": "human_approval_required_before_send",
                 "risk_reasons": list(task.get("risk_reasons") or []),
@@ -525,15 +601,9 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
             },
             provenance={"source": "dlp_worker"},
             confidence=0.98,
-            actor_context={
-                "tenant_id": str(task.get("tenant_id") or ""),
-                "user_id": str(task.get("user_id") or ""),
-                "workspace_id": str(task.get("workspace_id") or ""),
-                "session_id": str(task.get("session_id") or ""),
-                "conversation_id": str(task.get("conversation_id") or ""),
-            },
+            actor_context=_actor_context_from_task(task),
             success=True,
-        )
+        ), task)
         task = set_task_status(
             task_id,
             "pending_approval",
@@ -569,21 +639,15 @@ def process_dlp_outbound_task(self, task_id: str) -> dict[str, Any]:
         enqueue_email_send_task(task_id)
     except Exception as exc:
         error = str(exc)
-        failure_observation = make_failure_observation(
+        failure_observation = _with_task_communication_provenance(make_failure_observation(
             service="celery",
             operation="enqueue_email_send_task",
             error=error,
             fallback_strategy="mark_send_failed_and_return_recovery_observation",
             retry_count=0,
-            actor_context={
-                "tenant_id": str(task.get("tenant_id") or ""),
-                "user_id": str(task.get("user_id") or ""),
-                "workspace_id": str(task.get("workspace_id") or ""),
-                "session_id": str(task.get("session_id") or ""),
-                "conversation_id": str(task.get("conversation_id") or ""),
-            },
+            actor_context=_actor_context_from_task(task),
             severity="high",
-        )
+        ), task)
         task = set_task_status(
             task_id,
             "send_failed",
@@ -647,21 +711,15 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
     if fault_injection.get("force_smtp_fail"):
         record_fault_injection("force_smtp_fail")
         error = "Injected SMTP failure for scenario replay."
-        failure_observation = make_failure_observation(
+        failure_observation = _with_task_communication_provenance(make_failure_observation(
             service="smtp",
             operation="send_email_smtp",
             error=error,
             fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
             retry_count=0,
-            actor_context={
-                "tenant_id": str(task.get("tenant_id") or ""),
-                "user_id": str(task.get("user_id") or ""),
-                "workspace_id": str(task.get("workspace_id") or ""),
-                "session_id": str(task.get("session_id") or ""),
-                "conversation_id": str(task.get("conversation_id") or ""),
-            },
+            actor_context=_actor_context_from_task(task),
             severity="medium",
-        )
+        ), task)
         task = set_task_status(
             task_id,
             "send_failed",
@@ -693,7 +751,7 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
     if fault_injection.get("force_smtp_uncertain"):
         record_fault_injection("force_smtp_uncertain")
         error = "Injected SMTP uncertain result after provider accepted payload."
-        failure_observation = make_failure_observation(
+        failure_observation = _with_task_communication_provenance(make_failure_observation(
             service="smtp",
             operation="send_email_smtp",
             error=error,
@@ -701,7 +759,7 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
             retry_count=int(self.request.retries or 0),
             actor_context=_actor_context_from_task(task),
             severity="high",
-        )
+        ), task)
         task = set_task_status(
             task_id,
             "delivery_uncertain",
@@ -781,6 +839,14 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
             if task:
                 _publish_snapshot(task, "delivery_deferred", "Temporary SMTP issue detected. Delivery deferred for retry.")
             raise RuntimeError(error) from exc
+        failure_observation = _with_task_communication_provenance(make_failure_observation(
+            service="smtp",
+            operation="send_email_smtp",
+            error=error,
+            fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
+            retry_count=0,
+            actor_context=_actor_context_from_task(task),
+        ), task)
         task = set_task_status(
             task_id,
             "send_failed",
@@ -801,23 +867,11 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
                 "domain_result": {
                     "ok": False,
                     "error": error,
-                    "failure_observation": make_failure_observation(
-                        service="smtp",
-                        operation="send_email_smtp",
-                        error=error,
-                        fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
-                        retry_count=0,
-                        actor_context={
-                            "tenant_id": str(task.get("tenant_id") or ""),
-                            "user_id": str(task.get("user_id") or ""),
-                            "workspace_id": str(task.get("workspace_id") or ""),
-                            "session_id": str(task.get("session_id") or ""),
-                            "conversation_id": str(task.get("conversation_id") or ""),
-                        },
-                    ),
+                    "failure_observation": failure_observation,
+                    "recovery_observation": failure_observation,
                 },
             },
-            details={"error": error},
+            details={"error": error, "recovery_observation": failure_observation},
         )
         if task:
             _publish_snapshot(task, "send_failed", "Outbound email failed to send.")
@@ -861,14 +915,14 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
 
     if uncertain_result:
         error = error or "SMTP provider returned an uncertain delivery result."
-        failure_observation = dict(payload.get("failure_observation") or make_failure_observation(
+        failure_observation = _with_task_communication_provenance(dict(payload.get("failure_observation") or make_failure_observation(
             service="smtp",
             operation="send_email_smtp",
             error=error,
             fallback_strategy="mark_delivery_uncertain_and_require_manual_verification",
             retry_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
             actor_context=_actor_context_from_task(task),
-        ))
+        )), task)
         task = set_task_status(
             task_id,
             "delivery_uncertain",
@@ -938,6 +992,14 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
             _publish_snapshot(task, "delivery_deferred", "Temporary SMTP issue detected. Delivery deferred for retry.")
         raise RuntimeError(error or "Temporary SMTP delivery error.")
 
+    failure_observation = _with_task_communication_provenance(dict(payload.get("failure_observation") or make_failure_observation(
+        service="smtp",
+        operation="send_email_smtp",
+        error=error,
+        fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
+        retry_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
+        actor_context=_actor_context_from_task(task),
+    )), task)
     task = set_task_status(
         task_id,
         "send_failed",
@@ -960,23 +1022,11 @@ def send_dlp_email_task(self, task_id: str) -> dict[str, Any]:
             "domain_result": {
                 "ok": False,
                 "error": error,
-                "failure_observation": dict(payload.get("failure_observation") or make_failure_observation(
-                    service="smtp",
-                    operation="send_email_smtp",
-                    error=error,
-                    fallback_strategy="mark_send_failed_and_require_retry_or_manual_handover",
-                    retry_count=int((payload.get("resilience") or {}).get("retry_count") or 0) if isinstance(payload.get("resilience"), dict) else 0,
-                    actor_context={
-                        "tenant_id": str(task.get("tenant_id") or ""),
-                        "user_id": str(task.get("user_id") or ""),
-                        "workspace_id": str(task.get("workspace_id") or ""),
-                        "session_id": str(task.get("session_id") or ""),
-                        "conversation_id": str(task.get("conversation_id") or ""),
-                    },
-                )),
+                "failure_observation": failure_observation,
+                "recovery_observation": failure_observation,
             },
         },
-        details={"error": error},
+        details={"error": error, "recovery_observation": failure_observation},
     )
     if task:
         dlq = _create_mail_dlq_for_task(

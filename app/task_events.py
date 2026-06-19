@@ -50,10 +50,13 @@ def build_task_event(
     risk_level: str = "",
     delivery_error: str = "",
     delivery_status: str = "",
+    thread_id: str = "",
+    brief_id: str = "",
+    communication_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    return {
+    payload = {
         "task_id": task_id,
         "status": status,
         "event_type": event_type,
@@ -63,3 +66,10 @@ def build_task_event(
         "delivery_error": delivery_error,
         "delivery_status": delivery_status,
     }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if brief_id:
+        payload["brief_id"] = brief_id
+    if communication_context:
+        payload["communication_context"] = dict(communication_context)
+    return payload

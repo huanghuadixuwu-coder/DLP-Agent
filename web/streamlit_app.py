@@ -134,7 +134,7 @@ def delete_conversation(session_id: str, conversation_id: str) -> dict:
 @st.cache_data(ttl=10, show_spinner=False)
 def list_dlp_tasks(session_id: str) -> list[dict]:
     try:
-        return api_get("/tasks", params={"session_id": session_id})
+        return api_get("/tasks/sender-progress", params={"session_id": session_id})
     except Exception:
         return []
 
@@ -368,6 +368,12 @@ def render_realtime_task_panel_v2(
         "preferredTaskId": preferred_task_id,
         "preferredFilter": preferred_filter,
         "focusNonce": focus_nonce,
+        "actorContext": {
+            "tenant_id": os.getenv("WORKSPACE_TENANT_ID", "local-dev"),
+            "user_id": os.getenv("WORKSPACE_USER_ID", "local-user"),
+            "workspace_id": os.getenv("WORKSPACE_ID", "default"),
+            "roles": [item.strip() for item in os.getenv("WORKSPACE_ROLES", "admin,user,viewer,mail_sender").split(",") if item.strip()],
+        },
     }
     component_html = """
     <div id="dlp-task-panel-v2"></div>
@@ -420,6 +426,7 @@ def render_realtime_task_panel_v2(
         needs_clarification: "待补充",
         input_invalid: "输入无效",
         delivery_deferred: "延后发送",
+        sender_review_required: "待发送方确认",
         queued: "排队中",
         processing: "风险判断中",
         pending_approval: "待审批",
@@ -437,6 +444,7 @@ def render_realtime_task_panel_v2(
 
     function taskDetailHint(status) {
       if (status === "pending_approval") return "下一步：等待治理台审核，用户侧只显示进度。";
+      if (status === "sender_review_required") return "下一步：发送方复核中风险内容后确认发送。";
       if (status === "needs_clarification" || status === "input_invalid") return "下一步：补充信息并恢复任务";
       if (status === "send_failed" || status === "delivery_deferred") return "下一步：查看错误并决定是否重试或人工接管";
       return "下一步：查看任务进展";
@@ -560,7 +568,7 @@ def render_realtime_task_panel_v2(
     }
 
     async function loadTasks() {
-      const tasks = await fetchJson(`/tasks?session_id=${encodeURIComponent(cfg.sessionId)}`);
+      const tasks = await fetchJson(`/tasks/sender-progress?session_id=${encodeURIComponent(cfg.sessionId)}`);
       const signature = taskSignature(tasks);
       if (signature === state.lastTasksSignature) {
         syncSockets();
@@ -574,7 +582,7 @@ def render_realtime_task_panel_v2(
     }
 
     async function refreshTask(taskId) {
-      const task = await fetchJson(`/tasks/${encodeURIComponent(taskId)}`);
+      const task = await fetchJson(`/tasks/${encodeURIComponent(taskId)}/sender-progress`);
       const idx = state.tasks.findIndex((item) => item.task_id === taskId);
       if (idx >= 0) {
         state.tasks[idx] = task;
@@ -674,9 +682,21 @@ def render_realtime_task_panel_v2(
       await refreshTask(taskId);
     }
 
+    async function confirmSenderSafety(taskId) {
+      await fetchJson(`/tasks/${encodeURIComponent(taskId)}/sender-safety-confirm`, {
+        method: "POST",
+        body: JSON.stringify({ actor: "sender_workspace", ...(cfg.actorContext || {}) })
+      });
+      await refreshTask(taskId);
+    }
+
     function render() {
       const focusSnapshot = captureInputFocus();
       const selected = getSelectedTask();
+      const selectedPayload = selected?.domain_payload || {};
+      const selectedContext = selectedPayload.communication_context || {};
+      const selectedThreadId = selectedPayload.thread_id || selectedContext.thread_id || "";
+      const selectedBriefId = selectedPayload.brief_id || selectedPayload.source_brief_id || selectedContext.brief_id || "";
       if (selected && state.selectedTaskId !== selected.task_id) {
         state.selectedTaskId = selected.task_id;
       }
@@ -763,6 +783,8 @@ def render_realtime_task_panel_v2(
                 <div><span class="detail-label">status:</span> ${escapeHtml(taskStatusLabel(selected.status))}</div>
                 <div><span class="detail-label">risk:</span> ${escapeHtml(selected.risk_level || "-")}</div>
                 <div><span class="detail-label">delivery:</span> ${escapeHtml(selected.delivery_status || "not_sent")}</div>
+                ${selectedThreadId ? `<div><span class="detail-label">thread_id:</span> ${escapeHtml(selectedThreadId)}</div>` : ""}
+                ${selectedBriefId ? `<div><span class="detail-label">brief_id:</span> ${escapeHtml(selectedBriefId)}</div>` : ""}
               </div>
               <div class="detail-label">脱敏预览</div>
               <pre>${escapeHtml(selected.message_redacted || selected.message_raw || "")}</pre>
@@ -779,6 +801,12 @@ def render_realtime_task_panel_v2(
                 </div>
                 <div class="task-actions">
                   <button class="secondary-btn" data-action="supplement" data-task-id="${escapeAttr(selected.task_id)}">补充并恢复任务</button>
+                </div>
+              ` : ""}
+              ${selected.status === "sender_review_required" ? `
+                <div class="task-empty">该任务为中风险外发，请在用户工作台复核脱敏预览后确认发送；高风险审批仍在治理台。</div>
+                <div class="task-actions">
+                  <button class="secondary-btn" data-action="sender-confirm" data-task-id="${escapeAttr(selected.task_id)}">确认安全并发送</button>
                 </div>
               ` : ""}
               ${selected.status === "pending_approval" ? `
@@ -820,6 +848,18 @@ def render_realtime_task_panel_v2(
             await supplementTask(button.getAttribute("data-task-id"));
           } catch (err) {
             alert(`补充失败: ${err.message}`);
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+      root.querySelectorAll("[data-action='sender-confirm']").forEach((button) => {
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          try {
+            await confirmSenderSafety(button.getAttribute("data-task-id"));
+          } catch (err) {
+            alert(`确认失败: ${err.message}`);
           } finally {
             button.disabled = false;
           }
@@ -1180,7 +1220,8 @@ with left:
             for task in workspace_tasks[:5]:
                 st.markdown(
                     f"- `{task.get('task_id')}` {task.get('status')} / "
-                    f"{task.get('delivery_status')} / risk: {task.get('risk_level') or '-'}"
+                    f"{task.get('delivery_status')} / risk: {task.get('risk_level') or '-'} / "
+                    f"brief: `{task.get('brief_id') or '-'}`"
                 )
         else:
             st.caption("当前线程暂无外发任务。")
