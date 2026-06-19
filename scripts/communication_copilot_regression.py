@@ -2683,6 +2683,98 @@ def run_prior_answer_without_topic_overlap() -> dict[str, Any]:
     }
 
 
+def run_chinese_prior_answer_with_active_brief() -> dict[str, Any]:
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.mail.source_resolver import resolve_mail_source_request
+
+    candidates = [
+        {
+            "candidate_id": "communication-brief:active-cn",
+            "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+            "label": "communication brief: active customer thread",
+            "content": json.dumps(
+                {
+                    "brief_id": "active-cn",
+                    "thread_ref": {"thread_id": "thread-active-cn"},
+                    "employee_goal": "Prepare active customer closeout.",
+                    "must_include": ["active brief fact"],
+                },
+                ensure_ascii=False,
+            ),
+            "content_type": "application/json",
+        },
+        {
+            "candidate_id": "assistant-turn:medthink-eu",
+            "kind": "assistant_last_answer",
+            "label": "assistant answer: MedThink EU",
+            "content": "MedThink EU failover uses EU hot standby before short-term US fallback.",
+            "content_type": "text/plain",
+        },
+    ]
+    resolution = resolve_mail_source_request(
+        message="请把前面提到的 MedThink EU 回答发给 customer@example.com。",
+        candidates=candidates,
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    _assert_equal(resolution.get("source_mode"), "prior_assistant_answer", "Chinese prior answer source mode")
+    _assert_equal(resolution.get("selected_candidate_ids"), ["assistant-turn:medthink-eu"], "Chinese prior selected assistant")
+    _assert_equal(resolution.get("needs_clarification"), False, "Chinese prior clarification")
+
+    return {
+        "ok": True,
+        "case": "chinese_prior_answer_with_active_brief",
+        "source_mode": resolution.get("source_mode"),
+        "selected_candidate": resolution.get("selected_candidate_ids"),
+    }
+
+
+def run_prior_answer_unavailable_with_active_brief() -> dict[str, Any]:
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.mail.source_resolver import resolve_mail_source_request
+
+    candidates = [
+        {
+            "candidate_id": "communication-brief:active-only",
+            "kind": COMMUNICATION_BRIEF_SOURCE_KIND,
+            "label": "communication brief: active customer thread",
+            "content": json.dumps(
+                {
+                    "brief_id": "active-only",
+                    "thread_ref": {"thread_id": "thread-active-only"},
+                    "employee_goal": "Prepare active customer closeout.",
+                    "must_include": ["active brief fact"],
+                },
+                ensure_ascii=False,
+            ),
+            "content_type": "application/json",
+        }
+    ]
+    english_resolution = resolve_mail_source_request(
+        message="Please email customer@example.com the prior answer.",
+        candidates=candidates,
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    chinese_resolution = resolve_mail_source_request(
+        message="请把刚才的回答发给 customer@example.com。",
+        candidates=candidates,
+        legacy_referential_request=True,
+        explicit_summary=False,
+    )
+    for label, resolution in (("English unavailable", english_resolution), ("Chinese unavailable", chinese_resolution)):
+        _assert_equal(resolution.get("source_mode"), "none", f"{label} source mode")
+        _assert_equal(resolution.get("needs_clarification"), True, f"{label} clarification")
+        _assert_equal(resolution.get("selected_candidate_ids"), [], f"{label} selected candidates")
+
+    return {
+        "ok": True,
+        "case": "prior_answer_unavailable_with_active_brief",
+        "english_status": english_resolution.get("status"),
+        "chinese_status": chinese_resolution.get("status"),
+    }
+
+
 def run_polish_rewrite_from_active_brief() -> dict[str, Any]:
     import app.main as main_module
     from app.communication.brief_store import upsert_communication_brief
@@ -3545,6 +3637,8 @@ def main() -> int:
         "explicit_prior_answer_with_active_brief": run_explicit_prior_answer_with_active_brief,
         "default_closeout_prefers_brief_with_generic_overlap": run_default_closeout_prefers_brief_with_generic_overlap,
         "prior_answer_without_topic_overlap": run_prior_answer_without_topic_overlap,
+        "chinese_prior_answer_with_active_brief": run_chinese_prior_answer_with_active_brief,
+        "prior_answer_unavailable_with_active_brief": run_prior_answer_unavailable_with_active_brief,
         "polish_rewrite_from_active_brief": run_polish_rewrite_from_active_brief,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,

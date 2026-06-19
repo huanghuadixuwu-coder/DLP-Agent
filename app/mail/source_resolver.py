@@ -101,6 +101,16 @@ def _explicit_prior_assistant_reference(message: str) -> bool:
             "last answer",
             "earlier answer",
             "assistant answer",
+            "上一轮回答",
+            "上一条回答",
+            "刚才的回答",
+            "前面提到的回答",
+            "前面提到的",
+            "上面的方案",
+            "上面的信息",
+            "上面的内容",
+            "该回答",
+            "上述回答",
         )
     )
 
@@ -195,6 +205,13 @@ def resolve_mail_source_request(
                 reason="The user requested a prior assistant answer, but multiple prior answers are available.",
                 classifier_source="deterministic_explicit_prior_assistant_ambiguous",
             )
+        return _resolution(
+            source_mode="none",
+            needs_clarification=True,
+            confidence=0.9,
+            reason="The user requested a prior assistant answer, but no prior assistant answer source is available.",
+            classifier_source="deterministic_explicit_prior_assistant_unavailable",
+        )
     competing_reference_candidates = [
         item
         for item in normalized_candidates
