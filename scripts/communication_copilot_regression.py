@@ -2470,6 +2470,101 @@ def run_explicit_prior_answer_with_active_brief() -> dict[str, Any]:
     }
 
 
+def run_default_closeout_prefers_brief_with_generic_overlap() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_store import upsert_communication_brief
+    from app.communication.thread_store import set_active_communication_thread
+    from app.communication.types import CommunicationBrief, CommunicationThreadRef
+    from app.conversation_store import create_conversation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-default-brief-{suffix}"
+    conversation_id = f"conversation-default-brief-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-default-brief-{suffix}",
+        "user_id": f"user-default-brief-{suffix}",
+        "workspace_id": "workspace-default-brief",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-default-brief-{suffix}"
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-default-brief-1-{suffix}",
+        uid=f"uid-default-brief-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender="customer@example.com",
+        recipients="rep@example.com",
+        subject="Customer closeout plan",
+        received_at="2026-06-19T12:00:00+00:00",
+        summary="Customer needs a closeout email from the active thread.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "default closeout active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    thread_ref = CommunicationThreadRef(
+        thread_id=thread_id,
+        source="mail",
+        subject="Customer closeout plan",
+        participants=["customer@example.com", "rep@example.com"],
+        last_message_at="2026-06-19T12:00:00+00:00",
+        actor_context=actor_context,
+    )
+    brief = CommunicationBrief(
+        brief_id=f"brief-default-closeout-{suffix}",
+        conversation_id=conversation_id,
+        thread_ref=thread_ref,
+        employee_goal="Prepare the active customer closeout email.",
+        customer_context_summary="Active thread closeout should be the default source.",
+        grounding_refs=[{"citation_id": "default-brief-cite", "doc_id": "default-brief-doc"}],
+        must_include=["active brief closeout fact"],
+        recommended_next_action="draft_with_grounding",
+        confidence=0.9,
+        actor_context=actor_context,
+    )
+    _assert_true(upsert_communication_brief(brief, actor_context=actor_context, refresh_reason="default_closeout_regression"), "stored default brief")
+    generic_old_answer = "Old assistant customer closeout plan email content that shares generic words with this request."
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"generic-overlap-answer-{suffix}",
+        answer_summary=generic_old_answer,
+        intent="enterprise_rag_query",
+        citations=[{"doc_id": "generic-overlap-doc", "title": "Customer closeout plan"}],
+        actor_context=actor_context,
+    )
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message="Please email the customer with the closeout plan.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    _assert_equal(len([item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]), 1, "default closeout brief candidate")
+    _assert_true(any(item.get("kind") == "assistant_last_answer" for item in candidates), "default closeout raw answer candidate retained")
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(source_resolution.get("source_mode"), COMMUNICATION_BRIEF_SOURCE_KIND, "default closeout source mode")
+    _assert_equal(dict(mail_plan.get("selected_candidate") or {}).get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "default closeout selected brief")
+    if generic_old_answer in json.dumps(mail_plan.get("reference_sources") or [], ensure_ascii=False):
+        raise AssertionError("generic token overlap selected raw prior assistant answer over active brief")
+
+    return {
+        "ok": True,
+        "case": "default_closeout_prefers_brief_with_generic_overlap",
+        "source_mode": source_resolution.get("source_mode"),
+        "target_object": mail_plan.get("target_object"),
+        "candidate_count": len(candidates),
+    }
+
+
 def run_polish_rewrite_from_active_brief() -> dict[str, Any]:
     import app.main as main_module
     from app.communication.brief_store import upsert_communication_brief
@@ -3330,6 +3425,7 @@ def main() -> int:
         "runtime_brief_closeout": run_runtime_brief_closeout,
         "grounded_reply_from_thread": run_grounded_reply_from_thread,
         "explicit_prior_answer_with_active_brief": run_explicit_prior_answer_with_active_brief,
+        "default_closeout_prefers_brief_with_generic_overlap": run_default_closeout_prefers_brief_with_generic_overlap,
         "polish_rewrite_from_active_brief": run_polish_rewrite_from_active_brief,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,

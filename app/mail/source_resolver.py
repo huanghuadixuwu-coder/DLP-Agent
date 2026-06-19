@@ -86,6 +86,25 @@ def _explicit_brief_reference(message: str) -> bool:
     )
 
 
+def _explicit_prior_assistant_reference(message: str) -> bool:
+    text = message or ""
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "prior assistant answer",
+            "previous assistant answer",
+            "last assistant answer",
+            "earlier assistant answer",
+            "prior answer",
+            "previous answer",
+            "last answer",
+            "earlier answer",
+            "assistant answer",
+        )
+    )
+
+
 def resolve_mail_source_request(
     *,
     message: str,
@@ -147,7 +166,7 @@ def resolve_mail_source_request(
             )
     assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
     anchored_assistant = _deterministic_anchor_match(message, assistant_candidates)
-    if anchored_assistant:
+    if anchored_assistant and _explicit_prior_assistant_reference(message):
         return _resolution(
             selected_candidate_ids=[anchored_assistant["candidate_id"]],
             source_mode="prior_assistant_answer",
@@ -191,6 +210,16 @@ def resolve_mail_source_request(
             confidence=0.9,
             reason="Multiple communication briefs are available; the intended closeout source is ambiguous.",
             classifier_source="deterministic_communication_brief_ambiguous",
+        )
+    if anchored_assistant:
+        return _resolution(
+            selected_candidate_ids=[anchored_assistant["candidate_id"]],
+            source_mode="prior_assistant_answer",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=float(anchored_assistant.get("confidence") or 0.0),
+            reason="Selected the prior assistant answer matched by request anchors because no communication brief was available.",
+            classifier_source="deterministic_prior_assistant_anchor_match",
         )
     if (legacy_referential_request or explicit_summary) and len(assistant_candidates) == 1:
         return _resolution(
