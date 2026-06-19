@@ -13,7 +13,7 @@ def normalize_document(row: dict[str, Any]) -> EnterpriseDocument:
     doc_id = str(row.get("doc_id") or row.get("id") or "").strip()
     source_type = normalize_source_type(str(row.get("source_type") or row.get("source") or "unknown"))
     title = clean_text(str(row.get("title") or row.get("subject") or "(untitled)"), limit=500)
-    content = clean_text(str(row.get("content") or row.get("text") or ""), preserve_structure=True)
+    content = clean_text(str(row.get("content") or row.get("text") or row.get("content_preview") or ""), preserve_structure=True)
     metadata = {
         "thread_id": str(row.get("thread_id") or infer_thread_id(content, title)),
         "parent_doc_id": str(row.get("parent_doc_id") or ""),

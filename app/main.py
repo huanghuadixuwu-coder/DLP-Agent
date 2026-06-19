@@ -778,6 +778,9 @@ def _collect_outbound_candidates(
             {
                 "brief_id": str(brief_payload.get("brief_id") or ""),
                 "conversation_id": str(brief_payload.get("conversation_id") or ""),
+                "brief_persistence_source": str(brief_payload.get("brief_persistence_source") or ""),
+                "brief_version": int(brief_payload.get("brief_version") or 1),
+                "refresh_reason": str(brief_payload.get("refresh_reason") or ""),
                 "thread_ref": {
                     "thread_id": str(thread_ref.get("thread_id") or ""),
                     "source": str(thread_ref.get("source") or ""),
@@ -794,12 +797,8 @@ def _collect_outbound_candidates(
                 "recommended_next_action": str(brief_payload.get("recommended_next_action") or ""),
                 "source_observation_ids": list(brief_payload.get("source_observation_ids") or []),
                 "confidence": float(brief_payload.get("confidence") or 0.0),
-                "brief_persistence_source": str(brief_payload.get("brief_persistence_source") or ""),
-                "brief_version": int(brief_payload.get("brief_version") or 1),
-                "refresh_reason": str(brief_payload.get("refresh_reason") or ""),
             },
             ensure_ascii=False,
-            sort_keys=True,
         )
 
     def _append_candidate(
@@ -893,7 +892,15 @@ def _collect_outbound_candidates(
                 upload_blob_id=str(recalled_upload.get("upload_blob_id") or ""),
             )
 
+    has_active_brief_source = False
     if actor_context:
+        with suppress(Exception):
+            active_thread = get_active_communication_thread(actor_context=actor_context)
+            active_thread_id = str(dict(active_thread or {}).get("thread_id") or "").strip()
+            latest_brief = get_latest_brief_for_thread(active_thread_id, actor_context=actor_context) if active_thread_id else None
+            has_active_brief_source = bool(str(dict(dict(latest_brief or {}).get("brief") or {}).get("brief_id") or "").strip())
+
+    if actor_context and not has_active_brief_source:
         for artifact in list_active_pending_objects(
             conversation_id=conversation_id,
             actor_context=actor_context,
@@ -1011,6 +1018,8 @@ def _collect_outbound_candidates(
     assistant_candidate_count = 0
     for turn in reversed(turns):
         role = str(turn.get("role") or "").lower()
+        if has_active_brief_source and role == "assistant":
+            continue
         debug_payload = dict(turn.get("debug_payload") or {})
         if role == "assistant" and (
             bool(debug_payload.get("needs_clarification"))

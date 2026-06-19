@@ -110,18 +110,6 @@ def resolve_mail_source_request(
             reason="Selected the explicit uploaded content source before prior communication briefs.",
             classifier_source="deterministic_uploaded_content",
         )
-    assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
-    anchored_assistant = _deterministic_anchor_match(message, assistant_candidates)
-    if anchored_assistant:
-        return _resolution(
-            selected_candidate_ids=[anchored_assistant["candidate_id"]],
-            source_mode="prior_assistant_answer",
-            compose_mode="recipient_ready_summary",
-            referential_request=True,
-            confidence=float(anchored_assistant.get("confidence") or 0.0),
-            reason="Selected the prior assistant answer matched by explicit request anchors before prior communication briefs.",
-            classifier_source="deterministic_prior_assistant_anchor_match",
-        )
     brief_candidates = [item for item in normalized_candidates if item["kind"] == COMMUNICATION_BRIEF_SOURCE_KIND]
     competing_reference_candidates = [
         item
@@ -157,6 +145,18 @@ def resolve_mail_source_request(
             confidence=0.9,
             reason="Multiple communication briefs are available; the intended closeout source is ambiguous.",
             classifier_source="deterministic_communication_brief_ambiguous",
+        )
+    assistant_candidates = [item for item in normalized_candidates if item["kind"] == "assistant_last_answer"]
+    anchored_assistant = _deterministic_anchor_match(message, assistant_candidates)
+    if anchored_assistant:
+        return _resolution(
+            selected_candidate_ids=[anchored_assistant["candidate_id"]],
+            source_mode="prior_assistant_answer",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=float(anchored_assistant.get("confidence") or 0.0),
+            reason="Selected the prior assistant answer matched by explicit request anchors because no communication brief was available.",
+            classifier_source="deterministic_prior_assistant_anchor_match",
         )
     if (legacy_referential_request or explicit_summary) and len(assistant_candidates) == 1:
         return _resolution(
@@ -287,7 +287,13 @@ def _safe_fallback(
             classifier_source="safe_fallback",
             classifier_error=error,
         )
-    reference_candidates = [item for item in candidates if item["kind"] in REFERENCE_SOURCE_KINDS]
+    brief_candidates = [item for item in candidates if item["kind"] == COMMUNICATION_BRIEF_SOURCE_KIND]
+    reference_candidates = [
+        item
+        for item in candidates
+        if item["kind"] in REFERENCE_SOURCE_KINDS
+        and item["kind"] not in {COMMUNICATION_BRIEF_SOURCE_KIND, "assistant_last_answer"}
+    ]
     assistant_candidates = [item for item in candidates if item["kind"] == "assistant_last_answer"]
     anchored = _deterministic_anchor_match(message, reference_candidates)
     if anchored:
@@ -299,6 +305,26 @@ def _safe_fallback(
             confidence=float(anchored.get("confidence") or 0.0),
             reason="LLM source resolution failed; selected the unique reference candidate matched by request anchors.",
             classifier_source="safe_fallback_anchor_match",
+            classifier_error=error,
+        )
+    if len(brief_candidates) == 1:
+        return _resolution(
+            selected_candidate_ids=[brief_candidates[0]["candidate_id"]],
+            source_mode="communication_brief",
+            compose_mode="recipient_ready_summary",
+            referential_request=True,
+            confidence=0.82,
+            reason="LLM source resolution failed; selected the structured communication brief as the preferred closeout source.",
+            classifier_source="safe_fallback_communication_brief",
+            classifier_error=error,
+        )
+    if len(brief_candidates) > 1:
+        return _resolution(
+            source_mode="none",
+            needs_clarification=True,
+            confidence=0.8,
+            reason="LLM source resolution failed and multiple communication briefs are available.",
+            classifier_source="safe_fallback_communication_brief_ambiguous",
             classifier_error=error,
         )
     has_high_confidence_reference = any(marker in message or marker in message.lower() for marker in HIGH_CONFIDENCE_REFERENCE_MARKERS)

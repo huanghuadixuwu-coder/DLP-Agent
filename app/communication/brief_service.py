@@ -56,16 +56,32 @@ def _grounding_payload(grounding_observation: Any) -> dict[str, Any]:
 
 def extract_grounding_refs(grounding_observation: Any) -> list[dict[str, Any]]:
     payload = _grounding_payload(grounding_observation)
+    answer_state = dict(payload.get("answer_state") or {})
+    missing_aspects = _dedupe_strings(
+        [
+            *list(payload.get("missing_aspects") or []),
+            *list(answer_state.get("missing_aspects") or []),
+            str(answer_state.get("fallback_reason") or "") if answer_state.get("missing_evidence") else "",
+        ],
+        limit=6,
+    )
     refs: list[dict[str, Any]] = []
     for item in list(payload.get("evidence_manifest") or payload.get("selected_evidence") or payload.get("citations_brief") or []):
         ref = dict(item or {})
+        doc_id = str(ref.get("doc_id") or "")
+        chunk_id = str(ref.get("chunk_id") or "")
+        citation_id = str(ref.get("citation_id") or ref.get("id") or "")
+        if not citation_id and (doc_id or chunk_id):
+            citation_id = f"{doc_id}:{chunk_id}" if chunk_id else doc_id
         refs.append(
             {
-                "doc_id": str(ref.get("doc_id") or ""),
-                "chunk_id": str(ref.get("chunk_id") or ""),
+                "citation_id": citation_id,
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
                 "source_type": str(ref.get("source_type") or ""),
                 "title": _bounded_text(ref.get("title"), 120),
                 "score": float(ref.get("score") or 0.0),
+                "missing_aspects": missing_aspects,
             }
         )
     return refs[:8]

@@ -83,6 +83,9 @@ def build_rag_diagnostic_summary(result: dict[str, Any]) -> dict[str, Any]:
 def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any]:
     answer_debug = dict(result.get("answer_debug") or {})
     retrieval_debug = dict(result.get("retrieval_stage_debug") or {})
+    missing_aspects = []
+    if result.get("missing_evidence"):
+        missing_aspects.append(str(answer_debug.get("fallback_reason") or "missing_evidence"))
     canonical_facts = []
     for item in list(result.get("canonical_facts") or [])[:8]:
         fact = dict(item or {})
@@ -99,23 +102,32 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
     citations_brief = []
     for item in list(result.get("citations") or [])[:3]:
         citation = dict(item or {})
+        doc_id = str(citation.get("doc_id") or "")
+        chunk_id = str(citation.get("chunk_id") or "")
+        citation_id = str(citation.get("citation_id") or citation.get("id") or "")
+        if not citation_id and (doc_id or chunk_id):
+            citation_id = f"{doc_id}:{chunk_id}" if chunk_id else doc_id
         citations_brief.append(
             {
-                "doc_id": str(citation.get("doc_id") or ""),
-                "chunk_id": str(citation.get("chunk_id") or ""),
+                "citation_id": citation_id,
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
                 "source_type": str(citation.get("source_type") or ""),
                 "title": str(citation.get("title") or ""),
                 "snippet": str(citation.get("snippet") or "")[:320],
                 "score": float(citation.get("score") or 0.0),
+                "missing_aspects": missing_aspects,
             }
         )
     evidence_manifest = [
         {
             "doc_id": item["doc_id"],
             "chunk_id": item["chunk_id"],
+            "citation_id": item["citation_id"],
             "source_type": item["source_type"],
             "title": item["title"],
             "score": item["score"],
+            "missing_aspects": list(item.get("missing_aspects") or []),
         }
         for item in citations_brief
     ]
@@ -132,6 +144,7 @@ def build_enterprise_answer_observation(result: dict[str, Any]) -> dict[str, Any
             "question_focus": dict(answer_debug.get("question_focus") or {}),
             "fallback_reason": str(answer_debug.get("fallback_reason") or ""),
             "final_answer_source": str(answer_debug.get("final_answer_source") or ""),
+            "missing_aspects": missing_aspects,
         },
         "canonical_facts": canonical_facts,
         "evidence_manifest": evidence_manifest,

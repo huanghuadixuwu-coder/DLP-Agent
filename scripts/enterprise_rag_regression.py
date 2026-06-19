@@ -16,6 +16,10 @@ DEFAULT_QUERY = (
 )
 
 
+def _default_existing_path(primary: str, fallback: str) -> str:
+    return fallback if os.path.exists(fallback) and not os.path.exists(primary) else primary
+
+
 def _request(method: str, url: str, payload: dict | None = None) -> dict:
     data = None
     headers = {}
@@ -31,8 +35,20 @@ def _request(method: str, url: str, payload: dict | None = None) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run EnterpriseRAG Docker-first regression against the local API.")
     parser.add_argument("--api-base-url", default=os.getenv("API_BASE_URL", "http://127.0.0.1:8000"))
-    parser.add_argument("--documents-path", default="/app/documents.parquet")
-    parser.add_argument("--questions-path", default="/app/questions.parquet")
+    parser.add_argument(
+        "--documents-path",
+        default=_default_existing_path(
+            "/app/documents.parquet",
+            "/app/enterprise_rag_bench_documents_sample.csv",
+        ),
+    )
+    parser.add_argument(
+        "--questions-path",
+        default=_default_existing_path(
+            "/app/questions.parquet",
+            "/app/enterprise_rag_bench_questions_view.csv",
+        ),
+    )
     parser.add_argument("--mode", choices=["sample", "full"], default="sample")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--top-k", type=int, default=8)

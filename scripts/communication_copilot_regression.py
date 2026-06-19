@@ -1542,10 +1542,10 @@ def run_mail_closeout() -> dict[str, Any]:
         legacy_referential_request=True,
         explicit_summary=True,
     )
-    _assert_equal(anchored_prior_answer_resolution["source_mode"], "prior_assistant_answer", "anchored prior answer source mode")
+    _assert_equal(anchored_prior_answer_resolution["source_mode"], COMMUNICATION_BRIEF_SOURCE_KIND, "anchored prior answer source mode")
     _assert_equal(
         anchored_prior_answer_resolution["selected_candidate_ids"],
-        ["assistant-turn:medthink-failover"],
+        ["communication-brief:brief_closeout_123"],
         "anchored prior answer selected candidate",
     )
     _assert_equal(anchored_prior_answer_resolution["needs_clarification"], False, "anchored prior answer clarification")
@@ -2153,6 +2153,222 @@ def run_runtime_brief_closeout() -> dict[str, Any]:
         "candidate_count": len(candidates),
         "persisted_brief_id": latest_persisted_brief["brief"]["brief_id"],
         "source_mode": source_resolution["source_mode"],
+    }
+
+
+def run_grounded_reply_from_thread() -> dict[str, Any]:
+    import app.main as main_module
+    from app.communication.brief_service import assemble_communication_brief_observation
+    from app.communication.brief_store import get_latest_brief_for_thread
+    from app.communication.thread_store import set_active_communication_thread
+    from app.conversation_store import append_exchange, create_conversation
+    from app.enterprise_rag.core.service import build_enterprise_answer_observation
+    from app.mail.domain import COMMUNICATION_BRIEF_SOURCE_KIND
+    from app.models import UnifiedAgentRequest
+
+    suffix = uuid4().hex[:8]
+    session_id = f"session-grounded-reply-{suffix}"
+    conversation_id = f"conversation-grounded-reply-{suffix}"
+    actor_context = {
+        "tenant_id": f"tenant-grounded-reply-{suffix}",
+        "user_id": f"user-grounded-reply-{suffix}",
+        "workspace_id": "workspace-grounded-reply",
+        "roles": ["admin", "mail_sender"],
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    thread_id = f"thread-grounded-reply-{suffix}"
+    customer_email = "customer@example.com"
+    raw_answer = "RAW_RAG_FINAL_ANSWER_SHOULD_NOT_BECOME_EXTERNAL_BODY"
+    old_summary = "Hello, this is an old conversation summary that must not become an external body source."
+    grounded_fact = "MedThink Enterprise EU failover uses EU hot standby before any short-term US fallback."
+    citation = {
+        "citation_id": "cite-eu-failover-1",
+        "doc_id": "doc-eu-failover",
+        "chunk_id": "chunk-eu-failover-1",
+        "source_type": "policy",
+        "title": "Enterprise EU failover policy",
+        "snippet": "EU hot standby is the first failover target.",
+        "score": 0.96,
+    }
+
+    _seed_thread_store_message(
+        actor_context=actor_context,
+        message_id=f"msg-grounded-reply-1-{suffix}",
+        uid=f"uid-grounded-reply-1-{suffix}",
+        thread_id=thread_id,
+        provider_thread_id=f"provider-{thread_id}",
+        sender=customer_email,
+        recipients="rep@example.com",
+        subject="Enterprise EU failover question",
+        received_at="2026-06-19T09:00:00+00:00",
+        summary="Customer asks whether the Enterprise plan includes EU failover safeguards.",
+    )
+    _assert_true(set_active_communication_thread(thread_id, actor_context=actor_context), "grounded reply active thread")
+    create_conversation(session_id, conversation_id=conversation_id, actor_context=actor_context)
+    append_exchange(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        question="old greeting",
+        answer=old_summary,
+        answer_summary=old_summary,
+        intent="smalltalk",
+        actor_context=actor_context,
+    )
+
+    rag_observation = build_enterprise_answer_observation(
+        {
+            "correlation_id": f"rag-grounded-reply-{suffix}",
+            "confidence": 0.92,
+            "supporting_doc_ids": [citation["doc_id"]],
+            "context_sources": ["enterprise_rag"],
+            "answer_debug": {
+                "answerable": True,
+                "answer_intent": "enterprise_question",
+                "fallback_reason": "none",
+                "final_answer_source": "regression_fixture",
+            },
+            "retrieval_stage_debug": {"budget_profile": "sample"},
+            "canonical_facts": [
+                {
+                    "fact_id": "fact-eu-failover",
+                    "fact_type": "policy",
+                    "normalized_fact": grounded_fact,
+                    "priority": "high",
+                    "score": 0.96,
+                    "source_fact_ids": ["source-eu-failover"],
+                }
+            ],
+            "citations": [citation],
+        }
+    )
+    brief, brief_observation = assemble_communication_brief_observation(
+        employee_goal="Answer the active customer's EU failover question and draft a concise reply.",
+        conversation_id=conversation_id,
+        grounding_observation=rag_observation,
+        actor_context=actor_context,
+        source_observation_ids=[str(rag_observation.get("correlation_id") or "")],
+        persist_snapshot=True,
+        refresh_reason="grounded_reply_from_thread",
+    )
+    _assert_equal(brief.thread_ref.thread_id, thread_id, "grounded brief active thread")
+    _assert_true(brief.grounding_refs, "grounded brief refs")
+    _assert_equal(brief.grounding_refs[0].get("citation_id"), citation["citation_id"], "grounded brief citation id")
+    _assert_equal(brief.grounding_refs[0].get("doc_id"), citation["doc_id"], "grounded brief doc id")
+    _assert_true(grounded_fact in brief.must_include, "grounded fact in must_include")
+    _assert_equal(brief.recommended_next_action, "draft_with_grounding", "grounded brief next action")
+    _assert_equal(brief_observation.observation_type, COMMUNICATION_BRIEF_SOURCE_KIND, "grounded brief observation")
+    stored_brief = get_latest_brief_for_thread(thread_id, actor_context=actor_context)
+    _assert_true(stored_brief, "grounded stored brief")
+    _assert_equal(stored_brief["brief"]["brief_id"], brief.brief_id, "grounded stored brief id")
+
+    main_module._persist_answer_artifact_object(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        turn_id=f"raw-answer-{suffix}",
+        answer_summary=raw_answer,
+        intent="enterprise_rag_query",
+        citations=[citation],
+        actor_context=actor_context,
+    )
+
+    payload = UnifiedAgentRequest(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        message=f"Please email {customer_email} a concise response from the active thread and latest brief.",
+        tenant_id=actor_context["tenant_id"],
+        user_id=actor_context["user_id"],
+        workspace_id=actor_context["workspace_id"],
+        roles=actor_context["roles"],
+    )
+    candidates = main_module._collect_outbound_candidates(payload, conversation_id, {}, actor_context=actor_context)
+    brief_candidates = [item for item in candidates if item.get("kind") == COMMUNICATION_BRIEF_SOURCE_KIND]
+    assistant_candidates = [item for item in candidates if item.get("kind") == "assistant_last_answer"]
+    _assert_equal(len(brief_candidates), 1, "grounded reply brief candidate count")
+    _assert_equal(assistant_candidates, [], "raw answer fallback suppressed when active brief exists")
+
+    plan_result = main_module._build_mail_action_plan(payload, conversation_id, {}, actor_context=actor_context)
+    mail_plan = dict(plan_result.get("mail_plan") or {})
+    source_resolution = dict(mail_plan.get("source_resolution") or {})
+    _assert_equal(source_resolution.get("source_mode"), COMMUNICATION_BRIEF_SOURCE_KIND, "grounded reply source mode")
+    _assert_equal(source_resolution.get("selected_candidate_ids"), [brief_candidates[0]["candidate_id"]], "grounded reply selected brief")
+    _assert_equal(mail_plan.get("compose_mode"), "recipient_ready_summary", "grounded reply compose mode")
+    _assert_equal(mail_plan.get("resolved_body"), "", "grounded reply body before renderer")
+    if raw_answer in json.dumps(mail_plan, ensure_ascii=False):
+        raise AssertionError("raw answer artifact leaked into communication brief mail plan")
+    if old_summary in json.dumps(mail_plan, ensure_ascii=False):
+        raise AssertionError("old assistant summary leaked into communication brief mail plan")
+
+    captured: dict[str, Any] = {}
+    original_renderer = main_module.render_mail_authoring
+
+    def _fake_renderer(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        selected = list(kwargs.get("candidates") or [])
+        _assert_equal(len(selected), 1, "renderer selected candidate count")
+        _assert_equal(selected[0].get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "renderer selected candidate kind")
+        content = str(selected[0].get("content") or "")
+        _assert_true(citation["citation_id"] in content, "renderer brief citation id")
+        _assert_true(grounded_fact in content, "renderer grounded fact")
+        body = (
+            "Thanks for asking about Enterprise EU failover. "
+            "The current grounded policy says MedThink uses EU hot standby first, "
+            "with US fallback only as a short-term fallback. "
+            f"Reference: {citation['citation_id']}."
+        )
+        return {
+            "user_message": "Draft prepared from the active communication brief.",
+            "body_for_sending": body,
+            "clarification_question": "",
+            "token_in": 0,
+            "token_out": 0,
+            "estimated_cost": 0.0,
+            "used_fallback": False,
+        }
+
+    main_module.render_mail_authoring = _fake_renderer
+    try:
+        rendered_plan, _ = main_module._render_mail_plan_with_llm(
+            message=str(payload.message or ""),
+            mail_plan=mail_plan,
+            render_mode="confirmation",
+            observations=[asdict(brief_observation)],
+            candidates=candidates,
+        )
+    finally:
+        main_module.render_mail_authoring = original_renderer
+
+    resolved_body = str(rendered_plan.get("resolved_body") or "")
+    _assert_true(resolved_body.strip(), "grounded reply resolved body")
+    _assert_equal(rendered_plan.get("authoring_status"), "completed", "grounded reply authoring")
+    _assert_equal(resolved_body.count("EU hot standby"), 1, "grounded reply no duplicate fact body")
+    _assert_true(citation["citation_id"] in resolved_body, "grounded reply citation backed body")
+    _assert_equal(dict(rendered_plan.get("selected_candidate") or {}).get("kind"), COMMUNICATION_BRIEF_SOURCE_KIND, "grounded reply selected candidate")
+    _assert_true(
+        {
+            "kind": "reference_source",
+            "role": COMMUNICATION_BRIEF_SOURCE_KIND,
+            "policy": "recipient_ready_summary",
+        }
+        in list(rendered_plan.get("body_sources") or []),
+        "grounded reply body source",
+    )
+    if raw_answer in resolved_body or old_summary in resolved_body:
+        raise AssertionError("non-brief raw assistant content leaked into grounded reply body")
+    if thread_id not in str(brief_candidates[0].get("content") or ""):
+        raise AssertionError("communication brief candidate is not scoped to the active thread")
+    captured_candidates = json.dumps(captured.get("candidates") or [], ensure_ascii=False)
+    if raw_answer in captured_candidates or old_summary in captured_candidates:
+        raise AssertionError("non-brief raw assistant content leaked into renderer candidates")
+
+    return {
+        "ok": True,
+        "case": "grounded_reply_from_thread",
+        "thread_id": thread_id,
+        "brief_id": brief.brief_id,
+        "source_mode": source_resolution.get("source_mode"),
+        "candidate_count": len(candidates),
+        "resolved_body_chars": len(resolved_body),
     }
 
 
@@ -2918,6 +3134,7 @@ def main() -> int:
         "subordinate_inputs": run_subordinate_inputs,
         "retirement": run_retirement,
         "runtime_brief_closeout": run_runtime_brief_closeout,
+        "grounded_reply_from_thread": run_grounded_reply_from_thread,
         "contextual_chat": run_contextual_chat,
         "workspace_thread_inbox": run_workspace_thread_inbox,
     }
