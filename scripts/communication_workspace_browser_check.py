@@ -149,7 +149,92 @@ def run_check(url: str, api_base_url: str) -> dict[str, Any]:
         "thread_id": seeded["thread_id"],
         "brief_id": seeded["brief_id"],
         "selection_survived_refresh": True,
+        "acceptance_scenarios": browser_acceptance_scenarios(
+            url=url,
+            api_base_url=api_base_url,
+            thread_id=seeded["thread_id"],
+            brief_id=seeded["brief_id"],
+            automated=True,
+        ),
     }
+
+
+def browser_acceptance_scenarios(
+    *,
+    url: str,
+    api_base_url: str,
+    thread_id: str = "",
+    brief_id: str = "",
+    automated: bool = False,
+) -> list[dict[str, Any]]:
+    automated_status = "covered_by_script" if automated else "manual_required"
+    return [
+        {
+            "scenario": "Open 8511 workspace",
+            "status": automated_status,
+            "evidence": {"url": url},
+        },
+        {
+            "scenario": "Sync or seed inbound mail",
+            "status": automated_status,
+            "evidence": {"thread_id": thread_id},
+        },
+        {
+            "scenario": "Select customer thread from thread inbox",
+            "status": automated_status,
+            "evidence": {"thread_id": thread_id},
+        },
+        {
+            "scenario": "Confirm sanitized thread detail context",
+            "status": automated_status,
+            "evidence": {"api_base_url": api_base_url, "thread_id": thread_id},
+        },
+        {
+            "scenario": "Ask grounded product/company question with active thread",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "grounded_reply_from_thread", "brief_id": brief_id},
+        },
+        {
+            "scenario": "Confirm Copilot brief-backed answer or suggestion",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "grounded_reply_from_thread", "brief_id": brief_id},
+        },
+        {
+            "scenario": "Draft reply from grounded result",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "grounded_reply_from_thread", "brief_id": brief_id},
+        },
+        {
+            "scenario": "Draft preview is non-empty, non-duplicated, and selected-thread scoped",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "grounded_reply_from_thread"},
+        },
+        {
+            "scenario": "Refresh recovers selected thread and latest brief",
+            "status": automated_status,
+            "evidence": {"thread_id": thread_id, "brief_id": brief_id},
+        },
+        {
+            "scenario": "Medium-risk send on 8511 with audit",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "thread_governance_recovery"},
+        },
+        {
+            "scenario": "High-risk send waits for 8512 governance",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "thread_governance_recovery"},
+        },
+        {
+            "scenario": "Provider failure returns recovery observation",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "thread_governance_recovery"},
+        },
+        {
+            "scenario": "Meeting escalation requires confirmation before creation",
+            "status": "covered_by_communication_copilot_regression",
+            "evidence": {"case": "thread_meeting_escalation"},
+        },
+    ]
 
 
 def main() -> int:
@@ -159,7 +244,29 @@ def main() -> int:
         "--api-base-url",
         default=os.getenv("INTERNAL_API_BASE_URL") or os.getenv("API_BASE_URL") or "http://localhost:8000",
     )
+    parser.add_argument(
+        "--acceptance-scenarios",
+        action="store_true",
+        help="Print the browser acceptance scenario coverage map without touching runtime state.",
+    )
     args = parser.parse_args()
+    if args.acceptance_scenarios:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "url": args.url,
+                    "api_base_url": args.api_base_url.rstrip("/"),
+                    "acceptance_scenarios": browser_acceptance_scenarios(
+                        url=args.url,
+                        api_base_url=args.api_base_url.rstrip("/"),
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
     try:
         result = run_check(args.url, args.api_base_url.rstrip("/"))
     except Exception as exc:

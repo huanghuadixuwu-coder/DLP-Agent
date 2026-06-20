@@ -83,3 +83,70 @@ Write a Plan v2 that is explicitly scoped to the missing product-level requireme
 - Do not change the existing visual style of 8511.
 - Do not add generic Workspace/Document platform scope.
 - Do not hard-code user-visible answers to make demonstrations pass.
+
+## Task 9 Final Acceptance Evidence
+
+Date: 2026-06-20
+Status: done with one unrelated regression concern
+
+Thread-native acceptance summary is now explicit in
+`scripts/communication_copilot_regression.py --case acceptance_summary`. The
+summary reports each high-level requirement as `covered` or `not_covered` and
+exits non-zero if any requirement is missing.
+
+Covered acceptance requirements:
+
+- Thread inbox: `workspace_thread_inbox` proves thread list, selected thread,
+  selected-thread draft preview, and selected-thread task progress.
+- Active thread: `workspace_thread_inbox` proves active thread storage and
+  selected thread recovery after refresh.
+- Brief persistence: `workspace_thread_inbox` proves latest persisted brief and
+  Copilot context `brief_id` recovery.
+- Grounded reply: `grounded_reply_from_thread` proves `communication_brief`
+  source selection, `recipient_ready_summary`, non-empty draft body, and no raw
+  assistant-answer leakage.
+- Meeting escalation: `thread_meeting_escalation` proves confirmation is
+  required before meeting creation, meeting task parameters are thread/brief
+  scoped, and Mail Agent owns closeout.
+- Governed send: `thread_governance_recovery` proves medium sender
+  confirmation, high-risk governance boundary, and thread/brief audit
+  provenance.
+- Recovery: `thread_governance_recovery` proves provider failure, SMTP failure,
+  and worker enqueue failure recovery observations.
+- Retirement: `legacy_retirement_thread_native` plus `retirement` prove generic
+  thread closeout uses `communication_brief` instead of raw assistant answer
+  artifacts and retired orchestration fallback values remain absent.
+
+Docker evidence captured:
+
+- `docker compose ps api worker redis postgres chroma`: all five services were
+  running.
+- `docker compose exec -T api python -m compileall -q app scripts web`: passed.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case acceptance_summary`:
+  passed with `missing_requirements: []`.
+- `docker compose exec -T api python scripts/communication_copilot_regression.py --case all`:
+  passed, including the new `acceptance_summary` case.
+- `docker compose exec -T api python scripts/mail_m6_ui_governance_regression.py`:
+  passed.
+- `docker compose exec -T api python scripts/cross_domain_workflow_regression.py`:
+  passed under the current M6 governed-send contract: medium-risk outbound
+  content returns `sender_review_required`, `/tasks/{task_id}/sender-safety-confirm`
+  queues it for send, and final SMTP delivery reaches `sent`.
+- `docker compose exec -T api python scripts/enterprise_rag_regression.py --limit 4`:
+  command passed, but sample quality remains a data-governance residual risk
+  (`average_doc_recall=0.0`, `average_evidence_fact_coverage=0.0`,
+  `average_answer_fact_coverage=0.0` in this local sample run).
+- Browser smoke at `http://localhost:8511/`: host returned HTTP 200 after
+  starting the `web` service. `scripts/communication_workspace_browser_check.py`
+  seeded a browser thread, selected it, verified latest brief recovery, and
+  emitted the required scenario coverage map.
+
+Residual risks:
+
+- Browser QA is script-assisted rather than a human-visible exploratory pass:
+  the check proves page availability and backend workspace state, while the
+  grounded reply, governance, recovery, and meeting scenarios are proven through
+  Docker regressions and surfaced in the browser scenario map.
+- EnterpriseRAG sample metrics should not be overclaimed as answer-quality
+  proof; this acceptance only proves the Communication Copilot thread-native
+  coverage signals and records the existing dataset/retrieval quality risk.

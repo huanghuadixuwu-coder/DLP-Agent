@@ -560,12 +560,12 @@ Verification:
 
 Steps:
 
-- [ ] Write test: add an acceptance summary mode to `communication_copilot_regression.py` that reports thread inbox, active thread, brief persistence, grounded reply, meeting escalation, governed send, recovery, and retirement status.
-- [ ] Verify RED: run the summary and confirm any missing spec item is reported as not covered.
-- [ ] Minimal code: add only missing test harness signals or tracker updates required to make acceptance evidence explicit.
-- [ ] Verify GREEN: run the full Docker command set and browser QA.
-- [ ] Update `docs/aegis/work/2026-06-17-communication-copilot-spec-plan-gap-audit.md` with final evidence links and residual risks.
-- [ ] Commit: `git add scripts docs/aegis/work todolist.md problem_todolist.md && git commit -m "Record thread-native Communication Copilot acceptance"`
+- [x] Write test: add an acceptance summary mode to `communication_copilot_regression.py` that reports thread inbox, active thread, brief persistence, grounded reply, meeting escalation, governed send, recovery, and retirement status.
+- [x] Verify RED: run the summary and confirm any missing spec item is reported as not covered.
+- [x] Minimal code: add only missing test harness signals or tracker updates required to make acceptance evidence explicit.
+- [x] Verify GREEN: run the full Docker command set and browser QA.
+- [x] Update `docs/aegis/work/2026-06-17-communication-copilot-spec-plan-gap-audit.md` with final evidence links and residual risks.
+- [x] Commit: `git add scripts docs/aegis/work todolist.md problem_todolist.md && git commit -m "Record thread-native Communication Copilot acceptance"`
 
 Repair Track:
 

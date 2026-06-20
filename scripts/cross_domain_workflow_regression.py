@@ -88,6 +88,7 @@ def main() -> None:
 
     main_module.enqueue_meeting_task = lambda task_id: enqueued_meetings.append(task_id) or task_id
     main_module.enqueue_dlp_risk_task = lambda task_id: enqueued_dlp.append(task_id) or task_id
+    main_module.enqueue_email_send_task = lambda task_id: enqueued_email.append(task_id) or task_id
     task_worker.enqueue_email_send_task = lambda task_id: enqueued_email.append(task_id) or task_id
     task_worker.call_mcp_tool = lambda tool_name, args: {
         "ok": True,
@@ -282,6 +283,24 @@ def main() -> None:
         if dlp_result["status"] == "pending_approval":
             approved = main_module.approve_task(dlp_task_id, "cross_domain_regression")
             assert approved and approved["status"] == "approved", approved
+        elif dlp_result["status"] == "sender_review_required":
+            assert enqueued_email == [], enqueued_email
+            sender_confirmed = client.post(
+                f"/tasks/{dlp_task_id}/sender-safety-confirm",
+                json={
+                    "actor": "cross_domain_regression_sender",
+                    "tenant_id": actor_context["tenant_id"],
+                    "user_id": actor_context["user_id"],
+                    "workspace_id": actor_context["workspace_id"],
+                    "roles": list(actor_context.get("roles") or []),
+                },
+                headers=headers,
+            )
+            assert sender_confirmed.status_code == 200, sender_confirmed.text
+            confirmed_task = main_module.get_dlp_task(dlp_task_id)
+            assert confirmed_task and confirmed_task["status"] == "queued_for_send", confirmed_task
+            assert confirmed_task["delivery_status"] == "queued_for_send", confirmed_task
+            assert enqueued_email == [dlp_task_id], enqueued_email
         else:
             assert dlp_result["status"] == "queued_for_send", dlp_result
             assert enqueued_email == [dlp_task_id], enqueued_email

@@ -3206,7 +3206,7 @@ def run_workspace_thread_inbox() -> dict[str, Any]:
     actor_context = {
         "tenant_id": "local-dev",
         "user_id": "local-user",
-        "workspace_id": "workspace-thread-inbox",
+        "workspace_id": f"workspace-thread-inbox-{suffix}",
         "roles": ["admin", "mail_sender"],
         "session_id": session_id,
         "conversation_id": conversation_id,
@@ -4634,6 +4634,7 @@ def run_legacy_retirement_thread_native() -> dict[str, Any]:
         "case": "legacy_retirement_thread_native",
         "thread_id": thread_id,
         "brief_id": brief.brief_id,
+        "source_mode": source_resolution.get("source_mode"),
         "candidate_kinds": kinds,
         "explicit_compat_candidates": len(explicit_candidates),
     }
@@ -4742,6 +4743,127 @@ def run_retirement() -> dict[str, Any]:
     }
 
 
+def _has_value(payload: dict[str, Any], key: str) -> bool:
+    return bool(payload.get(key))
+
+
+def run_acceptance_summary() -> dict[str, Any]:
+    """Run the thread-native acceptance matrix and report spec coverage explicitly."""
+
+    case_functions = {
+        "workspace_thread_inbox": run_workspace_thread_inbox,
+        "grounded_reply_from_thread": run_grounded_reply_from_thread,
+        "thread_meeting_escalation": run_thread_meeting_escalation,
+        "thread_governance_recovery": run_thread_governance_recovery,
+        "legacy_retirement_thread_native": run_legacy_retirement_thread_native,
+        "retirement": run_retirement,
+    }
+    case_results: dict[str, dict[str, Any]] = {}
+    for case_name, case_function in case_functions.items():
+        try:
+            case_results[case_name] = case_function()
+        except Exception as exc:
+            case_results[case_name] = {
+                "ok": False,
+                "case": case_name,
+                "error": str(exc),
+            }
+
+    def _case_ok(case_name: str) -> bool:
+        return bool(case_results.get(case_name, {}).get("ok"))
+
+    coverage = [
+        {
+            "requirement": "thread inbox",
+            "status": "covered" if _case_ok("workspace_thread_inbox") else "not_covered",
+            "case": "workspace_thread_inbox",
+            "signals": ["threads", "selected_thread", "draft_preview", "task_progress"],
+            "evidence": {
+                "thread_id": case_results.get("workspace_thread_inbox", {}).get("thread_id"),
+                "draft_id": case_results.get("workspace_thread_inbox", {}).get("draft_id"),
+                "task_id": case_results.get("workspace_thread_inbox", {}).get("task_id"),
+            },
+        },
+        {
+            "requirement": "active thread",
+            "status": "covered" if _case_ok("workspace_thread_inbox") and _has_value(case_results["workspace_thread_inbox"], "thread_id") else "not_covered",
+            "case": "workspace_thread_inbox",
+            "signals": ["active_thread", "selected_thread survives refresh"],
+            "evidence": {
+                "thread_id": case_results.get("workspace_thread_inbox", {}).get("thread_id"),
+            },
+        },
+        {
+            "requirement": "brief persistence",
+            "status": "covered" if _case_ok("workspace_thread_inbox") and _has_value(case_results["workspace_thread_inbox"], "brief_id") else "not_covered",
+            "case": "workspace_thread_inbox",
+            "signals": ["latest_brief", "copilot_context.brief_id"],
+            "evidence": {
+                "brief_id": case_results.get("workspace_thread_inbox", {}).get("brief_id"),
+            },
+        },
+        {
+            "requirement": "grounded reply",
+            "status": "covered" if _case_ok("grounded_reply_from_thread") and case_results["grounded_reply_from_thread"].get("resolved_body_chars", 0) > 0 else "not_covered",
+            "case": "grounded_reply_from_thread",
+            "signals": ["communication_brief source", "recipient_ready_summary", "non-empty non-duplicated draft"],
+            "evidence": {
+                "source_mode": case_results.get("grounded_reply_from_thread", {}).get("source_mode"),
+                "resolved_body_chars": case_results.get("grounded_reply_from_thread", {}).get("resolved_body_chars"),
+            },
+        },
+        {
+            "requirement": "meeting escalation",
+            "status": "covered" if _case_ok("thread_meeting_escalation") and case_results["thread_meeting_escalation"].get("provider_objects_before_confirmation") == 0 else "not_covered",
+            "case": "thread_meeting_escalation",
+            "signals": ["confirmation_required before side effect", "thread/brief scoped meeting task", "Mail Agent closeout owner"],
+            "evidence": {
+                "meeting_task_id": case_results.get("thread_meeting_escalation", {}).get("meeting_task_id"),
+                "provider_objects_before_confirmation": case_results.get("thread_meeting_escalation", {}).get("provider_objects_before_confirmation"),
+                "brief_next_action": case_results.get("thread_meeting_escalation", {}).get("brief_next_action"),
+            },
+        },
+        {
+            "requirement": "governed send",
+            "status": "covered" if _case_ok("thread_governance_recovery") and "medium_sender_safety" in case_results["thread_governance_recovery"].get("recovery_checks", []) and "high_governance" in case_results["thread_governance_recovery"].get("recovery_checks", []) else "not_covered",
+            "case": "thread_governance_recovery",
+            "signals": ["medium sender confirmation on 8511", "high risk held for governance", "audit thread/brief provenance"],
+            "evidence": {
+                "medium_task_id": case_results.get("thread_governance_recovery", {}).get("medium_task_id"),
+                "checks": case_results.get("thread_governance_recovery", {}).get("recovery_checks"),
+            },
+        },
+        {
+            "requirement": "recovery",
+            "status": "covered" if _case_ok("thread_governance_recovery") and {"provider_failure", "smtp_failure", "worker_unavailable"}.issubset(set(case_results["thread_governance_recovery"].get("recovery_checks", []))) else "not_covered",
+            "case": "thread_governance_recovery",
+            "signals": ["provider failure recovery", "SMTP failure recovery", "worker enqueue failure recovery"],
+            "evidence": {
+                "checks": case_results.get("thread_governance_recovery", {}).get("recovery_checks"),
+            },
+        },
+        {
+            "requirement": "retirement",
+            "status": "covered" if _case_ok("legacy_retirement_thread_native") and _case_ok("retirement") else "not_covered",
+            "case": "legacy_retirement_thread_native + retirement",
+            "signals": ["thread-native closeout avoids raw assistant carrier", "retired orchestration fallback values absent"],
+            "evidence": {
+                "source_mode": case_results.get("legacy_retirement_thread_native", {}).get("source_mode"),
+                "mode_used": case_results.get("retirement", {}).get("mode_used"),
+                "final_answer_source": case_results.get("retirement", {}).get("final_answer_source"),
+            },
+        },
+    ]
+    missing = [item for item in coverage if item["status"] != "covered"]
+    return {
+        "ok": not missing,
+        "case": "acceptance_summary",
+        "coverage": coverage,
+        "missing_requirements": [item["requirement"] for item in missing],
+        "case_results": case_results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Communication Copilot regression checks")
     parser.add_argument("--case", required=True, dest="case_name")
@@ -4769,13 +4891,29 @@ def main() -> int:
         "thread_meeting_escalation": run_thread_meeting_escalation,
         "thread_governance_recovery": run_thread_governance_recovery,
         "legacy_retirement_thread_native": run_legacy_retirement_thread_native,
+        "acceptance_summary": run_acceptance_summary,
     }
     if args.case_name == "all":
         results = []
         for case_name, case in cases.items():
-            results.append(case())
-        print(json.dumps({"ok": True, "case": "all", "results": results}, ensure_ascii=False, sort_keys=True))
-        return 0
+            try:
+                results.append(case())
+            except Exception as exc:
+                results.append({"ok": False, "case": case_name, "error": str(exc)})
+        failed_cases = [
+            str(result.get("case") or case_name)
+            for case_name, result in zip(cases.keys(), results)
+            if not bool(result.get("ok", True))
+        ]
+        ok = not failed_cases
+        print(
+            json.dumps(
+                {"ok": ok, "case": "all", "failed_cases": failed_cases, "results": results},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0 if ok else 1
     if args.case_name not in cases:
         print(f"unsupported case: {args.case_name}", file=sys.stderr)
         return 2
@@ -4787,7 +4925,7 @@ def main() -> int:
         return 1
 
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if result.get("ok", True) else 1
 
 
 if __name__ == "__main__":

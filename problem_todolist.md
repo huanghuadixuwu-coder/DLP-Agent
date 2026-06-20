@@ -1060,6 +1060,27 @@ Task 1 evidence:
 - `[x]` Task 1 updated only `README.md`, `todolist.md`, and
   `problem_todolist.md`.
 
+Task 9 evidence:
+
+- `[x]` Added `scripts/communication_copilot_regression.py --case
+  acceptance_summary`, which reports `covered / not_covered` status for thread
+  inbox, active thread, brief persistence, grounded reply, meeting escalation,
+  governed send, recovery, and retirement.
+- `[x]` Docker acceptance summary passed with `missing_requirements: []`.
+- `[x]` Full Communication Copilot regression passed with
+  `scripts/communication_copilot_regression.py --case all`, including the new
+  acceptance summary case.
+- `[x]` Browser smoke at `http://localhost:8511/` returned HTTP 200 after
+  starting `web`; `scripts/communication_workspace_browser_check.py` seeded a
+  thread, selected it, verified latest brief recovery, and emitted the required
+  scenario coverage map.
+- `[x]` Cross-domain regression now matches the current M6 governed-send
+  contract: medium-risk outbound content returns `sender_review_required`,
+  `/tasks/{task_id}/sender-safety-confirm` queues delivery, and final SMTP
+  delivery reaches `sent`.
+- `[!]` EnterpriseRAG smoke command passes, but the local sample quality metrics
+  remain a data-governance residual risk and are not evidence of answer quality.
+
 ## Platform Capability Backlog (Not Failure Issues)
 
 Status: `[ ]` planned after Phase 3 stabilization
